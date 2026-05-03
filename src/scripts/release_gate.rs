@@ -115,7 +115,8 @@ mod tests {
 
     #[test]
     fn release_gate_requires_model_benchmark_when_requested() {
-        let report = serde_json::json!({"mode": "live-integration", "rows": [], "docs_missing": []});
+        let report =
+            serde_json::json!({"mode": "live-integration", "rows": [], "docs_missing": []});
         let payload = evaluate_release_gate_with_model_benchmark(&report, true, None, true);
         assert!(!payload.allowed);
         assert!(payload
@@ -126,7 +127,8 @@ mod tests {
 
     #[test]
     fn release_gate_records_model_benchmark_summary() {
-        let report = serde_json::json!({"mode": "live-integration", "rows": [], "docs_missing": []});
+        let report =
+            serde_json::json!({"mode": "live-integration", "rows": [], "docs_missing": []});
         let model_benchmark = serde_json::json!({
             "schema_version": 1,
             "contract": "local-openai-compatible-api",

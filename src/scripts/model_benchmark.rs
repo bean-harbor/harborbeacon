@@ -272,7 +272,9 @@ pub fn evaluate_embedding_benchmark(
         .collect::<Vec<_>>();
     let vector_dimensions = ok_dimensions.first().copied();
     let consistent_dimensions = !ok_dimensions.is_empty()
-        && ok_dimensions.iter().all(|value| Some(*value) == vector_dimensions);
+        && ok_dimensions
+            .iter()
+            .all(|value| Some(*value) == vector_dimensions);
     let vector_probe_ok = consistent_dimensions
         && vector_dimensions.unwrap_or_default() >= MIN_EMBEDDING_DIMENSIONS
         && probes.iter().all(|probe| probe.ok);
@@ -615,17 +617,18 @@ fn mean_rr(values: impl Iterator<Item = f32>) -> f32 {
 mod tests {
     use super::{
         benchmark_run_role, build_model_benchmark_gate, cosine_similarity, default_embedding_cases,
-        evaluate_embedding_benchmark, evaluate_embedding_case, is_output_clean,
-        lexical_similarity, summarize_chat_probes, ChatProbeResult, ColdStartProbeResult,
-        EmbeddingProbeResult, EmbeddingRetrievalCaseResult, HealthProbeResult,
-        BENCHMARK_RUN_ROLE_BUILDER_COMPATIBILITY, BENCHMARK_RUN_ROLE_TARGET_RUNTIME_PROMOTION,
+        evaluate_embedding_benchmark, evaluate_embedding_case, is_output_clean, lexical_similarity,
+        summarize_chat_probes, ChatProbeResult, ColdStartProbeResult, EmbeddingProbeResult,
+        EmbeddingRetrievalCaseResult, HealthProbeResult, BENCHMARK_RUN_ROLE_BUILDER_COMPATIBILITY,
+        BENCHMARK_RUN_ROLE_TARGET_RUNTIME_PROMOTION,
     };
     use std::collections::HashMap;
 
     #[test]
     fn lexical_similarity_prefers_related_text() {
         let related = lexical_similarity("帮我找一下录像导出的办法", "录像保存时长与导出步骤");
-        let unrelated = lexical_similarity("帮我找一下录像导出的办法", "植物识别备忘与花期观察日志");
+        let unrelated =
+            lexical_similarity("帮我找一下录像导出的办法", "植物识别备忘与花期观察日志");
         assert!(related > unrelated);
     }
 
@@ -650,7 +653,10 @@ mod tests {
         ]);
 
         let result = evaluate_embedding_case(&case, &vectors);
-        assert_eq!(result.embedding_top_candidate_id.as_deref(), Some("doc-flower"));
+        assert_eq!(
+            result.embedding_top_candidate_id.as_deref(),
+            Some("doc-flower")
+        );
         assert!(result.embedding_rr >= result.lexical_rr);
         assert!(result.error.is_none());
     }

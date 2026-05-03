@@ -167,8 +167,10 @@ impl ModelApiConfig {
             "HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID",
             &config.candle.embedding_model_id,
         );
-        config.candle.cache_dir =
-            env_or_default("HARBOR_MODEL_API_CANDLE_CACHE_DIR", &config.candle.cache_dir);
+        config.candle.cache_dir = env_or_default(
+            "HARBOR_MODEL_API_CANDLE_CACHE_DIR",
+            &config.candle.cache_dir,
+        );
         config.candle.max_new_tokens = env_or_default(
             "HARBOR_MODEL_API_CANDLE_MAX_NEW_TOKENS",
             &config.candle.max_new_tokens.to_string(),
@@ -216,26 +218,20 @@ impl ModelApiConfig {
                         .unwrap_or_else(|error| fail(&error));
                 }
                 "--upstream-base-url" => {
-                    self.upstream_base_url =
-                        take_value(&args, &mut index, "--upstream-base-url")
+                    self.upstream_base_url = take_value(&args, &mut index, "--upstream-base-url")
                 }
                 value if value.starts_with("--upstream-base-url=") => {
-                    self.upstream_base_url =
-                        value["--upstream-base-url=".len()..].to_string();
+                    self.upstream_base_url = value["--upstream-base-url=".len()..].to_string();
                 }
-                "--chat-model" => {
-                    self.chat_model = take_value(&args, &mut index, "--chat-model")
-                }
+                "--chat-model" => self.chat_model = take_value(&args, &mut index, "--chat-model"),
                 value if value.starts_with("--chat-model=") => {
                     self.chat_model = value["--chat-model=".len()..].to_string();
                 }
                 "--embedding-model" => {
-                    self.embedding_model =
-                        take_value(&args, &mut index, "--embedding-model")
+                    self.embedding_model = take_value(&args, &mut index, "--embedding-model")
                 }
                 value if value.starts_with("--embedding-model=") => {
-                    self.embedding_model =
-                        value["--embedding-model=".len()..].to_string();
+                    self.embedding_model = value["--embedding-model=".len()..].to_string();
                 }
                 "--request-timeout-ms" => {
                     self.request_timeout_ms = take_value(&args, &mut index, "--request-timeout-ms")
@@ -248,12 +244,10 @@ impl ModelApiConfig {
                         .unwrap_or_else(|error| fail(&format!("invalid request timeout: {error}")));
                 }
                 "--candle-model-id" => {
-                    self.candle.chat_model_id =
-                        take_value(&args, &mut index, "--candle-model-id")
+                    self.candle.chat_model_id = take_value(&args, &mut index, "--candle-model-id")
                 }
                 value if value.starts_with("--candle-model-id=") => {
-                    self.candle.chat_model_id =
-                        value["--candle-model-id=".len()..].to_string();
+                    self.candle.chat_model_id = value["--candle-model-id=".len()..].to_string();
                 }
                 "--candle-chat-model-id" => {
                     self.candle.chat_model_id =
@@ -286,12 +280,11 @@ impl ModelApiConfig {
                             });
                 }
                 value if value.starts_with("--candle-max-new-tokens=") => {
-                    self.candle.max_new_tokens =
-                        value["--candle-max-new-tokens=".len()..]
-                            .parse::<usize>()
-                            .unwrap_or_else(|error| {
-                                fail(&format!("invalid candle max tokens: {error}"))
-                            });
+                    self.candle.max_new_tokens = value["--candle-max-new-tokens=".len()..]
+                        .parse::<usize>()
+                        .unwrap_or_else(|error| {
+                            fail(&format!("invalid candle max tokens: {error}"))
+                        });
                 }
                 "--candle-temperature" => {
                     self.candle.temperature = take_value(&args, &mut index, "--candle-temperature")
@@ -303,7 +296,9 @@ impl ModelApiConfig {
                 value if value.starts_with("--candle-temperature=") => {
                     self.candle.temperature = value["--candle-temperature=".len()..]
                         .parse::<f64>()
-                        .unwrap_or_else(|error| fail(&format!("invalid candle temperature: {error}")));
+                        .unwrap_or_else(|error| {
+                            fail(&format!("invalid candle temperature: {error}"))
+                        });
                 }
                 "--help" | "-h" => {
                     print_usage();
@@ -385,7 +380,9 @@ impl ModelApiService {
             (Method::Post, "/v1/chat/completions") => {
                 self.backend.chat_completions(&self.config, headers, body)
             }
-            (Method::Post, "/v1/embeddings") => self.backend.embeddings(&self.config, headers, body),
+            (Method::Post, "/v1/embeddings") => {
+                self.backend.embeddings(&self.config, headers, body)
+            }
             (Method::Options, _) => no_content(),
             _ => error_response(
                 StatusCode(404),
@@ -466,12 +463,9 @@ impl BackendRuntime {
     ) -> Response<Cursor<Vec<u8>>> {
         match self {
             Self::Candle(backend) => backend.chat_completions(config, headers, body),
-            Self::OpenAIProxy(backend) => backend.forward_json(
-                "/chat/completions",
-                &config.chat_model,
-                headers,
-                body,
-            ),
+            Self::OpenAIProxy(backend) => {
+                backend.forward_json("/chat/completions", &config.chat_model, headers, body)
+            }
         }
     }
 
@@ -483,12 +477,9 @@ impl BackendRuntime {
     ) -> Response<Cursor<Vec<u8>>> {
         match self {
             Self::Candle(backend) => backend.embeddings(config, headers, body),
-            Self::OpenAIProxy(backend) => backend.forward_json(
-                "/embeddings",
-                &config.embedding_model,
-                headers,
-                body,
-            ),
+            Self::OpenAIProxy(backend) => {
+                backend.forward_json("/embeddings", &config.embedding_model, headers, body)
+            }
         }
     }
 }
@@ -631,7 +622,12 @@ impl CandleBackend {
         let completion = match self.run_chat(&request) {
             Ok(completion) => completion,
             Err(error) => {
-                return error_response(StatusCode(503), "BACKEND_GENERATION_FAILED", &error, "candle");
+                return error_response(
+                    StatusCode(503),
+                    "BACKEND_GENERATION_FAILED",
+                    &error,
+                    "candle",
+                );
             }
         };
 
@@ -684,7 +680,12 @@ impl CandleBackend {
         let vectors = match self.run_embeddings(&request) {
             Ok(vectors) => vectors,
             Err(error) => {
-                return error_response(StatusCode(503), "BACKEND_EMBEDDING_FAILED", &error, "candle");
+                return error_response(
+                    StatusCode(503),
+                    "BACKEND_EMBEDDING_FAILED",
+                    &error,
+                    "candle",
+                );
             }
         };
 
@@ -722,7 +723,10 @@ impl CandleBackend {
         self.with_runtime(|runtime| self.generate_with_runtime(&mut runtime.chat, request))
     }
 
-    fn run_embeddings(&self, request: &CandleEmbeddingRequest) -> Result<Vec<CandleEmbeddingVector>, String> {
+    fn run_embeddings(
+        &self,
+        request: &CandleEmbeddingRequest,
+    ) -> Result<Vec<CandleEmbeddingVector>, String> {
         self.with_runtime(|runtime| self.embed_with_runtime(&runtime.embeddings, request))
     }
 
@@ -735,7 +739,10 @@ impl CandleBackend {
             .lock()
             .map_err(|_| "candle runtime lock is poisoned".to_string())?;
 
-        if matches!(&*state, CandleRuntimeState::Uninitialized | CandleRuntimeState::Failed(_)) {
+        if matches!(
+            &*state,
+            CandleRuntimeState::Uninitialized | CandleRuntimeState::Failed(_)
+        ) {
             *state = match self.load_runtime() {
                 Ok(runtime) => CandleRuntimeState::Ready(runtime),
                 Err(error) => CandleRuntimeState::Failed(format!("{error:#}")),
@@ -748,7 +755,9 @@ impl CandleBackend {
                 "failed to initialize candle runtime: {}",
                 trim_for_note(error)
             )),
-            CandleRuntimeState::Uninitialized => Err("candle runtime did not initialize".to_string()),
+            CandleRuntimeState::Uninitialized => {
+                Err("candle runtime did not initialize".to_string())
+            }
         }
     }
 
@@ -784,12 +793,14 @@ impl CandleBackend {
             VarBuilder::from_mmaped_safetensors(&chat_assets.weight_files, DType::F32, &device)
                 .context("failed to mmap qwen3 model weights")?
         };
-        let config: QwenConfig = serde_json::from_slice(
-            &fs::read(&chat_assets.config_file).with_context(|| {
-                format!("failed to read qwen3 config {}", chat_assets.config_file.display())
-            })?,
-        )
-        .context("failed to parse qwen3 config")?;
+        let config: QwenConfig =
+            serde_json::from_slice(&fs::read(&chat_assets.config_file).with_context(|| {
+                format!(
+                    "failed to read qwen3 config {}",
+                    chat_assets.config_file.display()
+                )
+            })?)
+            .context("failed to parse qwen3 config")?;
         let chat_model =
             QwenModel::new(&config, chat_vb).context("failed to construct qwen3 model")?;
 
@@ -803,12 +814,8 @@ impl CandleBackend {
         let embedding_tokenizer = Tokenizer::from_file(&embedding_assets.tokenizer_file)
             .map_err(|error| anyhow!("failed to load jina tokenizer: {error}"))?;
         let embedding_vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                &embedding_assets.weight_files,
-                DType::F32,
-                &device,
-            )
-            .context("failed to mmap jina embedding weights")?
+            VarBuilder::from_mmaped_safetensors(&embedding_assets.weight_files, DType::F32, &device)
+                .context("failed to mmap jina embedding weights")?
         };
         let embedding_config: JinaBertConfig = serde_json::from_slice(
             &fs::read(&embedding_assets.config_file).with_context(|| {
@@ -961,11 +968,7 @@ impl CandleBackend {
                 if values.is_empty() {
                     return Err("embedding output was empty".to_string());
                 }
-                let l2 = values
-                    .iter()
-                    .map(|value| value * value)
-                    .sum::<f32>()
-                    .sqrt();
+                let l2 = values.iter().map(|value| value * value).sum::<f32>().sqrt();
                 if !l2.is_finite() || l2 <= f32::EPSILON {
                     return Err("embedding output had zero norm".to_string());
                 }
@@ -1061,7 +1064,9 @@ impl OpenAIProxyBackend {
                 upstream_base_url: self.upstream_base_url.clone(),
                 chat_model: self.chat_model.clone(),
                 embedding_model: self.embedding_model.clone(),
-                note: Some("openai_proxy backend is configured but upstream is unhealthy".to_string()),
+                note: Some(
+                    "openai_proxy backend is configured but upstream is unhealthy".to_string(),
+                ),
                 ready: false,
             }
         }
@@ -1150,14 +1155,20 @@ fn normalize_model(payload: &mut Value, default_model: &str) {
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false);
         if !has_model {
-            object.insert("model".to_string(), Value::String(default_model.to_string()));
+            object.insert(
+                "model".to_string(),
+                Value::String(default_model.to_string()),
+            );
         }
     }
 }
 
-fn parse_candle_chat_request(body: &[u8], config: &CandleConfig) -> Result<CandleChatRequest, String> {
-    let payload: Value = serde_json::from_slice(body)
-        .map_err(|error| format!("invalid JSON body: {error}"))?;
+fn parse_candle_chat_request(
+    body: &[u8],
+    config: &CandleConfig,
+) -> Result<CandleChatRequest, String> {
+    let payload: Value =
+        serde_json::from_slice(body).map_err(|error| format!("invalid JSON body: {error}"))?;
     let messages = payload
         .get("messages")
         .and_then(Value::as_array)
@@ -1243,8 +1254,8 @@ fn parse_candle_chat_request(body: &[u8], config: &CandleConfig) -> Result<Candl
 }
 
 fn parse_candle_embedding_request(body: &[u8]) -> Result<CandleEmbeddingRequest, String> {
-    let payload: Value = serde_json::from_slice(body)
-        .map_err(|error| format!("invalid JSON body: {error}"))?;
+    let payload: Value =
+        serde_json::from_slice(body).map_err(|error| format!("invalid JSON body: {error}"))?;
     let input = payload
         .get("input")
         .ok_or_else(|| "input must be a string or a non-empty string array".to_string())?;
@@ -1263,7 +1274,9 @@ fn parse_candle_embedding_request(body: &[u8]) -> Result<CandleEmbeddingRequest,
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string)
-                    .ok_or_else(|| "embedding input arrays must contain non-empty strings".to_string())
+                    .ok_or_else(|| {
+                        "embedding input arrays must contain non-empty strings".to_string()
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         if values.is_empty() {
@@ -1359,13 +1372,11 @@ fn sanitize_candle_completion_text(text: &str, request: &CandleChatRequest) -> S
     while sanitized.contains("\n\n\n") {
         sanitized = sanitized.replace("\n\n\n", "\n\n");
     }
-    if let Some(short_answer) =
-        extract_short_answer_from_response(
-            &sanitized,
-            &request.short_answer_options,
-            request.short_answer_focus.as_deref(),
-        )
-    {
+    if let Some(short_answer) = extract_short_answer_from_response(
+        &sanitized,
+        &request.short_answer_options,
+        request.short_answer_focus.as_deref(),
+    ) {
         return short_answer;
     }
     sanitized
@@ -1510,10 +1521,7 @@ fn match_short_answer_line(
         return None;
     }
 
-    if options.len() == 2
-        && options[0] == "是"
-        && options[1] == "否"
-    {
+    if options.len() == 2 && options[0] == "是" && options[1] == "否" {
         if normalized.contains("不能")
             || normalized.contains("不行")
             || normalized.contains("不可以")
@@ -1523,22 +1531,20 @@ fn match_short_answer_line(
         if normalized.contains('否') {
             return Some("否".to_string());
         }
-        if normalized.contains("可以")
-            || normalized.contains("能")
-            || normalized.contains('是')
+        if normalized.contains("可以") || normalized.contains("能") || normalized.contains('是')
         {
             return Some("是".to_string());
         }
     }
 
-    if let Some(answer) = focus_phrase
-        .and_then(|focus| match_short_answer_by_focus(&normalized, options, focus))
+    if let Some(answer) =
+        focus_phrase.and_then(|focus| match_short_answer_by_focus(&normalized, options, focus))
     {
         return Some(answer);
     }
 
-    if let Some(answer) = focus_phrase
-        .and_then(|focus| match_short_answer_by_domain_hint(options, focus))
+    if let Some(answer) =
+        focus_phrase.and_then(|focus| match_short_answer_by_domain_hint(options, focus))
     {
         return Some(answer);
     }
@@ -1551,7 +1557,11 @@ fn match_short_answer_line(
 
     let mut matches = options
         .iter()
-        .filter_map(|option| normalized.rfind(option).map(|position| (position, option.clone())))
+        .filter_map(|option| {
+            normalized
+                .rfind(option)
+                .map(|position| (position, option.clone()))
+        })
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| left.0.cmp(&right.0));
     matches.first().map(|(_, option)| option).cloned()
@@ -1562,7 +1572,10 @@ fn match_short_answer_by_focus(
     options: &[String],
     focus_phrase: &str,
 ) -> Option<String> {
-    let focus_positions = value.match_indices(focus_phrase).map(|(index, _)| index).collect::<Vec<_>>();
+    let focus_positions = value
+        .match_indices(focus_phrase)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
     if focus_positions.is_empty() {
         return None;
     }
@@ -1590,7 +1603,15 @@ fn match_short_answer_by_domain_hint(options: &[String], focus_phrase: &str) -> 
     if has_record && has_snapshot {
         if contains_any_phrase(
             &normalized_focus,
-            &["持续动作", "连续动作", "持续", "连续", "一直", "不停", "长时间"],
+            &[
+                "持续动作",
+                "连续动作",
+                "持续",
+                "连续",
+                "一直",
+                "不停",
+                "长时间",
+            ],
         ) {
             return Some("录像".to_string());
         }
@@ -1620,7 +1641,19 @@ fn normalize_short_answer_text(value: &str) -> String {
         .trim_start_matches(|character: char| {
             matches!(
                 character,
-                ':' | '：' | '。' | '，' | ',' | '！' | '!' | '？' | '?' | '"' | '\'' | '“' | '”' | ' '
+                ':' | '：'
+                    | '。'
+                    | '，'
+                    | ','
+                    | '！'
+                    | '!'
+                    | '？'
+                    | '?'
+                    | '"'
+                    | '\''
+                    | '“'
+                    | '”'
+                    | ' '
             )
         })
         .trim()
@@ -1799,11 +1832,11 @@ fn resolve_weight_files_from_index(
     index_file: &PathBuf,
     mut fetch_shard: impl FnMut(&str) -> AnyResult<PathBuf>,
 ) -> AnyResult<Vec<PathBuf>> {
-    let index: SafetensorIndex = serde_json::from_slice(
-        &fs::read(index_file)
-            .with_context(|| format!("failed to read safetensor index {}", index_file.display()))?,
-    )
-    .with_context(|| format!("failed to parse safetensor index {}", index_file.display()))?;
+    let index: SafetensorIndex =
+        serde_json::from_slice(&fs::read(index_file).with_context(|| {
+            format!("failed to read safetensor index {}", index_file.display())
+        })?)
+        .with_context(|| format!("failed to parse safetensor index {}", index_file.display()))?;
 
     let mut seen = HashSet::new();
     let mut weight_files = Vec::new();
@@ -1905,7 +1938,10 @@ fn json_response(status: StatusCode, payload: &impl Serialize) -> Response<Curso
 fn add_common_headers<R: Read>(response: &mut Response<R>) {
     for header in [
         ("Access-Control-Allow-Origin", "*"),
-        ("Access-Control-Allow-Headers", "Content-Type, Authorization"),
+        (
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization",
+        ),
         ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
         ("Cache-Control", "no-store"),
     ] {
@@ -1986,7 +2022,10 @@ mod tests {
 
     #[test]
     fn backend_kind_parsing_accepts_alternates() {
-        assert_eq!("candle".parse::<BackendKind>().unwrap(), BackendKind::Candle);
+        assert_eq!(
+            "candle".parse::<BackendKind>().unwrap(),
+            BackendKind::Candle
+        );
         assert_eq!(
             "openai_proxy".parse::<BackendKind>().unwrap(),
             BackendKind::OpenAIProxy
@@ -2049,9 +2088,11 @@ mod tests {
                 {"role": "user", "content": "请只回答“是”或“否”：摄像头能用于抓拍吗？"}
             ]
         });
-        let request =
-            parse_candle_chat_request(&serde_json::to_vec(&payload).unwrap(), &CandleConfig::default())
-                .unwrap();
+        let request = parse_candle_chat_request(
+            &serde_json::to_vec(&payload).unwrap(),
+            &CandleConfig::default(),
+        )
+        .unwrap();
         assert!(request.prompt.contains("<|im_start|>system"));
         assert!(request.prompt.contains("<|im_start|>user"));
         assert!(request.prompt.contains("<|im_start|>assistant"));
@@ -2074,9 +2115,11 @@ mod tests {
             "max_tokens": 8,
             "temperature": 0.4
         });
-        let request =
-            parse_candle_chat_request(&serde_json::to_vec(&payload).unwrap(), &CandleConfig::default())
-                .unwrap();
+        let request = parse_candle_chat_request(
+            &serde_json::to_vec(&payload).unwrap(),
+            &CandleConfig::default(),
+        )
+        .unwrap();
         assert!(request.prompt.contains("樱花\n更像植物还是工具？"));
         assert_eq!(request.max_new_tokens, 8);
         assert_eq!(request.temperature, 0.4);
@@ -2119,7 +2162,10 @@ mod tests {
 
     #[test]
     fn resolve_weight_files_from_index_keeps_unique_shards() {
-        let temp_dir = std::env::temp_dir().join(format!("harborbeacon-index-test-{}", current_timestamp_ms()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "harborbeacon-index-test-{}",
+            current_timestamp_ms()
+        ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let index_path = temp_dir.join("model.safetensors.index.json");
         std::fs::write(
@@ -2134,10 +2180,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let files = resolve_weight_files_from_index(&index_path, |relative| {
-            Ok(temp_dir.join(relative))
-        })
-        .unwrap();
+        let files =
+            resolve_weight_files_from_index(&index_path, |relative| Ok(temp_dir.join(relative)))
+                .unwrap();
         assert_eq!(files.len(), 2);
     }
 

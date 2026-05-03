@@ -64,7 +64,8 @@ impl Default for Cli {
             candle_chat_model_id: std::env::var("HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID")
                 .ok()
                 .or_else(|| std::env::var("HARBOR_MODEL_API_CANDLE_MODEL_ID").ok()),
-            candle_embedding_model_id: std::env::var("HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID").ok(),
+            candle_embedding_model_id: std::env::var("HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID")
+                .ok(),
             request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
             startup_timeout_ms: DEFAULT_STARTUP_TIMEOUT_MS,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
@@ -103,9 +104,7 @@ impl Cli {
                 value if value.starts_with("--base-url=") => {
                     cli.base_url = value["--base-url=".len()..].to_string();
                 }
-                "--healthz-url" => {
-                    cli.healthz_url = take_value(&args, &mut index, "--healthz-url")
-                }
+                "--healthz-url" => cli.healthz_url = take_value(&args, &mut index, "--healthz-url"),
                 value if value.starts_with("--healthz-url=") => {
                     cli.healthz_url = value["--healthz-url=".len()..].to_string();
                 }
@@ -113,9 +112,7 @@ impl Cli {
                 value if value.starts_with("--bind=") => {
                     cli.bind = value["--bind=".len()..].to_string();
                 }
-                "--run-role" => {
-                    cli.run_role = Some(take_value(&args, &mut index, "--run-role"))
-                }
+                "--run-role" => cli.run_role = Some(take_value(&args, &mut index, "--run-role")),
                 value if value.starts_with("--run-role=") => {
                     cli.run_role = Some(value["--run-role=".len()..].to_string());
                 }
@@ -127,9 +124,7 @@ impl Cli {
                 value if value.starts_with("--api-key=") => {
                     cli.api_key = Some(value["--api-key=".len()..].to_string());
                 }
-                "--chat-model" => {
-                    cli.chat_model = take_value(&args, &mut index, "--chat-model")
-                }
+                "--chat-model" => cli.chat_model = take_value(&args, &mut index, "--chat-model"),
                 value if value.starts_with("--chat-model=") => {
                     cli.chat_model = value["--chat-model=".len()..].to_string();
                 }
@@ -144,8 +139,7 @@ impl Cli {
                         Some(take_value(&args, &mut index, "--upstream-base-url"))
                 }
                 value if value.starts_with("--upstream-base-url=") => {
-                    cli.upstream_base_url =
-                        Some(value["--upstream-base-url=".len()..].to_string());
+                    cli.upstream_base_url = Some(value["--upstream-base-url=".len()..].to_string());
                 }
                 "--candle-chat-model-id" => {
                     cli.candle_chat_model_id =
@@ -156,16 +150,12 @@ impl Cli {
                         Some(value["--candle-chat-model-id=".len()..].to_string());
                 }
                 "--candle-embedding-model-id" => {
-                    cli.candle_embedding_model_id = Some(take_value(
-                        &args,
-                        &mut index,
-                        "--candle-embedding-model-id",
-                    ))
+                    cli.candle_embedding_model_id =
+                        Some(take_value(&args, &mut index, "--candle-embedding-model-id"))
                 }
                 value if value.starts_with("--candle-embedding-model-id=") => {
-                    cli.candle_embedding_model_id = Some(
-                        value["--candle-embedding-model-id=".len()..].to_string(),
-                    );
+                    cli.candle_embedding_model_id =
+                        Some(value["--candle-embedding-model-id=".len()..].to_string());
                 }
                 "--request-timeout-ms" => {
                     cli.request_timeout_ms = parse_u64(
@@ -284,8 +274,9 @@ fn main() {
 
     if let Some(parent) = cli.output.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .unwrap_or_else(|error| fail(&format!("failed to create output directory: {error}")));
+            std::fs::create_dir_all(parent).unwrap_or_else(|error| {
+                fail(&format!("failed to create output directory: {error}"))
+            });
         }
     }
     std::fs::write(
@@ -312,43 +303,43 @@ fn run_chat_benchmarks(client: &Client, cli: &Cli) -> Vec<ChatProbeResult> {
         .into_iter()
         .map(|spec| {
             let started = Instant::now();
-                match post_openai_chat(
-                    client,
-                    &cli.base_url,
-                    cli.api_key.as_deref(),
-                    &cli.chat_model,
-                    spec.prompt,
-                ) {
-                    Ok(text) => {
-                        let semantic_ok = spec
-                            .expected_any
-                            .iter()
-                            .find(|needle| text.contains(**needle))
-                            .map(|value| (*value).to_string());
-                        let output_clean = is_output_clean(&text);
-                        ChatProbeResult {
-                            name: spec.name.to_string(),
-                            prompt: spec.prompt.to_string(),
-                            ok: semantic_ok.is_some() && output_clean,
-                            semantic_ok: semantic_ok.is_some(),
-                            output_clean,
-                            latency_ms: Some(started.elapsed().as_millis() as u64),
-                            matched_expectation: semantic_ok,
-                            response_excerpt: Some(trim_excerpt(&text, 80)),
-                            error: None,
-                        }
-                    }
-                    Err(error) => ChatProbeResult {
+            match post_openai_chat(
+                client,
+                &cli.base_url,
+                cli.api_key.as_deref(),
+                &cli.chat_model,
+                spec.prompt,
+            ) {
+                Ok(text) => {
+                    let semantic_ok = spec
+                        .expected_any
+                        .iter()
+                        .find(|needle| text.contains(**needle))
+                        .map(|value| (*value).to_string());
+                    let output_clean = is_output_clean(&text);
+                    ChatProbeResult {
                         name: spec.name.to_string(),
                         prompt: spec.prompt.to_string(),
-                        ok: false,
-                        semantic_ok: false,
-                        output_clean: false,
+                        ok: semantic_ok.is_some() && output_clean,
+                        semantic_ok: semantic_ok.is_some(),
+                        output_clean,
                         latency_ms: Some(started.elapsed().as_millis() as u64),
-                        matched_expectation: None,
-                        response_excerpt: None,
-                        error: Some(error),
-                    },
+                        matched_expectation: semantic_ok,
+                        response_excerpt: Some(trim_excerpt(&text, 80)),
+                        error: None,
+                    }
+                }
+                Err(error) => ChatProbeResult {
+                    name: spec.name.to_string(),
+                    prompt: spec.prompt.to_string(),
+                    ok: false,
+                    semantic_ok: false,
+                    output_clean: false,
+                    latency_ms: Some(started.elapsed().as_millis() as u64),
+                    matched_expectation: None,
+                    response_excerpt: None,
+                    error: Some(error),
+                },
             }
         })
         .collect()
@@ -633,7 +624,10 @@ fn probe_healthz(client: &Client, url: &str) -> HealthProbeResult {
 
     HealthProbeResult {
         ok: http_status < 400,
-        ready: payload.get("ready").and_then(Value::as_bool).unwrap_or(false),
+        ready: payload
+            .get("ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         http_status: Some(http_status),
         service: payload
             .get("service")
@@ -652,7 +646,10 @@ fn probe_healthz(client: &Client, url: &str) -> HealthProbeResult {
             .get("backend")
             .and_then(|value| value.get("ready"))
             .and_then(Value::as_bool),
-        note: payload.get("note").and_then(Value::as_str).map(str::to_string),
+        note: payload
+            .get("note")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         error: None,
     }
 }
@@ -745,9 +742,7 @@ fn spawn_service(binary: &Path, cli: &Cli) -> SpawnedService {
         command.arg("--candle-chat-model-id").arg(model_id);
     }
     if let Some(model_id) = cli.candle_embedding_model_id.as_deref() {
-        command
-            .arg("--candle-embedding-model-id")
-            .arg(model_id);
+        command.arg("--candle-embedding-model-id").arg(model_id);
     }
 
     let child = command
@@ -757,8 +752,14 @@ fn spawn_service(binary: &Path, cli: &Cli) -> SpawnedService {
 }
 
 fn urls_from_bind(bind: &str) -> (String, String) {
-    let bind = bind.trim().trim_start_matches("http://").trim_end_matches('/');
-    (format!("http://{bind}/v1"), format!("http://{bind}/healthz"))
+    let bind = bind
+        .trim()
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    (
+        format!("http://{bind}/v1"),
+        format!("http://{bind}/healthz"),
+    )
 }
 
 fn current_timestamp_utc() -> String {

@@ -866,7 +866,7 @@ struct CachedLocalRuntimeProjection {
     projection: LocalRuntimeProjection,
 }
 
-const LOCAL_RUNTIME_PROJECTION_CACHE_TTL: Duration = Duration::from_secs(2);
+const LOCAL_RUNTIME_PROJECTION_CACHE_TTL: Duration = Duration::from_secs(30);
 
 fn local_runtime_projection_cache() -> &'static Mutex<Option<CachedLocalRuntimeProjection>> {
     static CACHE: OnceLock<Mutex<Option<CachedLocalRuntimeProjection>>> = OnceLock::new();
@@ -947,9 +947,10 @@ fn probe_local_runtime(endpoints: &[ModelEndpoint]) -> LocalRuntimeProjection {
     };
 
     let now = Instant::now();
-    if let Some(cached) = local_runtime_projection_cache()
+    let mut cache = local_runtime_projection_cache()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = cache
         .as_ref()
         .filter(|cached| cached.target_cache_key == target.cache_key && cached.expires_at > now)
         .cloned()
@@ -958,11 +959,9 @@ fn probe_local_runtime(endpoints: &[ModelEndpoint]) -> LocalRuntimeProjection {
     }
 
     let projection = probe_local_runtime_target(&target);
-    *local_runtime_projection_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CachedLocalRuntimeProjection {
+    *cache = Some(CachedLocalRuntimeProjection {
         target_cache_key: target.cache_key,
-        expires_at: now + LOCAL_RUNTIME_PROJECTION_CACHE_TTL,
+        expires_at: Instant::now() + LOCAL_RUNTIME_PROJECTION_CACHE_TTL,
         projection: projection.clone(),
     });
     projection
