@@ -2,26 +2,34 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::runtime::media_tools::{ffmpeg_resolution_hint, resolve_ffmpeg_bin};
+use crate::runtime::media_tools::{
+    ffmpeg_resolution_hint, resolve_ffmpeg_bin, resolve_ffprobe_bin,
+};
 use crate::runtime::registry::CameraDevice;
 
 const DEFAULT_HARBOROS_WRITABLE_ROOT: &str = "/mnt/software/harborbeacon-agent-ci";
 const HARBOROS_WRITABLE_ROOT_ENV: &str = "HARBOR_HARBOROS_WRITABLE_ROOT";
 const DVR_KNOWLEDGE_ROOT_ID: &str = "camera-dvr-recordings";
+const MIN_PLAYABLE_MP4_BYTES: u64 = 4096;
+const FFMPEG_GRACEFUL_STOP_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DvrRecordingSettings {
     #[serde(default = "default_recording_root")]
     pub recording_root: String,
+    #[serde(default = "default_media_library_root")]
+    pub media_library_root: String,
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
     #[serde(default = "default_segment_seconds")]
@@ -54,6 +62,7 @@ impl Default for DvrRecordingSettings {
     fn default() -> Self {
         Self {
             recording_root: default_recording_root(),
+            media_library_root: default_media_library_root(),
             retention_days: default_retention_days(),
             segment_seconds: default_segment_seconds(),
             continuous_recording_enabled: true,
@@ -107,14 +116,24 @@ pub struct DvrTimelineSegment {
     pub file_path: String,
     #[serde(default)]
     pub sidecar_path: Option<String>,
+    #[serde(default = "default_media_kind_recording")]
+    pub media_kind: String,
     pub stream_kind: String,
     pub started_at: String,
+    #[serde(default)]
+    pub created_at: String,
     pub ended_at: String,
     pub duration_seconds: u32,
+    #[serde(default)]
+    pub duration_actual_seconds: Option<u32>,
     pub retention_expires_at: String,
     pub size_bytes: u64,
     #[serde(default)]
     pub replay_url: Option<String>,
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
+    #[serde(default = "default_true")]
+    pub playable: bool,
     #[serde(default)]
     pub indexed: bool,
 }
@@ -123,6 +142,7 @@ pub struct DvrTimelineSegment {
 pub struct DvrTimelineResponse {
     pub generated_at: String,
     pub recording_root: String,
+    pub media_library_root: String,
     pub segments: Vec<DvrTimelineSegment>,
 }
 
@@ -174,7 +194,7 @@ impl DvrRuntime {
             ));
         }
 
-        let root = recording_root_path(&settings);
+        let root = media_library_root_path(&settings);
         fs::create_dir_all(
             root.join("recordings")
                 .join(device_path_component(&device.device_id)),
@@ -191,7 +211,6 @@ impl DvrRuntime {
             .arg("-hide_banner")
             .arg("-loglevel")
             .arg("warning")
-            .arg("-nostdin")
             .arg("-rtsp_transport")
             .arg("tcp")
             .arg("-i")
@@ -206,6 +225,8 @@ impl DvrRuntime {
             .arg("segment")
             .arg("-segment_time")
             .arg(settings.segment_seconds.to_string())
+            .arg("-segment_format_options")
+            .arg("movflags=+faststart")
             .arg("-reset_timestamps")
             .arg("1")
             .arg("-strftime")
@@ -213,7 +234,7 @@ impl DvrRuntime {
             .arg("-strftime_mkdir")
             .arg("1")
             .arg(pattern.to_string_lossy().into_owned())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let child = command
@@ -231,9 +252,8 @@ impl DvrRuntime {
             .processes
             .lock()
             .map_err(|_| "DVR runtime process lock is poisoned".to_string())?;
-        if let Some(mut existing) = processes.remove(&device.device_id) {
-            let _ = existing.child.kill();
-            let _ = existing.child.wait();
+        if let Some(existing) = processes.remove(&device.device_id) {
+            let _ = gracefully_stop_ffmpeg(existing.child);
         }
         processes.insert(
             device.device_id.clone(),
@@ -272,7 +292,7 @@ impl DvrRuntime {
             .processes
             .lock()
             .map_err(|_| "DVR runtime process lock is poisoned".to_string())?;
-        let Some(mut process) = processes.remove(device_id) else {
+        let Some(process) = processes.remove(device_id) else {
             return Ok(DvrRecordingStatus {
                 device_id: device_id.to_string(),
                 status: "stopped".to_string(),
@@ -290,15 +310,15 @@ impl DvrRuntime {
                 message: "DVR recording was not running".to_string(),
             });
         };
-        let _ = process.child.kill();
-        let _ = process.child.wait();
+        let _ = gracefully_stop_ffmpeg(process.child);
+        let last_segment_path = latest_segment_path_for_pattern(&process.pattern);
         Ok(DvrRecordingStatus {
             device_id: device_id.to_string(),
             status: "stopped".to_string(),
             started_at: Some(process.started_at),
             updated_at: Some(now_unix_secs().to_string()),
             stream_kind: process.stream_kind,
-            last_segment_path: None,
+            last_segment_path,
             live_mjpeg_url: public_origin.map(|origin| {
                 format!(
                     "{}/api/cameras/{}/live.mjpeg",
@@ -406,6 +426,14 @@ pub fn sanitize_dvr_recording_settings(mut settings: DvrRecordingSettings) -> Dv
     if settings.recording_root.is_empty() {
         settings.recording_root = default_recording_root();
     }
+    settings.media_library_root = settings.media_library_root.trim().to_string();
+    if settings.media_library_root.is_empty()
+        || (settings.media_library_root == default_media_library_root()
+            && settings.recording_root != default_recording_root())
+    {
+        settings.media_library_root =
+            default_media_library_root_for_recording_root(&settings.recording_root);
+    }
     settings.retention_days = settings.retention_days.clamp(1, 365);
     settings.segment_seconds = settings.segment_seconds.clamp(30, 3600);
     settings.continuous_bitrate_mbps = settings.continuous_bitrate_mbps.clamp(1, 20);
@@ -432,6 +460,17 @@ pub fn default_recording_root() -> String {
     .join("camera-dvr")
     .to_string_lossy()
     .into_owned()
+}
+
+pub fn default_media_library_root() -> String {
+    default_media_library_root_for_recording_root(&default_recording_root())
+}
+
+pub fn default_media_library_root_for_recording_root(recording_root: &str) -> String {
+    Path::new(recording_root.trim())
+        .join("library")
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn dvr_knowledge_root_id() -> &'static str {
@@ -493,7 +532,7 @@ pub fn scan_timeline(
     public_origin: Option<&str>,
 ) -> Result<DvrTimelineResponse, String> {
     let settings = sanitize_dvr_recording_settings(settings.clone());
-    let root = recording_root_path(&settings);
+    let root = media_library_root_path(&settings);
     let mut segments = Vec::new();
     let device_lookup = devices
         .iter()
@@ -503,6 +542,21 @@ pub fn scan_timeline(
     if recording_root.exists() {
         collect_segments(
             &recording_root,
+            &root,
+            &settings,
+            &device_lookup,
+            device_filter,
+            from_secs,
+            to_secs,
+            public_origin,
+            &mut segments,
+        )?;
+    }
+    let snapshot_root = root.join("snapshots");
+    if snapshot_root.exists() {
+        collect_snapshots(
+            &snapshot_root,
+            &root,
             &settings,
             &device_lookup,
             device_filter,
@@ -514,13 +568,14 @@ pub fn scan_timeline(
     }
     segments.sort_by(|left, right| {
         right
-            .started_at
-            .cmp(&left.started_at)
+            .created_at
+            .cmp(&left.created_at)
             .then_with(|| right.file_path.cmp(&left.file_path))
     });
     Ok(DvrTimelineResponse {
         generated_at: now_unix_secs().to_string(),
         recording_root: settings.recording_root,
+        media_library_root: settings.media_library_root,
         segments,
     })
 }
@@ -528,13 +583,20 @@ pub fn scan_timeline(
 pub fn apply_retention_policy(settings: &DvrRecordingSettings) -> Result<usize, String> {
     let settings = sanitize_dvr_recording_settings(settings.clone());
     let cutoff = now_unix_secs().saturating_sub(settings.retention_days as u64 * 24 * 60 * 60);
-    let recording_root = recording_root_path(&settings).join("recordings");
-    if !recording_root.exists() {
+    let media_root = media_library_root_path(&settings);
+    let recording_root = media_root.join("recordings");
+    let snapshot_root = media_root.join("snapshots");
+    if !recording_root.exists() && !snapshot_root.exists() {
         return Ok(0);
     }
     let mut removed = 0usize;
     let mut files = Vec::new();
-    collect_mp4_paths(&recording_root, &mut files)?;
+    if recording_root.exists() {
+        collect_mp4_paths(&recording_root, &mut files)?;
+    }
+    if snapshot_root.exists() {
+        collect_snapshot_paths(&snapshot_root, &mut files)?;
+    }
     for file in files {
         let timestamp = segment_timestamp_from_path(&file).or_else(|| file_modified_secs(&file));
         if timestamp.is_some_and(|value| value < cutoff) {
@@ -556,7 +618,7 @@ pub fn build_status_response(
     camera_count: usize,
 ) -> DvrRecordingStatusResponse {
     let settings = sanitize_dvr_recording_settings(settings);
-    let root = recording_root_path(&settings);
+    let root = media_library_root_path(&settings);
     DvrRecordingStatusResponse {
         generated_at: now_unix_secs().to_string(),
         capacity: dvr_capacity_estimate(&settings, camera_count),
@@ -580,6 +642,7 @@ pub fn recording_stream_url(device: &CameraDevice, settings: &DvrRecordingSettin
 
 fn collect_segments(
     directory: &Path,
+    media_root: &Path,
     settings: &DvrRecordingSettings,
     device_lookup: &HashMap<&str, &CameraDevice>,
     device_filter: Option<&str>,
@@ -601,6 +664,7 @@ fn collect_segments(
         if path.is_dir() {
             collect_segments(
                 &path,
+                media_root,
                 settings,
                 device_lookup,
                 device_filter,
@@ -618,7 +682,8 @@ fn collect_segments(
         {
             continue;
         }
-        let device_id = device_id_from_segment_path(settings, &path).unwrap_or_default();
+        let device_id =
+            device_id_from_media_path(media_root, "recordings", &path).unwrap_or_default();
         if device_id.is_empty() {
             continue;
         }
@@ -629,39 +694,52 @@ fn collect_segments(
         let Some(started) = started else {
             continue;
         };
-        let ended = started.saturating_add(settings.segment_seconds as u64);
-        if from_secs.is_some_and(|from| ended < from) || to_secs.is_some_and(|to| started > to) {
-            continue;
-        }
         let size_bytes = fs::metadata(&path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
+        let playback = recording_playback_info(&path, size_bytes, settings.segment_seconds);
+        if !playback.playable {
+            continue;
+        }
+        let actual_duration = playback
+            .duration_seconds
+            .unwrap_or(settings.segment_seconds.max(1));
+        let ended = started.saturating_add(actual_duration as u64);
+        if from_secs.is_some_and(|from| ended < from) || to_secs.is_some_and(|to| started > to) {
+            continue;
+        }
         let retention_expires_at =
             started.saturating_add(settings.retention_days as u64 * 24 * 60 * 60);
         let sidecar_path = path.with_extension("json");
         let sidecar_exists = sidecar_path.exists();
         let sidecar_path_text = sidecar_path.to_string_lossy().into_owned();
+        let replay_url = public_origin.map(|origin| {
+            format!(
+                "{}/api/knowledge/preview?path={}",
+                origin.trim_end_matches('/'),
+                url_encode_query_component(&path.to_string_lossy())
+            )
+        });
         let mut segment = DvrTimelineSegment {
             device_id: device_id.clone(),
             file_path: path.to_string_lossy().into_owned(),
             sidecar_path: Some(sidecar_path_text),
+            media_kind: "recording".to_string(),
             stream_kind: if settings.low_bitrate_stream_preferred {
                 "substream".to_string()
             } else {
                 "mainstream".to_string()
             },
             started_at: started.to_string(),
+            created_at: started.to_string(),
             ended_at: ended.to_string(),
             duration_seconds: settings.segment_seconds,
+            duration_actual_seconds: Some(actual_duration),
             retention_expires_at: retention_expires_at.to_string(),
             size_bytes,
-            replay_url: public_origin.map(|origin| {
-                format!(
-                    "{}/api/knowledge/preview?path={}",
-                    origin.trim_end_matches('/'),
-                    url_encode_query_component(&path.to_string_lossy())
-                )
-            }),
+            replay_url: replay_url.clone(),
+            thumbnail_url: replay_url,
+            playable: true,
             indexed: sidecar_exists,
         };
         if let Some(device) = device_lookup.get(device_id.as_str()) {
@@ -673,6 +751,160 @@ fn collect_segments(
     Ok(())
 }
 
+fn collect_snapshots(
+    directory: &Path,
+    media_root: &Path,
+    settings: &DvrRecordingSettings,
+    device_lookup: &HashMap<&str, &CameraDevice>,
+    device_filter: Option<&str>,
+    from_secs: Option<u64>,
+    to_secs: Option<u64>,
+    public_origin: Option<&str>,
+    segments: &mut Vec<DvrTimelineSegment>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "failed to read DVR snapshot directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("failed to read DVR snapshot directory entry: {error}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_snapshots(
+                &path,
+                media_root,
+                settings,
+                device_lookup,
+                device_filter,
+                from_secs,
+                to_secs,
+                public_origin,
+                segments,
+            )?;
+            continue;
+        }
+        if !is_snapshot_path(&path) {
+            continue;
+        }
+        let device_id =
+            device_id_from_media_path(media_root, "snapshots", &path).unwrap_or_default();
+        if device_id.is_empty() {
+            continue;
+        }
+        if device_filter.is_some_and(|filter| filter != device_id) {
+            continue;
+        }
+        let created = segment_timestamp_from_path(&path).or_else(|| file_modified_secs(&path));
+        let Some(created) = created else {
+            continue;
+        };
+        if from_secs.is_some_and(|from| created < from) || to_secs.is_some_and(|to| created > to) {
+            continue;
+        }
+        let size_bytes = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if size_bytes == 0 {
+            continue;
+        }
+        let retention_expires_at =
+            created.saturating_add(settings.retention_days as u64 * 24 * 60 * 60);
+        let sidecar_path = path.with_extension("json");
+        let replay_url = public_origin.map(|origin| {
+            format!(
+                "{}/api/knowledge/preview?path={}",
+                origin.trim_end_matches('/'),
+                url_encode_query_component(&path.to_string_lossy())
+            )
+        });
+        let mut segment = DvrTimelineSegment {
+            device_id: device_id.clone(),
+            file_path: path.to_string_lossy().into_owned(),
+            sidecar_path: Some(sidecar_path.to_string_lossy().into_owned()),
+            media_kind: "snapshot".to_string(),
+            stream_kind: "snapshot".to_string(),
+            started_at: created.to_string(),
+            created_at: created.to_string(),
+            ended_at: created.to_string(),
+            duration_seconds: 0,
+            duration_actual_seconds: Some(0),
+            retention_expires_at: retention_expires_at.to_string(),
+            size_bytes,
+            replay_url: replay_url.clone(),
+            thumbnail_url: replay_url,
+            playable: true,
+            indexed: sidecar_path.exists(),
+        };
+        if let Some(device) = device_lookup.get(device_id.as_str()) {
+            write_snapshot_sidecar(&segment, device)?;
+            segment.indexed = true;
+        }
+        segments.push(segment);
+    }
+    Ok(())
+}
+
+pub fn store_snapshot_bytes(
+    settings: &DvrRecordingSettings,
+    device: &CameraDevice,
+    bytes: &[u8],
+    public_origin: Option<&str>,
+) -> Result<DvrTimelineSegment, String> {
+    if bytes.is_empty() {
+        return Err("DVR snapshot bytes were empty".to_string());
+    }
+    let settings = sanitize_dvr_recording_settings(settings.clone());
+    let created = now_unix_secs();
+    let path = snapshot_media_path(
+        &media_library_root_path(&settings),
+        &device.device_id,
+        created,
+    );
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create DVR snapshot directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(&path, bytes)
+        .map_err(|error| format!("failed to write DVR snapshot {}: {error}", path.display()))?;
+    let retention_expires_at =
+        created.saturating_add(settings.retention_days as u64 * 24 * 60 * 60);
+    let sidecar_path = path.with_extension("json");
+    let replay_url = public_origin.map(|origin| {
+        format!(
+            "{}/api/knowledge/preview?path={}",
+            origin.trim_end_matches('/'),
+            url_encode_query_component(&path.to_string_lossy())
+        )
+    });
+    let segment = DvrTimelineSegment {
+        device_id: device.device_id.clone(),
+        file_path: path.to_string_lossy().into_owned(),
+        sidecar_path: Some(sidecar_path.to_string_lossy().into_owned()),
+        media_kind: "snapshot".to_string(),
+        stream_kind: "snapshot".to_string(),
+        started_at: created.to_string(),
+        created_at: created.to_string(),
+        ended_at: created.to_string(),
+        duration_seconds: 0,
+        duration_actual_seconds: Some(0),
+        retention_expires_at: retention_expires_at.to_string(),
+        size_bytes: bytes.len() as u64,
+        replay_url: replay_url.clone(),
+        thumbnail_url: replay_url,
+        playable: true,
+        indexed: true,
+    };
+    write_snapshot_sidecar(&segment, device)?;
+    Ok(segment)
+}
+
 fn write_segment_sidecar(
     segment: &DvrTimelineSegment,
     device: &CameraDevice,
@@ -681,7 +913,7 @@ fn write_segment_sidecar(
     let sidecar_path = Path::new(&segment.file_path).with_extension("json");
     let payload = json!({
         "media_asset": {
-            "kind": "recording",
+            "kind": segment.media_kind,
             "source": "camera_dvr",
             "device_id": segment.device_id,
             "device_name": device.name,
@@ -690,9 +922,12 @@ fn write_segment_sidecar(
             "model": device.model,
             "stream_kind": segment.stream_kind,
             "started_at": segment.started_at,
+            "created_at": segment.created_at,
             "ended_at": segment.ended_at,
             "duration_seconds": segment.duration_seconds,
+            "duration_actual_seconds": segment.duration_actual_seconds,
             "retention_expires_at": segment.retention_expires_at,
+            "playable": segment.playable,
             "source_video_path": segment.file_path,
             "labels": ["video", "recording", "dvr", "analysis_pending"],
             "analysis_pipeline": "multimodal_rag_vlm",
@@ -727,6 +962,54 @@ fn write_segment_sidecar(
     })
 }
 
+fn write_snapshot_sidecar(
+    segment: &DvrTimelineSegment,
+    device: &CameraDevice,
+) -> Result<(), String> {
+    let sidecar_path = Path::new(&segment.file_path).with_extension("json");
+    let payload = json!({
+        "media_asset": {
+            "kind": "snapshot",
+            "source": "camera_dvr",
+            "device_id": segment.device_id,
+            "device_name": device.name,
+            "room": device.room,
+            "vendor": device.vendor,
+            "model": device.model,
+            "created_at": segment.created_at,
+            "retention_expires_at": segment.retention_expires_at,
+            "source_image_path": segment.file_path,
+            "labels": ["image", "snapshot", "dvr", "analysis_pending"],
+            "analysis_pipeline": "multimodal_rag_vlm",
+            "model_boundary": "reuse_model_center_vlm_and_existing_knowledge_index"
+        },
+        "caption": format!(
+            "Camera DVR snapshot from {} at {}. Image sidecar is ready for existing multimodal RAG/VLM indexing.",
+            segment.device_id, segment.created_at
+        ),
+        "derived_text": "local camera DVR snapshot; analyze via existing HarborBeacon knowledge index image OCR/VLM path",
+        "source_image_path": segment.file_path,
+        "camera": {
+            "device_id": segment.device_id,
+            "name": device.name,
+            "room": device.room,
+            "ip_address": device.ip_address
+        },
+        "labels": ["image", "snapshot", "dvr", "analysis_pending"]
+    });
+    fs::write(
+        &sidecar_path,
+        serde_json::to_vec_pretty(&payload)
+            .map_err(|error| format!("failed to serialize DVR snapshot sidecar: {error}"))?,
+    )
+    .map_err(|error| {
+        format!(
+            "failed to write DVR snapshot sidecar {}: {error}",
+            sidecar_path.display()
+        )
+    })
+}
+
 fn collect_mp4_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
     for entry in fs::read_dir(directory).map_err(|error| {
         format!(
@@ -750,8 +1033,27 @@ fn collect_mp4_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<(), S
     Ok(())
 }
 
+fn collect_snapshot_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| {
+        format!(
+            "failed to read DVR snapshot directory {}: {error}",
+            directory.display()
+        )
+    })? {
+        let entry = entry
+            .map_err(|error| format!("failed to read DVR snapshot directory entry: {error}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_snapshot_paths(&path, paths)?;
+        } else if is_snapshot_path(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
 fn latest_segment_path(settings: &DvrRecordingSettings, device_id: &str) -> Option<String> {
-    let root = recording_root_path(settings)
+    let root = media_library_root_path(settings)
         .join("recordings")
         .join(device_path_component(device_id));
     if !root.exists() {
@@ -764,8 +1066,31 @@ fn latest_segment_path(settings: &DvrRecordingSettings, device_id: &str) -> Opti
     paths.last().map(|path| path.to_string_lossy().into_owned())
 }
 
+fn latest_segment_path_for_pattern(pattern: &Path) -> Option<String> {
+    let device_root = pattern
+        .parent()?
+        .parent()?
+        .parent()?
+        .parent()?
+        .to_path_buf();
+    if !device_root.exists() {
+        return None;
+    }
+    let mut paths = Vec::new();
+    collect_mp4_paths(&device_root, &mut paths).ok()?;
+    paths.retain(|path| {
+        let size_bytes = fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        recording_playback_info(path, size_bytes, 1).playable
+    });
+    paths
+        .sort_by_key(|path| segment_timestamp_from_path(path).or_else(|| file_modified_secs(path)));
+    paths.last().map(|path| path.to_string_lossy().into_owned())
+}
+
 fn segment_output_pattern(settings: &DvrRecordingSettings, device_id: &str) -> PathBuf {
-    recording_root_path(settings)
+    media_library_root_path(settings)
         .join("recordings")
         .join(device_path_component(device_id))
         .join("%Y")
@@ -774,8 +1099,56 @@ fn segment_output_pattern(settings: &DvrRecordingSettings, device_id: &str) -> P
         .join("%H%M%S.mp4")
 }
 
-fn recording_root_path(settings: &DvrRecordingSettings) -> PathBuf {
-    PathBuf::from(settings.recording_root.trim())
+pub fn media_library_root_path(settings: &DvrRecordingSettings) -> PathBuf {
+    PathBuf::from(settings.media_library_root.trim())
+}
+
+pub fn dvr_media_preview_path(
+    settings: &DvrRecordingSettings,
+    requested_path: &str,
+) -> Result<PathBuf, String> {
+    let settings = sanitize_dvr_recording_settings(settings.clone());
+    let requested = PathBuf::from(requested_path.trim());
+    if !requested.is_absolute() {
+        return Err("DVR media preview path must be absolute".to_string());
+    }
+    let requested = requested
+        .canonicalize()
+        .map_err(|_| format!("DVR media preview file not found: {}", requested.display()))?;
+    let root = media_library_root_path(&settings)
+        .canonicalize()
+        .map_err(|_| "DVR media library root is not available".to_string())?;
+    if !path_is_same_or_inside_path(&requested, &root) {
+        return Err(format!(
+            "DVR media preview path is outside the media library: {}",
+            requested.display()
+        ));
+    }
+    if requested.is_dir() || !requested.is_file() {
+        return Err(format!(
+            "DVR media preview file not found: {}",
+            requested.display()
+        ));
+    }
+    if is_recording_path(&requested) {
+        let size_bytes = fs::metadata(&requested)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if !recording_playback_info(&requested, size_bytes, 1).playable {
+            return Err(format!(
+                "DVR recording is not playable: {}",
+                requested.display()
+            ));
+        }
+        return Ok(requested);
+    }
+    if is_snapshot_path(&requested) {
+        return Ok(requested);
+    }
+    Err(format!(
+        "DVR media preview supports recordings and snapshots only: {}",
+        requested.display()
+    ))
 }
 
 fn prepare_segment_calendar_dirs(
@@ -798,14 +1171,126 @@ fn prepare_segment_calendar_dirs(
     Ok(())
 }
 
-fn device_id_from_segment_path(settings: &DvrRecordingSettings, path: &Path) -> Option<String> {
-    let root = recording_root_path(settings).join("recordings");
+fn snapshot_media_path(media_root: &Path, device_id: &str, unix_secs: u64) -> PathBuf {
+    let (year, month, day, hour, minute, second) = unix_to_utc_parts(unix_secs);
+    media_root
+        .join("snapshots")
+        .join(device_path_component(device_id))
+        .join(format!("{year:04}"))
+        .join(format!("{month:02}"))
+        .join(format!("{day:02}"))
+        .join(format!("{hour:02}{minute:02}{second:02}.jpg"))
+}
+
+fn device_id_from_media_path(
+    media_root: &Path,
+    media_kind_dir: &str,
+    path: &Path,
+) -> Option<String> {
+    let root = media_root.join(media_kind_dir);
     let relative = path.strip_prefix(root).ok()?;
     relative
         .components()
         .next()
         .and_then(|component| component.as_os_str().to_str())
         .map(|value| value.to_string())
+}
+
+fn is_recording_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
+}
+
+fn is_snapshot_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "webp"
+            )
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlaybackInfo {
+    playable: bool,
+    duration_seconds: Option<u32>,
+}
+
+fn recording_playback_info(
+    path: &Path,
+    size_bytes: u64,
+    fallback_duration_seconds: u32,
+) -> PlaybackInfo {
+    if size_bytes < MIN_PLAYABLE_MP4_BYTES {
+        return PlaybackInfo {
+            playable: false,
+            duration_seconds: None,
+        };
+    }
+    if let Some(duration_seconds) = ffprobe_video_duration_seconds(path) {
+        return PlaybackInfo {
+            playable: true,
+            duration_seconds: Some(duration_seconds.max(1)),
+        };
+    }
+    PlaybackInfo {
+        playable: true,
+        duration_seconds: Some(fallback_duration_seconds.max(1)),
+    }
+}
+
+fn ffprobe_video_duration_seconds(path: &Path) -> Option<u32> {
+    let ffprobe = resolve_ffprobe_bin()?;
+    let output = Command::new(ffprobe)
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-of")
+        .arg("default=nokey=1:noprint_wrappers=1")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let seconds = text
+        .lines()
+        .find_map(|line| line.trim().parse::<f64>().ok())?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    Some(seconds.ceil() as u32)
+}
+
+fn gracefully_stop_ffmpeg(mut child: Child) -> std::io::Result<()> {
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(b"q\n");
+        let _ = stdin.flush();
+    }
+    let started = SystemTime::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let elapsed = started.elapsed().unwrap_or_default().as_millis() as u64;
+        if elapsed >= FFMPEG_GRACEFUL_STOP_TIMEOUT_MS {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn path_is_same_or_inside_path(candidate: &Path, root: &Path) -> bool {
+    candidate == root || candidate.starts_with(root)
 }
 
 fn segment_timestamp_from_path(path: &Path) -> Option<u64> {
@@ -1015,6 +1500,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_media_kind_recording() -> String {
+    "recording".to_string()
+}
+
 fn default_retention_days() -> u32 {
     7
 }
@@ -1114,6 +1603,7 @@ mod tests {
     fn sanitize_settings_clamps_retention_segments_and_dedupes_devices() {
         let settings = sanitize_dvr_recording_settings(DvrRecordingSettings {
             recording_root: " ".to_string(),
+            media_library_root: " ".to_string(),
             retention_days: 0,
             segment_seconds: 12,
             continuous_bitrate_mbps: 0,
@@ -1126,6 +1616,8 @@ mod tests {
             ..Default::default()
         });
         assert!(!settings.recording_root.trim().is_empty());
+        assert!(Path::new(&settings.media_library_root)
+            .ends_with(Path::new("camera-dvr").join("library")));
         assert_eq!(settings.retention_days, 1);
         assert_eq!(settings.segment_seconds, 30);
         assert_eq!(settings.continuous_bitrate_mbps, 1);
@@ -1136,14 +1628,18 @@ mod tests {
     #[test]
     fn timeline_scan_writes_video_sidecar_for_rag() {
         let root = unique_dir("harborbeacon-dvr-timeline");
+        let media_root = root.join("library");
         let settings = DvrRecordingSettings {
             recording_root: root.to_string_lossy().into_owned(),
+            media_library_root: media_root.to_string_lossy().into_owned(),
             segment_seconds: 300,
             ..Default::default()
         };
-        let video_path = recording_segment_path(&root, "camera-main", 1_704_067_205);
+        let video_path = recording_segment_path(&media_root, "camera-main", 1_704_067_205);
         fs::create_dir_all(video_path.parent().expect("parent")).expect("create dir");
-        fs::write(&video_path, b"fake-mp4").expect("write video");
+        let mut fake_video = b"ftyp".to_vec();
+        fake_video.resize((MIN_PLAYABLE_MP4_BYTES + 1) as usize, 0);
+        fs::write(&video_path, fake_video).expect("write video");
         let mut device = CameraDevice::new("camera-main", "Front Door", "rtsp://host/stream1");
         device.room = Some("Door".to_string());
 
@@ -1151,10 +1647,42 @@ mod tests {
 
         assert_eq!(response.segments.len(), 1);
         assert_eq!(response.segments[0].device_id, "camera-main");
+        assert_eq!(response.media_library_root, media_root.to_string_lossy());
+        assert_eq!(response.segments[0].media_kind, "recording");
+        assert!(response.segments[0].playable);
         let sidecar = video_path.with_extension("json");
         let text = fs::read_to_string(sidecar).expect("sidecar");
         assert!(text.contains("multimodal_rag_vlm"));
         assert!(text.contains("analysis_pending"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn timeline_scan_hides_unplayable_tiny_recordings_and_mixes_snapshots() {
+        let root = unique_dir("harborbeacon-dvr-media-library");
+        let media_root = root.join("library");
+        let settings = DvrRecordingSettings {
+            recording_root: root.to_string_lossy().into_owned(),
+            media_library_root: media_root.to_string_lossy().into_owned(),
+            segment_seconds: 30,
+            ..Default::default()
+        };
+        let bad_video_path = recording_segment_path(&media_root, "camera-main", 1_704_067_205);
+        fs::create_dir_all(bad_video_path.parent().expect("parent")).expect("create video dir");
+        fs::write(&bad_video_path, vec![0_u8; 48]).expect("write bad video");
+        let snapshot_path = snapshot_media_path(&media_root, "camera-main", 1_704_067_206);
+        fs::create_dir_all(snapshot_path.parent().expect("parent")).expect("create snapshot dir");
+        fs::write(&snapshot_path, [0xFF, 0xD8, 0xFF, 0xD9]).expect("write snapshot");
+        let device = CameraDevice::new("camera-main", "Front Door", "rtsp://host/stream1");
+
+        let response = scan_timeline(&settings, &[device], None, None, None, None).expect("scan");
+
+        assert_eq!(response.segments.len(), 1);
+        assert_eq!(response.segments[0].media_kind, "snapshot");
+        assert_eq!(
+            response.segments[0].file_path,
+            snapshot_path.to_string_lossy()
+        );
         let _ = fs::remove_dir_all(root);
     }
 

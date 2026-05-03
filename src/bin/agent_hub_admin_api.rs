@@ -45,7 +45,8 @@ use harborbeacon_local_agent::runtime::admin_console::{
 };
 use harborbeacon_local_agent::runtime::discovery::RtspProbeRequest;
 use harborbeacon_local_agent::runtime::dvr::{
-    apply_retention_policy, build_status_response, scan_timeline, DvrRecordingSettings, DvrRuntime,
+    apply_retention_policy, build_status_response, dvr_media_preview_path, media_library_root_path,
+    scan_timeline, store_snapshot_bytes, DvrRecordingSettings, DvrRuntime, DvrTimelineSegment,
 };
 use harborbeacon_local_agent::runtime::hub::{
     CameraConnectRequest, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
@@ -602,6 +603,27 @@ struct KnowledgeSearchApiRequest {
     include_images: Option<bool>,
     #[serde(default)]
     include_videos: Option<bool>,
+    #[serde(default)]
+    source_scope: Option<String>,
+    #[serde(default)]
+    camera_id: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+}
+
+impl KnowledgeSearchApiRequest {
+    fn has_dvr_focus(&self) -> bool {
+        [
+            self.camera_id.as_deref(),
+            self.from.as_deref(),
+            self.to.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -783,6 +805,8 @@ struct ModelDownloadRequest {
 #[derive(Debug, Serialize)]
 struct CameraTaskResponse {
     task_response: TaskResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_item: Option<DvrTimelineSegment>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1593,7 +1617,22 @@ impl AdminApi {
             Ok(settings) => settings,
             Err(error) => return error_json(StatusCode(500), &error),
         };
-        let search_request = match build_admin_knowledge_search_request(payload, &settings) {
+        let focus_paths = match self.resolve_dvr_search_focus_paths(&payload) {
+            Ok(paths) => paths,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let dvr_settings = self.admin_store.dvr_recording_settings().ok();
+        let scoped_roots =
+            match resolve_admin_search_source_scope(&payload, &settings, dvr_settings.as_ref()) {
+                Ok(roots) => roots,
+                Err(error) => return error_json(StatusCode(422), &error),
+            };
+        let search_request = match build_admin_knowledge_search_request(
+            payload,
+            &settings,
+            focus_paths,
+            scoped_roots,
+        ) {
             Ok(request) => request,
             Err(error) => return error_json(StatusCode(422), &error),
         };
@@ -1601,6 +1640,50 @@ impl AdminApi {
             Ok(response) => ok_json(&response),
             Err(error) => error_json(StatusCode(422), &error),
         }
+    }
+
+    fn resolve_dvr_search_focus_paths(
+        &self,
+        payload: &KnowledgeSearchApiRequest,
+    ) -> Result<Vec<String>, String> {
+        if !payload.has_dvr_focus() {
+            return Ok(Vec::new());
+        }
+        if payload.include_videos == Some(false) {
+            return Err("DVR camera/time filters require video search to be enabled.".to_string());
+        }
+        let from_secs = parse_optional_unix_seconds(payload.from.as_deref(), "from")?;
+        let to_secs = parse_optional_unix_seconds(payload.to.as_deref(), "to")?;
+        if let (Some(from), Some(to)) = (from_secs, to_secs) {
+            if from > to {
+                return Err("DVR search time filter has from greater than to.".to_string());
+            }
+        }
+        let settings = self.admin_store.dvr_recording_settings()?;
+        if let Err(error) = apply_retention_policy(&settings) {
+            return Err(error);
+        }
+        let devices = self.hub().load_registered_cameras()?;
+        let camera_id = payload.camera_id.as_deref().and_then(non_empty_string);
+        let timeline = scan_timeline(
+            &settings,
+            &devices,
+            camera_id.as_deref(),
+            from_secs,
+            to_secs,
+            None,
+        )?;
+        let focus_paths = timeline
+            .segments
+            .into_iter()
+            .map(|segment| segment.file_path)
+            .collect::<Vec<_>>();
+        if focus_paths.is_empty() {
+            return Err(
+                "No DVR recording segments matched the requested camera/time scope.".to_string(),
+            );
+        }
+        Ok(focus_paths)
     }
 
     fn handle_knowledge_preview(
@@ -1624,7 +1707,15 @@ impl AdminApi {
         };
         let preview_path = match resolve_knowledge_preview_path(&requested_path, &settings) {
             Ok(path) => path,
-            Err(error) => return error_json(error.status, &error.message),
+            Err(error) => match self
+                .admin_store
+                .dvr_recording_settings()
+                .ok()
+                .and_then(|settings| dvr_media_preview_path(&settings, &requested_path).ok())
+            {
+                Some(path) => path,
+                None => return error_json(error.status, &error.message),
+            },
         };
         static_file_response(&preview_path)
     }
@@ -3047,6 +3138,7 @@ impl AdminApi {
 
         ok_json(&CameraTaskResponse {
             task_response: redact_camera_task_response(self.analyze_camera(&principal, &device_id)),
+            media_item: None,
         })
     }
 
@@ -3065,10 +3157,12 @@ impl AdminApi {
                 Err(error) => return error_json(StatusCode(403), &error),
             };
 
+        let task_response =
+            redact_camera_task_response(self.snapshot_camera(&principal, &device_id));
+        let media_item = self.store_dvr_snapshot_media_item(&device_id).ok();
         ok_json(&CameraTaskResponse {
-            task_response: redact_camera_task_response(
-                self.snapshot_camera(&principal, &device_id),
-            ),
+            task_response,
+            media_item,
         })
     }
 
@@ -3091,6 +3185,7 @@ impl AdminApi {
         self.record_share_link_response_evidence(&device_id, &task_response);
         ok_json(&CameraTaskResponse {
             task_response: redact_camera_task_response(task_response),
+            media_item: None,
         })
     }
 
@@ -3586,6 +3681,13 @@ impl AdminApi {
 
     fn capture_camera_snapshot(&self, device_id: &str) -> Result<Vec<u8>, String> {
         self.hub().capture_camera_snapshot(device_id)
+    }
+
+    fn store_dvr_snapshot_media_item(&self, device_id: &str) -> Result<DvrTimelineSegment, String> {
+        let settings = self.admin_store.dvr_recording_settings()?;
+        let device = self.load_camera_device(device_id)?;
+        let bytes = self.capture_camera_snapshot(device_id)?;
+        store_snapshot_bytes(&settings, &device, &bytes, Some(&self.public_origin))
     }
 
     fn load_camera_device(
@@ -6397,9 +6499,64 @@ fn knowledge_index_storage_summary(index_path: &Path) -> KnowledgeIndexStorageSu
     summary
 }
 
+fn resolve_admin_search_source_scope(
+    payload: &KnowledgeSearchApiRequest,
+    settings: &KnowledgeSettings,
+    dvr_settings: Option<&DvrRecordingSettings>,
+) -> Result<Vec<String>, String> {
+    let scope = payload
+        .source_scope
+        .as_deref()
+        .and_then(non_empty_string)
+        .map(|value| value.to_ascii_lowercase());
+    let Some(scope) = scope else {
+        return Ok(Vec::new());
+    };
+    if scope == "all" {
+        return Ok(Vec::new());
+    }
+    let dvr_root = dvr_settings
+        .map(|settings| {
+            media_library_root_path(settings)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .and_then(|path| non_empty_string(&path));
+    match scope.as_str() {
+        "dvr_library" => dvr_root
+            .map(|path| vec![path])
+            .ok_or_else(|| "DVR media library source scope requires DVR settings.".to_string()),
+        "nas_files" => {
+            let dvr_root = dvr_root.unwrap_or_default();
+            let roots = settings
+                .source_roots
+                .iter()
+                .filter(|root| root.enabled)
+                .filter_map(|root| non_empty_string(&root.path))
+                .filter(|root_path| {
+                    dvr_root.is_empty()
+                        || (!path_is_same_or_inside(root_path, &dvr_root)
+                            && !path_is_same_or_inside(&dvr_root, root_path))
+                })
+                .collect::<Vec<_>>();
+            if roots.is_empty() {
+                Err("No NAS source roots are configured outside the DVR media library.".to_string())
+            } else {
+                Ok(roots)
+            }
+        }
+        _ => Err(format!(
+            "Unsupported HarborBot source_scope {}; expected dvr_library, nas_files, or all.",
+            scope
+        )),
+    }
+}
+
 fn build_admin_knowledge_search_request(
     payload: KnowledgeSearchApiRequest,
     settings: &KnowledgeSettings,
+    focus_paths: Vec<String>,
+    scoped_roots: Vec<String>,
 ) -> Result<KnowledgeSearchRequest, String> {
     let query = payload.query.trim();
     if query.is_empty() {
@@ -6411,7 +6568,11 @@ fn build_admin_knowledge_search_request(
     }
     let mut request = KnowledgeSearchRequest::new(query.to_string());
     request.configured_roots = configured_roots.clone();
-    request.roots = configured_roots;
+    request.roots = if scoped_roots.is_empty() {
+        configured_roots
+    } else {
+        scoped_roots
+    };
     request.index_root = non_empty_string(&settings.index_root);
     request.include_documents = payload.include_documents.unwrap_or(true);
     request.include_images = payload.include_images.unwrap_or(true);
@@ -6421,7 +6582,18 @@ fn build_admin_knowledge_search_request(
     request.resource_profile = settings.default_resource_profile;
     request.require_embeddings = false;
     request.latency_budget_ms = None;
+    request.focus_paths = focus_paths;
     Ok(request)
+}
+
+fn parse_optional_unix_seconds(value: Option<&str>, field: &str) -> Result<Option<u64>, String> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| format!("DVR search {field} must be Unix seconds.")),
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11054,9 +11226,9 @@ mod tests {
         parse_member_default_delivery_surface_update_path, parse_member_role_update_path,
         parse_model_download_cancel_path, parse_model_download_job_path, parse_model_endpoint_path,
         parse_model_endpoint_test_path, parse_notification_target_delete_path,
-        parse_share_link_revoke_path, parse_shared_camera_live_page_path,
-        parse_shared_camera_live_stream_path, percent_decode_path_segment,
-        probe_local_model_runtime, redact_account_management_snapshot,
+        parse_optional_unix_seconds, parse_share_link_revoke_path,
+        parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
+        percent_decode_path_segment, probe_local_model_runtime, redact_account_management_snapshot,
         redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
         redact_value_stream_credentials, release_item, request_identity_hints,
@@ -12610,8 +12782,14 @@ mod tests {
                 include_documents: Some(false),
                 include_images: None,
                 include_videos: Some(true),
+                source_scope: None,
+                camera_id: None,
+                from: None,
+                to: None,
             },
             &settings,
+            vec!["/mnt/source-a/camera-main/segment.mp4".to_string()],
+            Vec::new(),
         )
         .expect("search request");
 
@@ -12623,6 +12801,38 @@ mod tests {
         assert!(request.include_images);
         assert!(request.include_videos);
         assert_eq!(request.index_root.as_deref(), Some("/mnt/index"));
+        assert_eq!(
+            request.focus_paths,
+            vec!["/mnt/source-a/camera-main/segment.mp4"]
+        );
+    }
+
+    #[test]
+    fn admin_search_request_detects_and_validates_dvr_focus_fields() {
+        let payload = KnowledgeSearchApiRequest {
+            query: "谁在倒饮料".to_string(),
+            limit: None,
+            include_documents: None,
+            include_images: None,
+            include_videos: Some(true),
+            source_scope: None,
+            camera_id: Some(" camera-main ".to_string()),
+            from: Some("1714600000".to_string()),
+            to: Some("1714600300".to_string()),
+        };
+
+        assert!(payload.has_dvr_focus());
+        assert_eq!(
+            parse_optional_unix_seconds(payload.from.as_deref(), "from").unwrap(),
+            Some(1_714_600_000)
+        );
+        assert_eq!(
+            parse_optional_unix_seconds(payload.to.as_deref(), "to").unwrap(),
+            Some(1_714_600_300)
+        );
+        assert!(parse_optional_unix_seconds(Some("today"), "from")
+            .unwrap_err()
+            .contains("Unix seconds"));
     }
 
     #[test]

@@ -981,6 +981,12 @@ impl AdminConsoleStore {
                 settings.recording_root
             )
         })?;
+        fs::create_dir_all(&settings.media_library_root).map_err(|error| {
+            format!(
+                "failed to create DVR media_library_root {}: {error}",
+                settings.media_library_root
+            )
+        })?;
         let mut state = self.load_or_create_state()?;
         state.dvr = settings.clone();
         upsert_dvr_knowledge_root(&mut state.knowledge, &settings);
@@ -1581,17 +1587,24 @@ pub fn sanitize_knowledge_settings(settings: KnowledgeSettings) -> KnowledgeSett
 }
 
 fn upsert_dvr_knowledge_root(settings: &mut KnowledgeSettings, dvr: &DvrRecordingSettings) {
-    let path = dvr.recording_root.trim();
+    let path = dvr.media_library_root.trim();
     if path.is_empty() {
         return;
     }
     let root_id = dvr_knowledge_root_id().to_string();
     let root = KnowledgeSourceRoot {
         root_id: root_id.clone(),
-        label: "Camera DVR Recordings".to_string(),
+        label: "Camera DVR Library".to_string(),
         path: path.to_string(),
         enabled: true,
-        include: vec!["**/*.mp4".to_string(), "**/*.json".to_string()],
+        include: vec![
+            "**/*.mp4".to_string(),
+            "**/*.jpg".to_string(),
+            "**/*.jpeg".to_string(),
+            "**/*.png".to_string(),
+            "**/*.webp".to_string(),
+            "**/*.json".to_string(),
+        ],
         exclude: Vec::new(),
         last_indexed_at: None,
     };
@@ -2542,6 +2555,7 @@ fn sanitize_legacy_admin_fields(state: &mut AdminConsoleState) {
     state.bridge_provider = sanitize_bridge_provider_config(state.bridge_provider.clone());
     state.remote_view = sanitize_remote_view_config(state.remote_view.clone());
     state.dvr = sanitize_dvr_recording_settings(state.dvr.clone());
+    upsert_dvr_knowledge_root(&mut state.knowledge, &state.dvr);
     state.notification_targets = sanitize_notification_targets(state.notification_targets.clone());
     state.device_credentials = sanitize_device_credentials(state.device_credentials.clone());
     state.device_evidence = sanitize_device_evidence_records(state.device_evidence.clone());
@@ -2601,6 +2615,10 @@ fn apply_workspace_projection_to_legacy(state: &mut AdminConsoleState) {
 
     if let Some(dvr) = workspace.settings.get("dvr") {
         assign_string(&mut state.dvr.recording_root, dvr.get("recording_root"));
+        assign_string(
+            &mut state.dvr.media_library_root,
+            dvr.get("media_library_root"),
+        );
         if let Some(days) = dvr.get("retention_days").and_then(Value::as_u64) {
             state.dvr.retention_days = days as u32;
         }
@@ -3326,6 +3344,7 @@ fn set_workspace_dvr_projection(workspace: &mut Workspace, dvr: &DvrRecordingSet
         "dvr".to_string(),
         json!({
             "recording_root": dvr.recording_root.clone(),
+            "media_library_root": dvr.media_library_root.clone(),
             "retention_days": dvr.retention_days,
             "segment_seconds": dvr.segment_seconds,
             "continuous_recording_enabled": dvr.continuous_recording_enabled,
@@ -4684,6 +4703,7 @@ mod tests {
         let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
         let store = AdminConsoleStore::new(admin_path.clone(), registry);
         let recording_root = std::env::temp_dir().join("harborbeacon-dvr-recordings-valid");
+        let media_library_root = recording_root.join("library");
 
         let updated = store
             .save_dvr_recording_settings(DvrRecordingSettings {
@@ -4700,13 +4720,17 @@ mod tests {
         assert_eq!(updated.dvr.segment_seconds, 600);
         assert!(updated.knowledge.source_roots.iter().any(|root| {
             root.root_id == "camera-dvr-recordings"
-                && root.path == recording_root.to_string_lossy()
+                && root.path == media_library_root.to_string_lossy()
                 && root.enabled
                 && root.include.iter().any(|pattern| pattern == "**/*.mp4")
         }));
         assert_eq!(
             updated.platform.workspaces[0].settings["dvr"]["recording_root"],
             json!(recording_root.to_string_lossy())
+        );
+        assert_eq!(
+            updated.platform.workspaces[0].settings["dvr"]["media_library_root"],
+            json!(media_library_root.to_string_lossy())
         );
 
         let reloaded = store.dvr_recording_settings().expect("reload dvr");
