@@ -46,6 +46,8 @@ pub struct HubScanRequest {
     pub cidr: Option<String>,
     #[serde(default)]
     pub protocol: Option<String>,
+    #[serde(default)]
+    pub rtsp_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +192,9 @@ impl CameraHubService {
             if !trimmed.is_empty() {
                 defaults.discovery = trimmed.to_string();
             }
+        }
+        if let Some(rtsp_port) = request.rtsp_port.filter(|port| *port > 0) {
+            defaults.rtsp_port = rtsp_port;
         }
         defaults = sanitize_defaults(defaults);
         let state = self.admin_store.save_defaults(defaults)?;

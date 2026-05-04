@@ -301,12 +301,7 @@ fn should_seed_rtsp_candidates(
     request: &DiscoveryRequest,
     candidates: &[DiscoveryCandidate],
 ) -> bool {
-    candidates.is_empty()
-        && request.protocols.contains(&DiscoveryProtocol::RtspProbe)
-        && request
-            .protocols
-            .iter()
-            .all(|protocol| *protocol == DiscoveryProtocol::RtspProbe)
+    candidates.is_empty() && request.protocols.contains(&DiscoveryProtocol::RtspProbe)
 }
 
 pub fn default_rtsp_paths() -> Vec<String> {
@@ -729,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_service_does_not_seed_rtsp_scan_when_onvif_finds_nothing() {
+    fn discovery_service_falls_back_to_rtsp_scan_when_onvif_finds_nothing() {
         let seen_requests = Arc::new(Mutex::new(Vec::new()));
         let service = DiscoveryService::new(
             Box::new(RecordingRtspAdapter {
@@ -753,9 +748,9 @@ mod tests {
         let result = service.discover(&request).expect("discovery result");
         let seen_requests = seen_requests.lock().expect("read probe requests");
 
-        assert!(result.candidates.is_empty());
-        assert!(result.connected_devices.is_empty());
-        assert!(seen_requests.is_empty());
+        assert_eq!(result.candidates.len(), 254);
+        assert_eq!(result.connected_devices.len(), 254);
+        assert_eq!(seen_requests.len(), 254);
     }
 
     #[test]

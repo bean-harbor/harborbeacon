@@ -1,7 +1,7 @@
 use std::env;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread;
 
 use serde::Serialize;
@@ -15,7 +15,8 @@ mod assistant_task_api;
 #[path = "harbor_model_api_support.rs"]
 mod harbor_model_api_support;
 
-use harbor_model_api_support::{ModelApiConfig, ModelApiService};
+use harbor_model_api_support::{BackendKind, ModelApiConfig, ModelApiService};
+use harborbeacon_local_agent::control_plane::models::{ModelEndpointStatus, ModelKind};
 use harborbeacon_local_agent::runtime::admin_console::AdminConsoleStore;
 use harborbeacon_local_agent::runtime::model_center::ADMIN_STATE_PATH_ENV;
 use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
@@ -122,7 +123,7 @@ impl Cli {
 struct HarborBeaconService {
     admin_api: agent_hub_admin_api::AdminApi,
     task_api: assistant_task_api::TaskApiHttpServer,
-    model_api: Arc<ModelApiService>,
+    model_api: Arc<RwLock<ModelApiService>>,
 }
 
 impl HarborBeaconService {
@@ -134,15 +135,20 @@ impl HarborBeaconService {
         let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
         let mut model_config = ModelApiConfig::from_env();
         model_config.bind = cli.bind.clone();
+        apply_persisted_model_runtime_selection(&mut model_config, &admin_store);
+        let model_api = Arc::new(RwLock::new(ModelApiService::new(model_config)));
+        let model_runtime_activation =
+            build_model_runtime_activation_handler(model_api.clone());
         Self {
             admin_api: agent_hub_admin_api::AdminApi::new(
                 admin_store,
                 task_service.clone(),
                 cli.harbordesk_dist.clone(),
                 cli.public_origin.clone(),
-            ),
+            )
+            .with_model_runtime_activation_handler(model_runtime_activation),
             task_api: assistant_task_api::TaskApiHttpServer::new(task_service, service_token),
-            model_api: Arc::new(ModelApiService::new(model_config)),
+            model_api,
         }
     }
 
@@ -190,8 +196,124 @@ impl HarborBeaconService {
         } else {
             Vec::new()
         };
-        let response = self.model_api.route(method, &model_path, &headers, &body);
+        let response = match self.model_api.read() {
+            Ok(model_api) => model_api.route(method, &model_path, &headers, &body),
+            Err(_) => error_json(
+                StatusCode(503),
+                "MODEL_RUNTIME_LOCK_ERROR",
+                "model runtime lock is poisoned",
+            ),
+        };
         let _ = request.respond(response);
+    }
+}
+
+fn build_model_runtime_activation_handler(
+    model_api: Arc<RwLock<ModelApiService>>,
+) -> agent_hub_admin_api::ModelRuntimeActivationHandler {
+    Arc::new(move |request| {
+        let current_config = model_api
+            .read()
+            .map_err(|_| "model runtime lock is poisoned".to_string())?
+            .config()
+            .clone();
+        let mut next_config = current_config;
+        apply_activation_request_to_model_config(&mut next_config, &request)?;
+        let runtime_model_id = runtime_model_id_for_activation(&next_config, request.model_kind);
+        let next_service = ModelApiService::new(next_config);
+        let mut guard = model_api
+            .write()
+            .map_err(|_| "model runtime lock is poisoned".to_string())?;
+        *guard = next_service;
+        let runtime_model_id = runtime_model_id.or_else(|| Some(request.model_id.clone()));
+        Ok(agent_hub_admin_api::ModelRuntimeActivationResult {
+            activated: true,
+            status: "activated".to_string(),
+            message: format!(
+                "模型运行时已切换到 {}",
+                runtime_model_id
+                    .as_deref()
+                    .unwrap_or(request.model_id.as_str())
+            ),
+            runtime_model_id,
+        })
+    })
+}
+
+fn apply_activation_request_to_model_config(
+    config: &mut ModelApiConfig,
+    request: &agent_hub_admin_api::ModelRuntimeActivationRequest,
+) -> Result<(), String> {
+    match request.model_kind {
+        ModelKind::Llm => {
+            config.chat_model = request.model_id.clone();
+            if matches!(config.backend, BackendKind::Candle) {
+                config.candle.chat_model_id = request
+                    .local_path
+                    .clone()
+                    .unwrap_or_else(|| request.model_id.clone());
+            }
+            Ok(())
+        }
+        ModelKind::Embedder => {
+            config.embedding_model = request.model_id.clone();
+            if matches!(config.backend, BackendKind::Candle) {
+                config.candle.embedding_model_id = request
+                    .local_path
+                    .clone()
+                    .unwrap_or_else(|| request.model_id.clone());
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "当前运行时暂不支持自动启动 {} 模型",
+            request.model_kind.as_str()
+        )),
+    }
+}
+
+fn runtime_model_id_for_activation(config: &ModelApiConfig, kind: ModelKind) -> Option<String> {
+    match kind {
+        ModelKind::Llm => Some(match config.backend {
+            BackendKind::Candle => config.candle.chat_model_id.clone(),
+            BackendKind::OpenAIProxy => config.chat_model.clone(),
+        }),
+        ModelKind::Embedder => Some(match config.backend {
+            BackendKind::Candle => config.candle.embedding_model_id.clone(),
+            BackendKind::OpenAIProxy => config.embedding_model.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn apply_persisted_model_runtime_selection(
+    config: &mut ModelApiConfig,
+    admin_store: &AdminConsoleStore,
+) {
+    let Ok(state) = admin_store.load_or_create_state() else {
+        return;
+    };
+    for endpoint in state.models.endpoints {
+        if endpoint.model_name.trim().is_empty() {
+            continue;
+        }
+        let auto_activation = endpoint
+            .metadata
+            .get("runtime_auto_activation")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !auto_activation && endpoint.status != ModelEndpointStatus::Active {
+            continue;
+        }
+        match endpoint.model_endpoint_id.as_str() {
+            "llm-local-openai-compatible" => {
+                config.chat_model = endpoint.model_name.trim().to_string();
+            }
+            "embed-local-openai-compatible" => {
+                config.embedding_model = endpoint.model_name.trim().to_string();
+            }
+            _ => {}
+        }
     }
 }
 

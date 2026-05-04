@@ -6,6 +6,7 @@ use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -191,13 +192,36 @@ impl Cli {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdminApi {
     admin_store: AdminConsoleStore,
     task_service: TaskApiService,
     dvr_runtime: DvrRuntime,
     harbordesk_dist: PathBuf,
     public_origin: String,
+    model_runtime_activation: Option<ModelRuntimeActivationHandler>,
+}
+
+pub(crate) type ModelRuntimeActivationHandler = Arc<
+    dyn Fn(ModelRuntimeActivationRequest) -> Result<ModelRuntimeActivationResult, String>
+        + Send
+        + Sync,
+>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelRuntimeActivationRequest {
+    pub capability_id: String,
+    pub model_id: String,
+    pub model_kind: ModelKind,
+    pub local_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelRuntimeActivationResult {
+    pub activated: bool,
+    pub status: String,
+    pub message: String,
+    pub runtime_model_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -469,6 +493,10 @@ struct HardwareReadinessResponse {
     memory: HardwareComponentReadiness,
     gpu: HardwareComponentReadiness,
     npu: HardwareComponentReadiness,
+    memory_mb: Option<u64>,
+    gpu_vram_total_mb: Option<u64>,
+    gpu_vram_free_mb: Option<u64>,
+    hardware_class: String,
     recommended_model_profile: String,
     blockers: Vec<String>,
     evidence: Vec<String>,
@@ -732,6 +760,9 @@ struct LocalModelCatalogItem {
     size_bytes: Option<u64>,
     download_job_id: Option<String>,
     download_size_hint: String,
+    hardware_fit: String,
+    fit_reason: String,
+    recommendation_group: String,
     detail: String,
     source_kind: String,
     installable: bool,
@@ -805,6 +836,9 @@ struct ModelCapabilityInstallableModel {
     local_path: Option<String>,
     download_job_id: Option<String>,
     download_size_hint: String,
+    hardware_fit: String,
+    fit_reason: String,
+    recommendation_group: String,
     source_kind: String,
     repo_id: Option<String>,
     file_policy: String,
@@ -1031,7 +1065,16 @@ impl AdminApi {
             dvr_runtime: DvrRuntime::default(),
             harbordesk_dist,
             public_origin,
+            model_runtime_activation: None,
         }
+    }
+
+    pub(crate) fn with_model_runtime_activation_handler(
+        mut self,
+        handler: ModelRuntimeActivationHandler,
+    ) -> Self {
+        self.model_runtime_activation = Some(handler);
+        self
     }
 
     fn hub(&self) -> CameraHubService {
@@ -2512,7 +2555,94 @@ impl AdminApi {
         {
             return error_json(StatusCode(422), &error);
         }
+        if let Err(error) = self.activate_selected_model_capability(&capability_id, &body.model_id)
+        {
+            return error_json(StatusCode(422), &error);
+        }
         self.handle_model_capabilities(hints)
+    }
+
+    fn activate_selected_model_capability(
+        &self,
+        capability_id: &str,
+        model_id: &str,
+    ) -> Result<(), String> {
+        let Some(model_kind) = runtime_model_kind_for_capability(capability_id) else {
+            return Ok(());
+        };
+        let state = self.admin_store.load_or_create_state()?;
+        let download_jobs = self.admin_store.list_model_download_jobs()?;
+        let catalog = build_local_model_catalog_for_model_state(&state.models, download_jobs);
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == model_id)
+            .ok_or_else(|| format!("未找到模型 {model_id}"))?;
+        if !model.installed {
+            return Err(format!("模型 {} 尚未下载完成，不能启动", model.display_name));
+        }
+        if !catalog_model_matches_kind_or_capability(model, model_kind, capability_id) {
+            return Err(format!(
+                "模型 {} 不适用于 {} 能力",
+                model.display_name, capability_id
+            ));
+        }
+
+        let request = ModelRuntimeActivationRequest {
+            capability_id: capability_id.to_string(),
+            model_id: model.model_id.clone(),
+            model_kind,
+            local_path: model.local_path.clone(),
+        };
+        let result = if let Some(handler) = self.model_runtime_activation.as_ref() {
+            handler(request)?
+        } else {
+            ModelRuntimeActivationResult {
+                activated: false,
+                status: "activation_unavailable".to_string(),
+                message: "当前服务未提供自动启动入口".to_string(),
+                runtime_model_id: None,
+            }
+        };
+        self.record_model_runtime_activation(model_kind, model, result)
+    }
+
+    fn record_model_runtime_activation(
+        &self,
+        model_kind: ModelKind,
+        model: &LocalModelCatalogItem,
+        result: ModelRuntimeActivationResult,
+    ) -> Result<(), String> {
+        let endpoint_id = preferred_endpoint_id_for_model_kind(model_kind);
+        let mut metadata = json!({
+            "catalog_model_id": model.model_id,
+            "local_path": model.local_path,
+            "activation_status": result.status,
+            "activation_message": result.message,
+            "activation_requested_at": now_unix_string(),
+            "runtime_auto_activation": true,
+        });
+        if let Some(runtime_model_id) = result.runtime_model_id.as_ref() {
+            set_metadata_string(&mut metadata, "runtime_model_id", runtime_model_id.clone());
+        }
+        let model_name = result
+            .runtime_model_id
+            .clone()
+            .unwrap_or_else(|| model.model_id.clone());
+        let status = if result.activated {
+            ModelEndpointStatus::Active
+        } else {
+            ModelEndpointStatus::Degraded
+        };
+        self.admin_store.patch_model_endpoint(
+            endpoint_id,
+            json!({
+                "model_name": model_name,
+                "status": status,
+                "metadata": metadata,
+            }),
+        )?;
+        Ok(())
     }
 
     fn handle_cancel_model_download(
@@ -3723,6 +3853,7 @@ impl AdminApi {
                 json!({
                     "cidr": request.cidr,
                     "protocol": request.protocol,
+                    "rtsp_port": request.rtsp_port,
                 }),
             ));
         if response.status != TaskStatus::Completed {
@@ -6384,6 +6515,7 @@ fn build_hardware_readiness_response() -> HardwareReadinessResponse {
         .unwrap_or(1);
     let memory_mb = proc_mem_total_mb();
     let gpu_evidence = gpu_probe_evidence();
+    let (gpu_vram_total_mb, gpu_vram_free_mb) = nvidia_smi_memory_mb();
     let npu_evidence = npu_probe_evidence();
 
     let cpu = HardwareComponentReadiness {
@@ -6436,13 +6568,9 @@ fn build_hardware_readiness_response() -> HardwareReadinessResponse {
         detail: "Checks common Linux accelerator device nodes.".to_string(),
         evidence: npu_evidence,
     };
-    let recommended_model_profile = if gpu_ready {
-        "local-vlm-plus-llm".to_string()
-    } else if memory_mb.unwrap_or_default() >= 16384 && cpu_count >= 4 {
-        "cpu-small-llm-and-embedding".to_string()
-    } else {
-        "cloud-or-tiny-local-models".to_string()
-    };
+    let hardware_class =
+        hardware_class_for_probe(cpu_count, memory_mb, gpu_ready, gpu_vram_total_mb);
+    let recommended_model_profile = recommended_model_profile_for_class(&hardware_class);
     let mut blockers = Vec::new();
     if cpu_count < 2 {
         blockers.push("CPU parallelism is below the release recommendation.".to_string());
@@ -6460,6 +6588,14 @@ fn build_hardware_readiness_response() -> HardwareReadinessResponse {
     evidence.extend(cpu.evidence.clone());
     evidence.extend(memory.evidence.clone());
     evidence.extend(gpu.evidence.clone());
+    if let Some(total) = gpu_vram_total_mb {
+        evidence.push(format!("gpu_vram_total_mb={total}"));
+    } else if gpu_ready {
+        evidence.push("gpu_vram_total_mb=unknown".to_string());
+    }
+    if let Some(free) = gpu_vram_free_mb {
+        evidence.push(format!("gpu_vram_free_mb={free}"));
+    }
     evidence.extend(npu.evidence.clone());
     HardwareReadinessResponse {
         generated_at,
@@ -6468,10 +6604,55 @@ fn build_hardware_readiness_response() -> HardwareReadinessResponse {
         memory,
         gpu,
         npu,
+        memory_mb,
+        gpu_vram_total_mb,
+        gpu_vram_free_mb,
+        hardware_class,
         recommended_model_profile,
         blockers,
         evidence,
     }
+}
+
+fn hardware_class_for_probe(
+    cpu_count: usize,
+    memory_mb: Option<u64>,
+    gpu_ready: bool,
+    gpu_vram_total_mb: Option<u64>,
+) -> String {
+    let memory_mb = memory_mb.unwrap_or_default();
+    if let Some(vram) = gpu_vram_total_mb {
+        if vram >= 48 * 1024 {
+            return "multi_gpu_or_remote".to_string();
+        }
+        if vram >= 24 * 1024 {
+            return "gpu_24gb_plus".to_string();
+        }
+        if vram >= 16 * 1024 {
+            return "gpu_16gb".to_string();
+        }
+        return "low_vram_gpu".to_string();
+    }
+    if gpu_ready {
+        return "low_vram_gpu".to_string();
+    }
+    if memory_mb >= 16 * 1024 && cpu_count >= 4 {
+        return "cpu_small".to_string();
+    }
+    if memory_mb >= 8 * 1024 && cpu_count >= 2 {
+        return "tiny_cpu".to_string();
+    }
+    "cloud_first".to_string()
+}
+
+fn recommended_model_profile_for_class(hardware_class: &str) -> String {
+    match hardware_class {
+        "multi_gpu_or_remote" | "gpu_24gb_plus" => "high-capacity-local-models",
+        "gpu_16gb" => "local-4b-vlm-plus-llm",
+        "low_vram_gpu" | "cpu_small" | "tiny_cpu" => "lightweight-local-models",
+        _ => "cloud-or-tiny-local-models",
+    }
+    .to_string()
 }
 
 fn build_knowledge_index_job(
@@ -7858,6 +8039,48 @@ fn proc_mem_total_mb() -> Option<u64> {
     Some(kb / 1024)
 }
 
+fn nvidia_smi_memory_mb() -> (Option<u64>, Option<u64>) {
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.total,memory.free",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return (None, None);
+    };
+    if !output.status.success() {
+        return (None, None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut total = 0_u64;
+    let mut free = 0_u64;
+    let mut any = false;
+    for line in text.lines() {
+        let mut parts = line.split(',').map(|part| part.trim());
+        let Some(total_part) = parts.next() else {
+            continue;
+        };
+        let Some(free_part) = parts.next() else {
+            continue;
+        };
+        let Ok(total_mb) = total_part.parse::<u64>() else {
+            continue;
+        };
+        let Ok(free_mb) = free_part.parse::<u64>() else {
+            continue;
+        };
+        total = total.saturating_add(total_mb);
+        free = free.saturating_add(free_mb);
+        any = true;
+    }
+    if any {
+        (Some(total), Some(free))
+    } else {
+        (None, None)
+    }
+}
+
 fn gpu_probe_evidence() -> Vec<String> {
     let mut evidence = Vec::new();
     let cuda_visible = env::var("CUDA_VISIBLE_DEVICES")
@@ -8127,9 +8350,17 @@ fn build_local_model_catalog_for_roots(
     download_jobs: Vec<ModelDownloadJobRecord>,
 ) -> LocalModelCatalogResponse {
     let latest_download_jobs = latest_model_download_jobs(&download_jobs);
+    let hardware = build_hardware_readiness_response();
     let models = local_model_catalog_specs()
         .into_iter()
-        .map(|spec| local_model_catalog_item(&cache_roots, &latest_download_jobs, spec))
+        .map(|spec| {
+            local_model_catalog_item_with_hardware(
+                &cache_roots,
+                &latest_download_jobs,
+                spec,
+                &hardware,
+            )
+        })
         .collect::<Vec<_>>();
     let generated_at = now_unix_string();
     LocalModelCatalogResponse {
@@ -8310,7 +8541,8 @@ fn build_model_capability_status(
         })
         .map(model_capability_installable_model)
         .collect::<Vec<_>>();
-    let capability_jobs = download_jobs
+    let capability_jobs = latest_model_download_jobs(
+        &download_jobs
         .iter()
         .filter(|job| {
             job.metadata
@@ -8325,7 +8557,8 @@ fn build_model_capability_status(
                     })
         })
         .cloned()
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>(),
+    );
     let active_download = capability_jobs.iter().any(model_download_job_is_active);
     let installed_model = catalog_models
         .iter()
@@ -8374,7 +8607,7 @@ fn build_model_capability_status(
     let next_action = match status.as_str() {
         "ready" => "可以使用".to_string(),
         "downloading" => "等待模型下载完成".to_string(),
-        "installed_not_running" => "模型已安装，需要启动本地模型服务".to_string(),
+        "installed_not_running" => "模型已安装，点击选择会自动切换并启动".to_string(),
         "unsupported" => "暂不支持该能力".to_string(),
         "degraded" => runtime
             .error
@@ -8537,10 +8770,10 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             model_kind: "embedder",
             recommended_hardware: "CPU 4GB+",
             download_size_hint: "1-2 GB",
-            source_kind: "manual_or_url",
-            repo_id: None,
+            source_kind: "huggingface",
+            repo_id: Some("BAAI/bge-m3"),
             revision: "main",
-            file_policy: "single_file_or_existing_cache",
+            file_policy: "runtime_snapshot",
             runtime_profiles: &["openai-compatible-embedding"],
             expected_capabilities: &["embedding"],
             acceptance_note: Some("legacy-catalog"),
@@ -8583,6 +8816,16 @@ fn local_model_catalog_item(
     cache_roots: &[String],
     download_jobs: &[ModelDownloadJobRecord],
     spec: LocalModelCatalogSpec,
+) -> LocalModelCatalogItem {
+    let hardware = build_hardware_readiness_response();
+    local_model_catalog_item_with_hardware(cache_roots, download_jobs, spec, &hardware)
+}
+
+fn local_model_catalog_item_with_hardware(
+    cache_roots: &[String],
+    download_jobs: &[ModelDownloadJobRecord],
+    spec: LocalModelCatalogSpec,
+    hardware: &HardwareReadinessResponse,
 ) -> LocalModelCatalogItem {
     let latest_job = latest_model_download_job(download_jobs, spec.model_id);
     let candidate_path = find_cached_model_path(cache_roots, spec.model_id).or_else(|| {
@@ -8638,6 +8881,12 @@ fn local_model_catalog_item(
         evidence.push(format!("latest_download_job={}", job.job_id));
         evidence.push(format!("latest_download_status={}", job.status));
     }
+    let recommendation = model_hardware_recommendation(&spec, hardware, installed);
+    evidence.push(format!("hardware_fit={}", recommendation.hardware_fit));
+    evidence.push(format!(
+        "recommendation_group={}",
+        recommendation.recommendation_group
+    ));
     let detail = if installed {
         format!(
             "{} is installed at {}.",
@@ -8671,6 +8920,9 @@ fn local_model_catalog_item(
         size_bytes,
         download_job_id: latest_job.map(|job| job.job_id.clone()),
         download_size_hint: spec.download_size_hint.to_string(),
+        hardware_fit: recommendation.hardware_fit,
+        fit_reason: recommendation.fit_reason,
+        recommendation_group: recommendation.recommendation_group,
         detail,
         source_kind: spec.source_kind.to_string(),
         installable,
@@ -8697,6 +8949,83 @@ fn local_model_catalog_item(
 
 fn local_model_catalog_spec_is_installable(spec: &LocalModelCatalogSpec) -> bool {
     spec.source_kind == "huggingface" && spec.repo_id.is_some()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelHardwareRecommendation {
+    hardware_fit: String,
+    fit_reason: String,
+    recommendation_group: String,
+}
+
+fn model_hardware_recommendation(
+    spec: &LocalModelCatalogSpec,
+    hardware: &HardwareReadinessResponse,
+    installed: bool,
+) -> ModelHardwareRecommendation {
+    let class = hardware.hardware_class.as_str();
+    let model_id = spec.model_id.to_ascii_lowercase();
+    let recommended = |reason: &str, group: &str| ModelHardwareRecommendation {
+        hardware_fit: "recommended".to_string(),
+        fit_reason: reason.to_string(),
+        recommendation_group: group.to_string(),
+    };
+    let compatible = |reason: &str, group: &str| ModelHardwareRecommendation {
+        hardware_fit: "compatible".to_string(),
+        fit_reason: reason.to_string(),
+        recommendation_group: group.to_string(),
+    };
+    let not_recommended = |reason: &str| ModelHardwareRecommendation {
+        hardware_fit: "not_recommended".to_string(),
+        fit_reason: reason.to_string(),
+        recommendation_group: if installed {
+            "installed_not_recommended".to_string()
+        } else {
+            "high_end_experimental".to_string()
+        },
+    };
+
+    if model_id.contains("35b") {
+        return if class == "multi_gpu_or_remote" {
+            recommended("multi-GPU or remote class hardware detected.", "high_end_experimental")
+        } else {
+            not_recommended("35B class models need multi-GPU or remote inference.")
+        };
+    }
+    if model_id.contains("9b") {
+        return if matches!(class, "gpu_24gb_plus" | "multi_gpu_or_remote") {
+            recommended("24GB+ GPU class hardware detected.", "current_recommended")
+        } else {
+            not_recommended("9B class models are reserved for 24GB+ GPU hardware.")
+        };
+    }
+    if model_id.contains("qwen3.5-4b") {
+        return if matches!(class, "gpu_16gb" | "gpu_24gb_plus" | "multi_gpu_or_remote") {
+            recommended("16GB+ GPU class hardware detected.", "current_recommended")
+        } else {
+            not_recommended("4B model is installed, but current hardware has no confirmed 16GB+ usable GPU memory.")
+        };
+    }
+    if model_id.contains("minicpm") {
+        return if matches!(class, "gpu_16gb" | "gpu_24gb_plus" | "multi_gpu_or_remote") {
+            compatible("GPU class hardware detected.", "current_recommended")
+        } else {
+            not_recommended("MiniCPM-V should stay experimental without confirmed GPU memory.")
+        };
+    }
+    if model_id.contains("smolvlm")
+        || model_id.contains("1.5b")
+        || model_id.contains("embedding")
+        || model_id.contains("bge")
+        || model_id.contains("jina")
+    {
+        return recommended(
+            "Lightweight local profile fits the current machine better than 4B+ models.",
+            "lightweight_local",
+        );
+    }
+
+    compatible("No strict hardware rule matched this model.", "current_recommended")
 }
 
 fn catalog_model_matches_kind(model: &LocalModelCatalogItem, kind: ModelKind) -> bool {
@@ -8771,6 +9100,9 @@ fn model_capability_installable_model(
         local_path: model.local_path.clone(),
         download_job_id: model.download_job_id.clone(),
         download_size_hint: model.download_size_hint.clone(),
+        hardware_fit: model.hardware_fit.clone(),
+        fit_reason: model.fit_reason.clone(),
+        recommendation_group: model.recommendation_group.clone(),
         source_kind: model.source_kind.clone(),
         repo_id: model.repo_id.clone(),
         file_policy: model.file_policy.clone(),
@@ -8786,6 +9118,14 @@ fn preferred_endpoint_id_for_model_kind(kind: ModelKind) -> &'static str {
         ModelKind::Asr => "asr-local",
         ModelKind::Detector => "detector-local",
         ModelKind::Embedder => "embed-local-openai-compatible",
+    }
+}
+
+fn runtime_model_kind_for_capability(capability_id: &str) -> Option<ModelKind> {
+    match capability_id.trim() {
+        "semantic_router" | "retrieval_answer" => Some(ModelKind::Llm),
+        "embedder" => Some(ModelKind::Embedder),
+        _ => None,
     }
 }
 
@@ -12220,13 +12560,14 @@ mod tests {
         camera_stream_url_with_credentials, default_model_download_target_path,
         default_model_endpoints, ensure_local_admin_access, ensure_local_camera_access,
         harbordesk_build_missing_response, has_forwarding_headers,
+        hardware_class_for_probe,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbordesk_client_route,
         is_harbordesk_surface_path, knowledge_preview_mime_supported, latest_model_download_jobs,
         live_bridge_provider_from_setup_status, local_model_catalog_item,
         local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
         model_download_huggingface_endpoints, model_download_jobs_status,
-        model_snapshot_file_allowed, normalize_unified_admin_path,
+        model_hardware_recommendation, model_snapshot_file_allowed, normalize_unified_admin_path,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
         parse_camera_analyze_path, parse_camera_live_page_path, parse_camera_live_stream_path,
         parse_camera_recording_start_path, parse_camera_recording_stop_path,
@@ -12246,7 +12587,7 @@ mod tests {
         resolve_harbordesk_asset_path, resolve_knowledge_preview_path, run_knowledge_index_jobs,
         run_model_download_job, run_model_download_transfer, url_encode_path_segment, AdminApi,
         KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
-        DEFAULT_HF_ENDPOINT,
+        ModelRuntimeActivationRequest, ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
     };
     use harborbeacon_local_agent::control_plane::media::{
         MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
@@ -12278,7 +12619,7 @@ mod tests {
     use std::net::TcpListener;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13553,6 +13894,17 @@ mod tests {
             .iter()
             .any(|profile| profile == "cpu-vlm-sidecar"));
         assert_eq!(smolvlm.acceptance_note.as_deref(), Some("vm-cpu-photo-rag"));
+
+        let bge = catalog
+            .models
+            .iter()
+            .find(|item| item.model_id == "bge-m3")
+            .expect("bge catalog model");
+        assert_eq!(bge.source_kind, "huggingface");
+        assert_eq!(bge.repo_id.as_deref(), Some("BAAI/bge-m3"));
+        assert_eq!(bge.file_policy, "runtime_snapshot");
+        assert!(bge.installable);
+        assert!(!bge.manual_only);
     }
 
     #[test]
@@ -13568,6 +13920,45 @@ mod tests {
         assert!(!legacy.installable);
         assert!(legacy.manual_only);
         assert!(legacy.repo_id.is_none());
+    }
+
+    #[test]
+    fn hardware_profile_keeps_4b_models_out_of_tiny_cpu_recommendations() {
+        assert_eq!(hardware_class_for_probe(4, Some(12_000), false, None), "tiny_cpu");
+        assert_eq!(
+            hardware_class_for_probe(8, Some(32_000), true, Some(12_288)),
+            "low_vram_gpu"
+        );
+        assert_eq!(
+            hardware_class_for_probe(8, Some(32_000), true, Some(16_384)),
+            "gpu_16gb"
+        );
+
+        let mut hardware = build_hardware_readiness_response();
+        hardware.hardware_class = "tiny_cpu".to_string();
+        let qwen35_4b = local_model_catalog_specs()
+            .into_iter()
+            .find(|spec| spec.model_id == "Qwen/Qwen3.5-4B")
+            .expect("qwen3.5 4b spec");
+        let recommendation = model_hardware_recommendation(&qwen35_4b, &hardware, true);
+        assert_eq!(recommendation.hardware_fit, "not_recommended");
+        assert_eq!(
+            recommendation.recommendation_group,
+            "installed_not_recommended"
+        );
+
+        let qwen25 = local_model_catalog_specs()
+            .into_iter()
+            .find(|spec| spec.model_id == "qwen2.5-1.5b-instruct")
+            .expect("qwen2.5 1.5b spec");
+        let recommendation = model_hardware_recommendation(&qwen25, &hardware, false);
+        assert_eq!(recommendation.hardware_fit, "recommended");
+        assert_eq!(recommendation.recommendation_group, "lightweight_local");
+
+        hardware.hardware_class = "gpu_16gb".to_string();
+        let recommendation = model_hardware_recommendation(&qwen35_4b, &hardware, true);
+        assert_eq!(recommendation.hardware_fit, "recommended");
+        assert_eq!(recommendation.recommendation_group, "current_recommended");
     }
 
     #[test]
@@ -14795,6 +15186,80 @@ mod tests {
             payload.endpoints[0].metadata["nested"]["token_configured"],
             json!(true)
         );
+    }
+
+    #[test]
+    fn installed_model_selection_activates_runtime_and_updates_endpoint() {
+        let registry_path = unique_store_path("harborbeacon-model-select-registry");
+        let admin_path = unique_store_path("harborbeacon-model-select-state");
+        let conversation_path = unique_store_path("harborbeacon-model-select-conversations");
+        let model_store = unique_store_path("harborbeacon-model-select-store");
+        let model_dir = model_store.join("qwen-qwen3.5-4b");
+        fs::create_dir_all(&model_dir).expect("create model dir");
+        fs::write(model_dir.join("config.json"), "{}").expect("write model file");
+
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        admin_store
+            .save_model_store_root(&model_store.to_string_lossy())
+            .expect("save model store root");
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
+        let seen_requests: Arc<Mutex<Vec<ModelRuntimeActivationRequest>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let seen_for_handler = seen_requests.clone();
+        let api = AdminApi::new(
+            admin_store.clone(),
+            task_service,
+            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            "http://harborbeacon.local:4174".to_string(),
+        )
+        .with_model_runtime_activation_handler(Arc::new(move |request| {
+            seen_for_handler
+                .lock()
+                .expect("request lock")
+                .push(request.clone());
+            Ok(ModelRuntimeActivationResult {
+                activated: true,
+                status: "activated".to_string(),
+                message: "runtime switched".to_string(),
+                runtime_model_id: Some(request.model_id.clone()),
+            })
+        }));
+        api.admin_store
+            .save_model_capability_binding("semantic_router", "Qwen/Qwen3.5-4B")
+            .expect("save binding");
+
+        api.activate_selected_model_capability("semantic_router", "Qwen/Qwen3.5-4B")
+            .expect("activate selected model");
+
+        let requests = seen_requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model_kind, ModelKind::Llm);
+        assert_eq!(requests[0].model_id, "Qwen/Qwen3.5-4B");
+        assert_eq!(
+            requests[0].local_path.as_deref(),
+            Some(model_dir.to_string_lossy().as_ref())
+        );
+        drop(requests);
+
+        let state = admin_store.load_state().expect("load state");
+        let endpoint = state
+            .models
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible")
+            .expect("llm endpoint");
+        assert_eq!(endpoint.status, ModelEndpointStatus::Active);
+        assert_eq!(endpoint.model_name, "Qwen/Qwen3.5-4B");
+        assert_eq!(endpoint.metadata["runtime_auto_activation"], json!(true));
+        assert_eq!(endpoint.metadata["activation_status"], json!("activated"));
+        assert_eq!(endpoint.metadata["catalog_model_id"], json!("Qwen/Qwen3.5-4B"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+        let _ = fs::remove_dir_all(model_store);
     }
 
     #[test]

@@ -1161,6 +1161,11 @@ impl AdminConsoleStore {
         state
             .device_evidence
             .retain(|record| record.device_id != device_id);
+        let remaining_devices = self.registry_store.load_devices().unwrap_or_default();
+        if state.device_credentials.is_empty() && remaining_devices.is_empty() {
+            state.defaults.rtsp_username = default_rtsp_username();
+            state.defaults.rtsp_password.clear();
+        }
 
         let credential_id = device_rtsp_credential_id(device_id);
         state
@@ -1676,6 +1681,8 @@ pub struct RtspHints {
 pub fn sanitize_defaults(mut defaults: AdminDefaults) -> AdminDefaults {
     if defaults.cidr.trim().is_empty() || defaults.cidr.trim().eq_ignore_ascii_case("auto") {
         defaults.cidr = default_scan_cidr();
+    } else if let Some(normalized) = normalize_scan_cidr(defaults.cidr.trim()) {
+        defaults.cidr = normalized;
     }
     if defaults.discovery.trim().is_empty() {
         defaults.discovery = "RTSP Probe".to_string();
@@ -1713,6 +1720,28 @@ pub fn sanitize_defaults(mut defaults: AdminDefaults) -> AdminDefaults {
     defaults
 }
 
+fn normalize_scan_cidr(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let (ip, prefix) = trimmed.split_once('/')?;
+    let parsed_ip = ip.parse::<Ipv4Addr>().ok()?;
+    if let Ok(parsed_prefix) = prefix.parse::<u8>() {
+        if parsed_prefix <= 32 {
+            let mask = if parsed_prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - parsed_prefix)
+            };
+            let network = Ipv4Addr::from(u32::from(parsed_ip) & mask);
+            return Some(format!("{network}/{parsed_prefix}"));
+        }
+    }
+    if prefix.parse::<u16>().ok().is_some_and(|port| port > 32) {
+        let octets = parsed_ip.octets();
+        return Some(format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]));
+    }
+    None
+}
+
 pub fn sanitize_knowledge_settings(settings: KnowledgeSettings) -> KnowledgeSettings {
     let mut normalized_roots = Vec::new();
     let mut seen_ids = HashSet::new();
@@ -1742,11 +1771,18 @@ pub fn sanitize_knowledge_settings(settings: KnowledgeSettings) -> KnowledgeSett
 }
 
 fn upsert_dvr_knowledge_root(settings: &mut KnowledgeSettings, dvr: &DvrRecordingSettings) {
+    let root_id = dvr_knowledge_root_id().to_string();
+    if dvr.enabled_device_ids.is_empty() {
+        settings
+            .source_roots
+            .retain(|existing| existing.root_id != root_id);
+        return;
+    }
+
     let path = dvr.media_library_root.trim();
     if path.is_empty() {
         return;
     }
-    let root_id = dvr_knowledge_root_id().to_string();
     let root = KnowledgeSourceRoot {
         root_id: root_id.clone(),
         label: "Camera DVR Library".to_string(),
@@ -4665,6 +4701,7 @@ mod tests {
         normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path,
         resolved_identity_binding_records, resolved_remote_view_config,
         sanitize_bridge_provider_config, sanitize_model_center_state,
+        sanitize_defaults,
         user_default_delivery_surface, user_recent_interactive_surface, AdminConsoleStore,
         AdminDefaults, AdminModelCenterState, BridgeProviderCapabilities, BridgeProviderConfig,
         DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings, IdentityBindingRecord,
@@ -4801,6 +4838,8 @@ mod tests {
         store
             .save_defaults(AdminDefaults {
                 selected_camera_device_id: Some("cam-1".to_string()),
+                rtsp_username: "admin".to_string(),
+                rtsp_password: "secret".to_string(),
                 ..Default::default()
             })
             .expect("save defaults");
@@ -4836,6 +4875,8 @@ mod tests {
         let updated = store.forget_device("cam-1").expect("forget device");
 
         assert_eq!(updated.defaults.selected_camera_device_id, None);
+        assert_eq!(updated.defaults.rtsp_username, "admin");
+        assert!(updated.defaults.rtsp_password.is_empty());
         assert_eq!(updated.dvr.enabled_device_ids, vec!["cam-2"]);
         assert!(updated.device_credentials.is_empty());
         assert!(updated.device_evidence.is_empty());
@@ -4852,6 +4893,24 @@ mod tests {
 
         let _ = std::fs::remove_file(admin_path);
         let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn sanitize_defaults_treats_cidr_slash_port_as_rtsp_port_typo() {
+        let sanitized = sanitize_defaults(AdminDefaults {
+            cidr: "192.168.3.0/554".to_string(),
+            rtsp_port: 554,
+            ..Default::default()
+        });
+
+        assert_eq!(sanitized.cidr, "192.168.3.0/24");
+        assert_eq!(sanitized.rtsp_port, 554);
+
+        let sanitized = sanitize_defaults(AdminDefaults {
+            cidr: "192.168.3.73/30".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(sanitized.cidr, "192.168.3.72/30");
     }
 
     #[test]
@@ -5061,15 +5120,21 @@ mod tests {
             })
             .expect("save knowledge settings");
 
-        assert_eq!(updated.knowledge.source_roots.len(), 1);
-        assert_eq!(updated.knowledge.source_roots[0].label, "Family Docs");
+        let user_roots = updated
+            .knowledge
+            .source_roots
+            .iter()
+            .filter(|root| root.root_id != "camera-dvr-recordings")
+            .collect::<Vec<_>>();
+        assert_eq!(user_roots.len(), 1);
+        assert_eq!(user_roots[0].label, "Family Docs");
         assert_eq!(
-            updated.knowledge.source_roots[0].root_id,
+            user_roots[0].root_id,
             "knowledge-familydocs"
         );
-        assert_eq!(updated.knowledge.source_roots[0].include, vec!["**/*.md"]);
-        assert_eq!(updated.knowledge.source_roots[0].exclude, vec!["tmp/**"]);
-        assert_eq!(updated.knowledge.source_roots[0].last_indexed_at, None);
+        assert_eq!(user_roots[0].include, vec!["**/*.md"]);
+        assert_eq!(user_roots[0].exclude, vec!["tmp/**"]);
+        assert_eq!(user_roots[0].last_indexed_at, None);
 
         let reloaded = store
             .knowledge_settings()

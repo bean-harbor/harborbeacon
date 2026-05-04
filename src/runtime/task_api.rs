@@ -1000,6 +1000,11 @@ impl TaskApiService {
         let scan_request = HubScanRequest {
             cidr: string_at_paths(&request.args, &["/cidr"]),
             protocol: protocol_string(&request.args),
+            rtsp_port: request
+                .args
+                .get("rtsp_port")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok()),
         };
         let action = apply_governance_defaults(Action {
             domain: "camera".to_string(),
@@ -1010,6 +1015,7 @@ impl TaskApiService {
             args: json!({
                 "cidr": scan_request.cidr.clone(),
                 "protocol": scan_request.protocol.clone(),
+                "rtsp_port": scan_request.rtsp_port,
             }),
             risk_level: RiskLevel::Low,
             requires_approval: request_requires_approval(request),
