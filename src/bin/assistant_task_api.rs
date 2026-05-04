@@ -319,15 +319,25 @@ fn validate_turn_request_contract(envelope: &TaskTurnEnvelope) -> Result<(), Str
         ("actor.user_id", envelope.actor.user_id.trim()),
         ("conversation.channel", envelope.conversation.channel.trim()),
         ("conversation.surface", envelope.conversation.surface.trim()),
-        ("conversation.thread_id", envelope.conversation.thread_id.trim()),
+        (
+            "conversation.thread_id",
+            envelope.conversation.thread_id.trim(),
+        ),
         ("transport.route_key", envelope.transport.route_key.trim()),
     ] {
         if value.is_empty() {
-            return Err(format!("missing required field for HarborGate caller: {field}"));
+            return Err(format!(
+                "missing required field for HarborGate caller: {field}"
+            ));
         }
     }
 
-    if envelope.conversation.chat_type.trim().eq_ignore_ascii_case("group") {
+    if envelope
+        .conversation
+        .chat_type
+        .trim()
+        .eq_ignore_ascii_case("group")
+    {
         return Err("group chat is out of scope for the v2.0 upgrade".to_string());
     }
     if !envelope
@@ -336,9 +346,7 @@ fn validate_turn_request_contract(envelope: &TaskTurnEnvelope) -> Result<(), Str
         .trim()
         .eq_ignore_ascii_case("harborgate")
     {
-        return Err(
-            "conversation.surface must be harborgate for the v2.0 upgrade".to_string(),
-        );
+        return Err("conversation.surface must be harborgate for the v2.0 upgrade".to_string());
     }
     Ok(())
 }
@@ -768,7 +776,10 @@ mod tests {
         assert_eq!(status.0, 200);
         assert_eq!(payload["turn"]["status"], "completed");
         assert_eq!(payload["reply"]["kind"], "tool_result");
-        assert_eq!(payload["observability"]["route_key"], "gw_route_task-http-service-status");
+        assert_eq!(
+            payload["observability"]["route_key"],
+            "gw_route_task-http-service-status"
+        );
 
         let task_step = server
             .service
@@ -805,7 +816,10 @@ mod tests {
         assert_eq!(status.0, 200);
         assert_eq!(payload["turn"]["status"], "completed");
         assert_eq!(payload["reply"]["kind"], "tool_result");
-        assert_eq!(payload["observability"]["route_key"], "gw_route_task-http-service-fallback");
+        assert_eq!(
+            payload["observability"]["route_key"],
+            "gw_route_task-http-service-fallback"
+        );
 
         let task_step = server
             .service
@@ -879,7 +893,10 @@ mod tests {
         assert_eq!(status.0, 200);
         assert_eq!(payload["turn"]["status"], "completed");
         assert_eq!(payload["reply"]["kind"], "tool_result");
-        assert_eq!(payload["observability"]["route_key"], "gw_route_task-http-files-list");
+        assert_eq!(
+            payload["observability"]["route_key"],
+            "gw_route_task-http-files-list"
+        );
 
         let task_step = server
             .service

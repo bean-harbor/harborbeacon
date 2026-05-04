@@ -720,10 +720,7 @@ impl CommandRtspAdapter {
             byte_size,
             request.storage_target,
         )
-        .with_keyframe_hints(
-            request.keyframe_count,
-            request.keyframe_interval_seconds,
-        );
+        .with_keyframe_hints(request.keyframe_count, request.keyframe_interval_seconds);
         result.storage.relative_path = output_path.to_string_lossy().to_string();
         result.index_sidecar_relative_path = output_path
             .with_extension("json")

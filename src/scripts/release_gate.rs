@@ -134,8 +134,8 @@ mod tests {
             "contract": "local-openai-compatible-api",
             "mode": "spawned",
             "backend": "candle",
-            "base_url": "http://127.0.0.1:4176/v1",
-            "healthz_url": "http://127.0.0.1:4176/healthz",
+            "base_url": "http://127.0.0.1:4174/api/inference/v1",
+            "healthz_url": "http://127.0.0.1:4174/api/inference/healthz",
             "generated_at_utc": "unix-epoch-ms:1",
             "cold_start": {
                 "measured": true,

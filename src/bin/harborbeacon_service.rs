@@ -200,7 +200,10 @@ fn main() {
     let service_token = resolve_service_token(cli.service_token.clone());
     let service = HarborBeaconService::new(&cli, service_token);
     let server = Server::http(&cli.bind).unwrap_or_else(|error| {
-        panic!("failed to bind harborbeacon service on {}: {error}", cli.bind);
+        panic!(
+            "failed to bind harborbeacon service on {}: {error}",
+            cli.bind
+        );
     });
     println!(
         "harborbeacon-service listening on http://{} (admin/web/inference single-port)",

@@ -346,7 +346,10 @@ mod tests {
             }),
         };
 
-        assert_eq!(policy.capture_subdirectory(), Some("camera-archive/front-door"));
+        assert_eq!(
+            policy.capture_subdirectory(),
+            Some("camera-archive/front-door")
+        );
         assert_eq!(policy.keyframe_count_hint(), Some(4));
         assert_eq!(policy.keyframe_interval_seconds_hint(), Some(2));
         assert_eq!(policy.clip_length_seconds_hint(), Some(12));

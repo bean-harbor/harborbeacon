@@ -1437,7 +1437,8 @@ mod tests {
         device.capabilities.stream = true;
         device.capabilities.snapshot = true;
 
-        let mut snapshot = DeviceRegistrySnapshot::from_camera_devices(std::slice::from_ref(&device));
+        let mut snapshot =
+            DeviceRegistrySnapshot::from_camera_devices(std::slice::from_ref(&device));
         snapshot.camera_profiles[0].vendor_features = json!({
             "profile": "custom",
             "rtsp_path_candidates": ["/custom", "stream2", "/stream1", "/custom"]

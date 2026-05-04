@@ -5,6 +5,7 @@ use std::env;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use if_addrs::{get_if_addrs, IfAddr};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,13 @@ use crate::runtime::registry::{CameraDevice, DeviceRegistryStore};
 
 const DEFAULT_BINDING_CHANNEL_LABEL: &str = "Harbor HarborGate";
 const DEFAULT_PROVIDER_ACCOUNT_DISPLAY_NAME: &str = "Harbor HarborGate";
+static ADMIN_CONSOLE_MODEL_DOWNLOAD_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn model_download_write_guard() -> Result<MutexGuard<'static, ()>, String> {
+    ADMIN_CONSOLE_MODEL_DOWNLOAD_WRITE_LOCK
+        .lock()
+        .map_err(|_| "model download state write lock poisoned".to_string())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdminBindingState {
@@ -352,6 +360,10 @@ pub struct AdminModelCenterState {
     pub endpoints: Vec<ModelEndpoint>,
     #[serde(default)]
     pub route_policies: Vec<ModelRoutePolicy>,
+    #[serde(default = "default_model_store_root")]
+    pub model_store_root: String,
+    #[serde(default)]
+    pub capability_bindings: Vec<ModelCapabilityBindingRecord>,
 }
 
 impl Default for AdminModelCenterState {
@@ -359,8 +371,17 @@ impl Default for AdminModelCenterState {
         Self {
             endpoints: default_model_endpoints(),
             route_policies: default_model_route_policies(),
+            model_store_root: default_model_store_root(),
+            capability_bindings: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelCapabilityBindingRecord {
+    pub capability_id: String,
+    pub model_id: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -390,6 +411,12 @@ pub struct ModelDownloadJobRecord {
     pub message: String,
     #[serde(default)]
     pub metadata: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDownloadJobCreateResult {
+    pub job: ModelDownloadJobRecord,
+    pub should_spawn_worker: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1114,6 +1141,41 @@ impl AdminConsoleStore {
         Ok(state)
     }
 
+    pub fn forget_device(&self, device_id: &str) -> Result<AdminConsoleState, String> {
+        let device_id = device_id.trim();
+        if device_id.is_empty() {
+            return Err("device_id 不能为空".to_string());
+        }
+
+        let mut state = self.load_or_create_state()?;
+        if state.defaults.selected_camera_device_id.as_deref() == Some(device_id) {
+            state.defaults.selected_camera_device_id = None;
+        }
+        state
+            .dvr
+            .enabled_device_ids
+            .retain(|enabled| enabled != device_id);
+        state
+            .device_credentials
+            .retain(|credential| credential.device_id != device_id);
+        state
+            .device_evidence
+            .retain(|record| record.device_id != device_id);
+
+        let credential_id = device_rtsp_credential_id(device_id);
+        state
+            .platform
+            .credentials
+            .retain(|credential| credential.credential_id != credential_id);
+        for policy in &mut state.platform.recording_policies {
+            if policy.device_id.as_deref() == Some(device_id) {
+                policy.device_id = None;
+            }
+        }
+
+        self.save_projected_state(state)
+    }
+
     pub fn record_device_evidence(
         &self,
         mut record: DeviceEvidenceRecord,
@@ -1364,11 +1426,61 @@ impl AdminConsoleStore {
         target_path: Option<String>,
         metadata: Value,
     ) -> Result<ModelDownloadJobRecord, String> {
+        Ok(self
+            .create_or_update_model_download_job(
+                model_id,
+                display_name,
+                provider_key,
+                target_path,
+                metadata,
+            )?
+            .job)
+    }
+
+    pub fn create_or_update_model_download_job(
+        &self,
+        model_id: &str,
+        display_name: &str,
+        provider_key: &str,
+        target_path: Option<String>,
+        metadata: Value,
+    ) -> Result<ModelDownloadJobCreateResult, String> {
+        let _guard = model_download_write_guard()?;
         let model_id = model_id.trim();
         if model_id.is_empty() {
             return Err("model_id 不能为空".to_string());
         }
         let now = model_test_timestamp();
+        let mut state = self.load_or_create_state()?;
+        if let Some(index) = latest_model_download_job_index(&state.model_download_jobs, model_id) {
+            let existing = &mut state.model_download_jobs[index];
+            if model_download_job_record_is_active(existing) {
+                return Ok(ModelDownloadJobCreateResult {
+                    job: existing.clone(),
+                    should_spawn_worker: false,
+                });
+            }
+            existing.display_name = display_name.trim().to_string();
+            existing.provider_key = provider_key.trim().to_string();
+            existing.status = "queued".to_string();
+            existing.requested_at = now.clone();
+            existing.updated_at = now;
+            existing.target_path = target_path;
+            existing.progress_percent = Some(0);
+            existing.bytes_downloaded = Some(0);
+            existing.total_bytes = None;
+            existing.started_at = None;
+            existing.completed_at = None;
+            existing.error_message = None;
+            existing.message = "download job queued by explicit admin action".to_string();
+            existing.metadata = metadata;
+            let job = existing.clone();
+            self.save_projected_state(state)?;
+            return Ok(ModelDownloadJobCreateResult {
+                job,
+                should_spawn_worker: true,
+            });
+        }
         let job = ModelDownloadJobRecord {
             job_id: format!("model-download-{}", Uuid::new_v4().simple()),
             model_id: model_id.to_string(),
@@ -1388,10 +1500,51 @@ impl AdminConsoleStore {
             metadata,
         };
 
-        let mut state = self.load_or_create_state()?;
         state.model_download_jobs.push(job.clone());
         self.save_projected_state(state)?;
-        Ok(job)
+        Ok(ModelDownloadJobCreateResult {
+            job,
+            should_spawn_worker: true,
+        })
+    }
+
+    pub fn save_model_store_root(&self, root: &str) -> Result<AdminConsoleState, String> {
+        let root = non_empty_opt(root).ok_or_else(|| "模型保存位置不能为空".to_string())?;
+        let path = Path::new(&root);
+        if !path.is_absolute() {
+            return Err("模型保存位置必须是 HarborOS 上的绝对路径".to_string());
+        }
+        let mut state = self.load_or_create_state()?;
+        state.models.model_store_root = root;
+        self.save_projected_state(state)
+    }
+
+    pub fn save_model_capability_binding(
+        &self,
+        capability_id: &str,
+        model_id: &str,
+    ) -> Result<ModelCapabilityBindingRecord, String> {
+        let capability_id =
+            non_empty_opt(capability_id).ok_or_else(|| "capability_id 不能为空".to_string())?;
+        let model_id = non_empty_opt(model_id).ok_or_else(|| "model_id 不能为空".to_string())?;
+        let mut state = self.load_or_create_state()?;
+        let record = ModelCapabilityBindingRecord {
+            capability_id,
+            model_id,
+            updated_at: model_test_timestamp(),
+        };
+        if let Some(existing) = state
+            .models
+            .capability_bindings
+            .iter_mut()
+            .find(|existing| existing.capability_id == record.capability_id)
+        {
+            *existing = record.clone();
+        } else {
+            state.models.capability_bindings.push(record.clone());
+        }
+        self.save_projected_state(state)?;
+        Ok(record)
     }
 
     pub fn model_download_job(
@@ -1403,7 +1556,7 @@ impl AdminConsoleStore {
             return Ok(None);
         }
         Ok(self
-            .load_or_create_state()?
+            .load_state()?
             .model_download_jobs
             .into_iter()
             .find(|job| job.job_id == job_id))
@@ -1417,6 +1570,7 @@ impl AdminConsoleStore {
         if job_id.is_empty() {
             return Ok(None);
         }
+        let _guard = model_download_write_guard()?;
         let mut state = self.load_or_create_state()?;
         let Some(job) = state
             .model_download_jobs
@@ -1440,7 +1594,7 @@ impl AdminConsoleStore {
     }
 
     pub fn list_model_download_jobs(&self) -> Result<Vec<ModelDownloadJobRecord>, String> {
-        Ok(self.load_or_create_state()?.model_download_jobs)
+        Ok(self.load_state()?.model_download_jobs)
     }
 
     pub fn save_model_download_job(
@@ -1451,6 +1605,7 @@ impl AdminConsoleStore {
         if job_id.is_empty() {
             return Err("job_id 不能为空".to_string());
         }
+        let _guard = model_download_write_guard()?;
         let mut state = self.load_or_create_state()?;
         let Some(existing) = state
             .model_download_jobs
@@ -2119,9 +2274,34 @@ pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCe
     }
     route_policies.sort_by(|left, right| left.route_policy_id.cmp(&right.route_policy_id));
 
+    let model_store_root =
+        non_empty_opt(&state.model_store_root).unwrap_or_else(default_model_store_root);
+
+    let mut capability_bindings = Vec::new();
+    let mut seen_capabilities = HashSet::new();
+    for binding in state.capability_bindings {
+        let Some(capability_id) = non_empty_opt(&binding.capability_id) else {
+            continue;
+        };
+        let Some(model_id) = non_empty_opt(&binding.model_id) else {
+            continue;
+        };
+        if !seen_capabilities.insert(capability_id.clone()) {
+            continue;
+        }
+        capability_bindings.push(ModelCapabilityBindingRecord {
+            capability_id,
+            model_id,
+            updated_at: non_empty_opt(&binding.updated_at).unwrap_or_else(model_test_timestamp),
+        });
+    }
+    capability_bindings.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
+
     AdminModelCenterState {
         endpoints,
         route_policies,
+        model_store_root,
+        capability_bindings,
     }
 }
 
@@ -2167,7 +2347,108 @@ pub fn sanitize_model_endpoint(mut endpoint: ModelEndpoint) -> Result<ModelEndpo
     endpoint.capability_tags.dedup();
     endpoint.cost_policy = normalize_json_object(endpoint.cost_policy);
     endpoint.metadata = normalize_json_object(endpoint.metadata);
+    normalize_builtin_local_model_api_endpoint(&mut endpoint);
     Ok(endpoint)
+}
+
+fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
+    if !matches!(
+        endpoint.model_endpoint_id.as_str(),
+        "embed-local-openai-compatible" | "llm-local-openai-compatible"
+    ) {
+        return;
+    }
+    if !endpoint
+        .provider_key
+        .eq_ignore_ascii_case("openai_compatible")
+    {
+        return;
+    }
+
+    let base_url = model_endpoint_metadata_string(endpoint, "base_url");
+    let healthz_url = model_endpoint_metadata_string(endpoint, "healthz_url");
+    let legacy_base_url = base_url
+        .as_deref()
+        .filter(|value| is_legacy_model_api_url(value));
+    let legacy_healthz_url = healthz_url
+        .as_deref()
+        .filter(|value| is_legacy_model_api_url(value));
+    if legacy_base_url.is_none() && legacy_healthz_url.is_none() {
+        return;
+    }
+
+    let Some(default_endpoint) = default_model_endpoints()
+        .into_iter()
+        .find(|default| default.model_endpoint_id == endpoint.model_endpoint_id)
+    else {
+        return;
+    };
+
+    for key in ["base_url", "healthz_url", "api_key"] {
+        if let Some(value) = model_endpoint_metadata_string(&default_endpoint, key) {
+            set_model_endpoint_metadata_string(endpoint, key, value);
+        }
+    }
+    set_model_endpoint_metadata_bool(
+        endpoint,
+        "api_key_configured",
+        model_endpoint_metadata_bool(&default_endpoint, "api_key_configured"),
+    );
+    set_model_endpoint_metadata_bool(endpoint, "legacy_model_api_migrated", true);
+    set_model_endpoint_metadata_string(
+        endpoint,
+        "legacy_model_api_migrated_reason",
+        "4176 standalone model API is not part of the release inference path".to_string(),
+    );
+    if let Some(value) = legacy_base_url {
+        set_model_endpoint_metadata_string(
+            endpoint,
+            "legacy_model_api_migrated_from_base_url",
+            value.to_string(),
+        );
+    }
+    if let Some(value) = legacy_healthz_url {
+        set_model_endpoint_metadata_string(
+            endpoint,
+            "legacy_model_api_migrated_from_healthz_url",
+            value.to_string(),
+        );
+    }
+}
+
+fn is_legacy_model_api_url(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.contains("127.0.0.1:4176") || normalized.contains("localhost:4176")
+}
+
+fn model_endpoint_metadata_string(endpoint: &ModelEndpoint, key: &str) -> Option<String> {
+    endpoint
+        .metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn model_endpoint_metadata_bool(endpoint: &ModelEndpoint, key: &str) -> bool {
+    endpoint
+        .metadata
+        .get(key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn set_model_endpoint_metadata_string(endpoint: &mut ModelEndpoint, key: &str, value: String) {
+    if let Some(object) = endpoint.metadata.as_object_mut() {
+        object.insert(key.to_string(), json!(value));
+    }
+}
+
+fn set_model_endpoint_metadata_bool(endpoint: &mut ModelEndpoint, key: &str, value: bool) {
+    if let Some(object) = endpoint.metadata.as_object_mut() {
+        object.insert(key.to_string(), json!(value));
+    }
 }
 
 pub fn sanitize_model_route_policy(
@@ -4179,6 +4460,13 @@ pub fn default_knowledge_index_root() -> String {
         .into_owned()
 }
 
+pub fn default_model_store_root() -> String {
+    Path::new(&harboros_writable_root())
+        .join("model-store")
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub fn harboros_current_user_id() -> String {
     env::var(HARBOROS_CURRENT_USER_ENV)
         .ok()
@@ -4323,6 +4611,38 @@ pub fn parse_rtsp_path(url: &str) -> Option<String> {
     }
 }
 
+fn latest_model_download_job_index(
+    jobs: &[ModelDownloadJobRecord],
+    model_id: &str,
+) -> Option<usize> {
+    jobs.iter()
+        .enumerate()
+        .filter(|(_, job)| job.model_id == model_id)
+        .max_by(|(_, left), (_, right)| {
+            model_download_job_record_sort_key(left).cmp(&model_download_job_record_sort_key(right))
+        })
+        .map(|(index, _)| index)
+}
+
+fn model_download_job_record_sort_key(job: &ModelDownloadJobRecord) -> (u64, u64, &str) {
+    (
+        model_download_job_record_timestamp(&job.updated_at),
+        model_download_job_record_timestamp(&job.requested_at),
+        job.job_id.as_str(),
+    )
+}
+
+fn model_download_job_record_timestamp(value: &str) -> u64 {
+    value.trim().parse::<u64>().unwrap_or(0)
+}
+
+fn model_download_job_record_is_active(job: &ModelDownloadJobRecord) -> bool {
+    matches!(
+        job.status.as_str(),
+        "queued" | "running" | "downloading" | "installing"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4340,14 +4660,15 @@ mod tests {
 
     use super::{
         account_management_snapshot, build_platform_state, dedupe_rtsp_paths,
-        default_model_endpoints, default_model_route_policies, default_rtsp_paths,
-        derive_rtsp_hints, normalize_binding_code, normalize_loaded_admin_state, parse_rtsp_auth,
-        parse_rtsp_path, resolved_identity_binding_records, resolved_remote_view_config,
-        sanitize_bridge_provider_config, user_default_delivery_surface,
-        user_recent_interactive_surface, AdminConsoleStore, AdminDefaults,
-        BridgeProviderCapabilities, BridgeProviderConfig, DeviceCredentialSecret,
-        DeviceEvidenceRecord, DvrRecordingSettings, IdentityBindingRecord, KnowledgeSettings,
-        KnowledgeSourceRoot, RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID,
+        default_model_endpoints, default_model_route_policies, default_model_store_root,
+        default_rtsp_paths, derive_rtsp_hints, device_rtsp_credential_id, normalize_binding_code,
+        normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path,
+        resolved_identity_binding_records, resolved_remote_view_config,
+        sanitize_bridge_provider_config, sanitize_model_center_state,
+        user_default_delivery_surface, user_recent_interactive_surface, AdminConsoleStore,
+        AdminDefaults, AdminModelCenterState, BridgeProviderCapabilities, BridgeProviderConfig,
+        DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings, IdentityBindingRecord,
+        KnowledgeSettings, KnowledgeSourceRoot, RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID,
         LOCAL_RTSP_CREDENTIAL_ID, LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
     };
 
@@ -4465,6 +4786,69 @@ mod tests {
         assert!(!payload.contains("token=abc"));
         assert!(payload.contains("redacted:redacted@192.168.1.10"));
         assert!(payload.contains("token=redacted"));
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn forget_device_clears_admin_references() {
+        let registry_path = temp_path("registry-forget-device");
+        let admin_path = temp_path("admin-forget-device");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        store
+            .save_defaults(AdminDefaults {
+                selected_camera_device_id: Some("cam-1".to_string()),
+                ..Default::default()
+            })
+            .expect("save defaults");
+        store
+            .save_dvr_recording_settings(DvrRecordingSettings {
+                enabled_device_ids: vec!["cam-1".to_string(), "cam-2".to_string()],
+                ..Default::default()
+            })
+            .expect("save dvr settings");
+        store
+            .save_device_credential(DeviceCredentialSecret {
+                device_id: "cam-1".to_string(),
+                username: "admin".to_string(),
+                password: "secret".to_string(),
+                rtsp_port: Some(554),
+                rtsp_paths: vec!["/stream1".to_string()],
+                updated_at: Some("123".to_string()),
+                last_verified_at: Some("124".to_string()),
+            })
+            .expect("save credential");
+        store
+            .record_device_evidence(DeviceEvidenceRecord {
+                evidence_id: "evidence-1".to_string(),
+                device_id: "cam-1".to_string(),
+                evidence_kind: "rtsp_check".to_string(),
+                status: "passed".to_string(),
+                observed_at: "125".to_string(),
+                summary: "ok".to_string(),
+                details: json!({}),
+            })
+            .expect("record evidence");
+
+        let updated = store.forget_device("cam-1").expect("forget device");
+
+        assert_eq!(updated.defaults.selected_camera_device_id, None);
+        assert_eq!(updated.dvr.enabled_device_ids, vec!["cam-2"]);
+        assert!(updated.device_credentials.is_empty());
+        assert!(updated.device_evidence.is_empty());
+        assert!(!updated
+            .platform
+            .credentials
+            .iter()
+            .any(|credential| credential.credential_id == device_rtsp_credential_id("cam-1")));
+        assert!(updated
+            .platform
+            .recording_policies
+            .iter()
+            .all(|policy| policy.device_id.as_deref() != Some("cam-1")));
 
         let _ = std::fs::remove_file(admin_path);
         let _ = std::fs::remove_file(registry_path);
@@ -5073,6 +5457,51 @@ mod tests {
             .find(|policy| policy.route_policy_id == "retrieval.vision_summary")
             .expect("vlm policy");
         assert!(!vlm_policy.fallback_order.iter().any(|kind| kind == "cloud"));
+    }
+
+    #[test]
+    fn sanitize_model_center_migrates_legacy_builtin_model_api_urls() {
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "embed-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Embedder,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+                capability_tags: vec!["embeddings".to_string(), "local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "builtin": true,
+                    "base_url": "http://127.0.0.1:4176/v1",
+                    "healthz_url": "http://127.0.0.1:4176/healthz",
+                    "api_key": "legacy-token",
+                    "api_key_configured": true,
+                }),
+            }],
+            route_policies: default_model_route_policies(),
+            model_store_root: default_model_store_root(),
+            capability_bindings: Vec::new(),
+        };
+
+        let sanitized = sanitize_model_center_state(state);
+        let endpoint = sanitized
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "embed-local-openai-compatible")
+            .expect("embed endpoint");
+
+        assert_eq!(
+            endpoint.metadata["base_url"],
+            json!("http://127.0.0.1:4174/api/inference/v1")
+        );
+        assert_eq!(
+            endpoint.metadata["healthz_url"],
+            json!("http://127.0.0.1:4174/api/inference/healthz")
+        );
+        assert_eq!(endpoint.metadata["legacy_model_api_migrated"], json!(true));
     }
 
     #[test]

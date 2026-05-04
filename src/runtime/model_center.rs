@@ -155,6 +155,8 @@ pub fn redact_model_center_state(state: &AdminModelCenterState) -> AdminModelCen
     AdminModelCenterState {
         endpoints: state.endpoints.iter().map(redact_model_endpoint).collect(),
         route_policies: state.route_policies.clone(),
+        model_store_root: state.model_store_root.clone(),
+        capability_bindings: state.capability_bindings.clone(),
     }
 }
 
@@ -885,6 +887,8 @@ fn runtime_wired_model_center_state(state: &AdminModelCenterState) -> AdminModel
     AdminModelCenterState {
         endpoints: overlay_endpoints_with_runtime_truth(&state.endpoints, &runtime),
         route_policies: state.route_policies.clone(),
+        model_store_root: state.model_store_root.clone(),
+        capability_bindings: state.capability_bindings.clone(),
     }
 }
 
@@ -991,13 +995,20 @@ fn resolve_local_runtime_probe_target(
                 .find(|endpoint| is_builtin_local_openai_endpoint(endpoint))
         });
 
-    let base_url = metadata_string(&template.metadata, "base_url")
-        .or_else(|| fallback.and_then(|endpoint| metadata_string(&endpoint.metadata, "base_url")))
+    let template_is_builtin = is_builtin_local_openai_endpoint(&template);
+    let raw_base_url = metadata_string(&template.metadata, "base_url");
+    let fallback_base_url =
+        fallback.and_then(|endpoint| metadata_string(&endpoint.metadata, "base_url"));
+    let base_url = raw_base_url
+        .filter(|value| !(template_is_builtin && is_legacy_model_api_url(value)))
+        .or(fallback_base_url)
         .unwrap_or_default();
-    let healthz_url = metadata_string(&template.metadata, "healthz_url")
-        .or_else(|| {
-            fallback.and_then(|endpoint| metadata_string(&endpoint.metadata, "healthz_url"))
-        })
+    let raw_healthz_url = metadata_string(&template.metadata, "healthz_url");
+    let fallback_healthz_url =
+        fallback.and_then(|endpoint| metadata_string(&endpoint.metadata, "healthz_url"));
+    let healthz_url = raw_healthz_url
+        .filter(|value| !(template_is_builtin && is_legacy_model_api_url(value)))
+        .or(fallback_healthz_url)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| infer_healthz_url(&base_url));
     let api_key = metadata_string(&template.metadata, "api_key")
@@ -1119,31 +1130,44 @@ fn overlay_endpoints_with_runtime_truth(
             let mut overlayed = endpoint.clone();
             if let Some(default_endpoint) = builtin_defaults.get(&overlayed.model_endpoint_id) {
                 if is_builtin_local_openai_endpoint(default_endpoint) {
-                    if metadata_missing_or_empty(&overlayed.metadata, "base_url") {
+                    let legacy_base_url = metadata_string(&overlayed.metadata, "base_url")
+                        .is_some_and(|value| is_legacy_model_api_url(&value));
+                    if metadata_missing_or_empty(&overlayed.metadata, "base_url") || legacy_base_url
+                    {
                         set_metadata_string(
                             &mut overlayed.metadata,
                             "base_url",
-                            runtime
-                                .base_url
-                                .clone()
-                                .if_empty_then(|| {
-                                    metadata_string(&default_endpoint.metadata, "base_url")
-                                })
+                            metadata_string(&default_endpoint.metadata, "base_url")
+                                .or_else(|| runtime.base_url.clone().if_empty_then(|| None))
                                 .unwrap_or_default(),
                         );
+                        if legacy_base_url {
+                            set_metadata_bool(
+                                &mut overlayed.metadata,
+                                "legacy_model_api_migrated",
+                                true,
+                            );
+                        }
                     }
-                    if metadata_missing_or_empty(&overlayed.metadata, "healthz_url") {
+                    let legacy_healthz_url = metadata_string(&overlayed.metadata, "healthz_url")
+                        .is_some_and(|value| is_legacy_model_api_url(&value));
+                    if metadata_missing_or_empty(&overlayed.metadata, "healthz_url")
+                        || legacy_healthz_url
+                    {
                         set_metadata_string(
                             &mut overlayed.metadata,
                             "healthz_url",
-                            runtime
-                                .healthz_url
-                                .clone()
-                                .if_empty_then(|| {
-                                    metadata_string(&default_endpoint.metadata, "healthz_url")
-                                })
+                            metadata_string(&default_endpoint.metadata, "healthz_url")
+                                .or_else(|| runtime.healthz_url.clone().if_empty_then(|| None))
                                 .unwrap_or_else(|| infer_healthz_url(&runtime.base_url)),
                         );
+                        if legacy_healthz_url {
+                            set_metadata_bool(
+                                &mut overlayed.metadata,
+                                "legacy_model_api_migrated",
+                                true,
+                            );
+                        }
                     }
                     if metadata_missing_or_empty(&overlayed.metadata, "api_key") {
                         set_metadata_string(
@@ -1163,11 +1187,12 @@ fn overlay_endpoints_with_runtime_truth(
                     {
                         set_metadata_bool(&mut overlayed.metadata, "api_key_configured", true);
                     }
-                    if matches!(overlayed.model_kind, ModelKind::Llm | ModelKind::Embedder)
-                        && runtime.ready
-                        && runtime.backend_ready
-                    {
-                        overlayed.status = ModelEndpointStatus::Active;
+                    if matches!(overlayed.model_kind, ModelKind::Llm | ModelKind::Embedder) {
+                        if runtime.ready && runtime.backend_ready {
+                            overlayed.status = ModelEndpointStatus::Active;
+                        } else if overlayed.status == ModelEndpointStatus::Active {
+                            overlayed.status = ModelEndpointStatus::Degraded;
+                        }
                     }
                 }
             }
@@ -1405,6 +1430,11 @@ fn metadata_bool(metadata: &Value, key: &str) -> bool {
 
 fn metadata_missing_or_empty(metadata: &Value, key: &str) -> bool {
     metadata_string(metadata, key).is_none()
+}
+
+fn is_legacy_model_api_url(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.contains("127.0.0.1:4176") || normalized.contains("localhost:4176")
 }
 
 fn set_metadata_string(metadata: &mut Value, key: &str, value: String) {
@@ -1684,6 +1714,7 @@ mod tests {
                 status: "active".to_string(),
                 metadata: json!({}),
             }],
+            ..AdminModelCenterState::default()
         };
 
         let result = run_vlm_summary_with_state(&image_path, &state);
@@ -1727,6 +1758,7 @@ mod tests {
                 status: "active".to_string(),
                 metadata: json!({}),
             }],
+            ..AdminModelCenterState::default()
         };
 
         let exact = run_embedding_with_state("樱花整理", &state);
@@ -1838,6 +1870,7 @@ mod tests {
                 status: "active".to_string(),
                 metadata: json!({}),
             }],
+            ..AdminModelCenterState::default()
         };
 
         let result = run_llm_text_with_state("摄像头能干什么", &state);
@@ -1851,6 +1884,96 @@ mod tests {
         assert_eq!(result.status, "active");
         assert!(result.text.contains("\"decision\":\"capability_summary\""));
         assert!(result.text.contains("我可以帮你抓拍最新画面。"));
+    }
+
+    #[test]
+    fn run_embedding_migrates_legacy_builtin_4176_endpoint_to_runtime_proxy() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_local_runtime_projection_cache();
+        let server = Server::http("127.0.0.1:0").expect("server");
+        let base_url = format!("http://{}/v1", server.server_addr());
+        let header = Header::from_bytes(b"Content-Type", b"application/json").expect("header");
+
+        let server_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                let request = server.recv().expect("request");
+                match (request.method(), request.url()) {
+                    (&Method::Get, "/healthz") => request
+                        .respond(
+                            Response::from_string(
+                                r#"{"ready":true,"backend":{"ready":true,"kind":"openai_proxy"},"embedding_model":"Qwen/Qwen3-Embedding-0.6B"}"#,
+                            )
+                            .with_header(header.clone()),
+                        )
+                        .expect("health response"),
+                    (&Method::Post, "/v1/embeddings") => request
+                        .respond(
+                            Response::from_string(
+                                r#"{"data":[{"embedding":[0.1,0.2,0.3]}],"model":"Qwen/Qwen3-Embedding-0.6B"}"#,
+                            )
+                            .with_header(header.clone()),
+                        )
+                        .expect("embedding response"),
+                    _ => request
+                        .respond(Response::from_string("not found").with_status_code(404))
+                        .expect("404 response"),
+                }
+            }
+        });
+
+        std::env::set_var("HARBOR_MODEL_API_BASE_URL", &base_url);
+        std::env::set_var("HARBOR_MODEL_API_TOKEN", "runtime-overlay-token");
+
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "embed-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Embedder,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+                capability_tags: vec!["embeddings".to_string(), "local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "builtin": true,
+                    "base_url": "http://127.0.0.1:4176/v1",
+                    "healthz_url": "http://127.0.0.1:4176/healthz",
+                    "api_key": "legacy-token",
+                    "api_key_configured": true,
+                }),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "retrieval.embed".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::StrictLocal,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+            ..AdminModelCenterState::default()
+        };
+
+        let result = run_embedding_with_state("谁在倒啤酒", &state);
+
+        std::env::remove_var("HARBOR_MODEL_API_BASE_URL");
+        std::env::remove_var("HARBOR_MODEL_API_TOKEN");
+        clear_local_runtime_projection_cache();
+        server_thread.join().expect("server thread");
+
+        assert!(result.available);
+        assert_eq!(
+            result.model_endpoint_id.as_deref(),
+            Some("embed-local-openai-compatible")
+        );
+        assert_eq!(result.vector, vec![0.1, 0.2, 0.3]);
     }
 
     #[test]
@@ -1917,6 +2040,7 @@ mod tests {
                 status: "active".to_string(),
                 metadata: json!({}),
             }],
+            ..AdminModelCenterState::default()
         };
 
         let result = run_llm_text_with_state_and_options(
@@ -1993,6 +2117,7 @@ mod tests {
                 status: "active".to_string(),
                 metadata: json!({"capability": "router"}),
             }],
+            ..AdminModelCenterState::default()
         };
 
         let result = run_llm_text_with_state_and_options(
@@ -2050,6 +2175,7 @@ mod tests {
                 status: "active".to_string(),
                 metadata: json!({}),
             }],
+            ..AdminModelCenterState::default()
         };
 
         let result = run_llm_text_with_state("answer locally", &state);
@@ -2133,6 +2259,7 @@ mod tests {
                 status: "active".to_string(),
                 metadata: json!({}),
             }],
+            ..AdminModelCenterState::default()
         };
 
         let first = run_llm_text_with_state("摄像头能干什么", &state);

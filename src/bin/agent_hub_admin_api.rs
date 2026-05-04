@@ -9,6 +9,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+use base64::Engine as _;
 use hf_hub::{
     api::{sync::ApiBuilder as HfApiBuilder, Progress as HfProgress},
     Cache as HfCache, Repo, RepoType,
@@ -22,6 +23,7 @@ use uuid::Uuid;
 
 use harborbeacon_local_agent::adapters::rtsp::{CommandRtspAdapter, RtspProbeAdapter};
 use harborbeacon_local_agent::connectors::im_gateway::GatewayPlatformStatus;
+use harborbeacon_local_agent::connectors::storage::StorageTarget;
 use harborbeacon_local_agent::control_plane::media::{
     MediaAsset, MediaAssetKind, MediaSession, MediaSessionStatus, ShareLink,
 };
@@ -36,12 +38,13 @@ use harborbeacon_local_agent::runtime::access_control::{
 use harborbeacon_local_agent::runtime::admin_console::{
     account_management_snapshot, dedupe_rtsp_paths, default_capture_subdirectory,
     default_clip_length_seconds, default_keyframe_count, default_keyframe_interval_seconds,
-    default_model_endpoints, device_rtsp_credential_id, harboros_writable_root,
-    normalize_delivery_surface, path_is_same_or_inside, user_default_delivery_surface,
-    user_recent_interactive_surface, validate_knowledge_settings, AccountManagementSnapshot,
-    AdminConsoleState, AdminConsoleStore, AdminDefaults, BridgeProviderConfig,
-    DeviceCredentialSecret, DeviceEvidenceRecord, GatewayStatusSummary, KnowledgeIndexJobRecord,
-    KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord, RagResourceProfile,
+    default_model_endpoints, default_model_store_root, device_rtsp_credential_id,
+    harboros_writable_root, normalize_delivery_surface, path_is_same_or_inside,
+    user_default_delivery_surface, user_recent_interactive_surface, validate_knowledge_settings,
+    AccountManagementSnapshot, AdminConsoleState, AdminConsoleStore, AdminDefaults,
+    AdminModelCenterState, BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord,
+    GatewayStatusSummary, KnowledgeIndexJobRecord, KnowledgeSettings, KnowledgeSourceRoot,
+    ModelDownloadJobRecord, RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::discovery::RtspProbeRequest;
 use harborbeacon_local_agent::runtime::dvr::{
@@ -59,6 +62,7 @@ use harborbeacon_local_agent::runtime::knowledge_index::{
     load_embedding_store, KnowledgeIndexConfig, KnowledgeIndexManifest, KnowledgeIndexService,
     KnowledgeModality,
 };
+use harborbeacon_local_agent::runtime::media::{SnapshotCaptureRequest, SnapshotFormat};
 use harborbeacon_local_agent::runtime::media_tools::{ffmpeg_resolution_hint, resolve_ffmpeg_bin};
 use harborbeacon_local_agent::runtime::model_center::{
     redact_model_endpoint, test_model_endpoint, ModelEndpointTestResult, ADMIN_STATE_PATH_ENV,
@@ -730,6 +734,8 @@ struct LocalModelCatalogItem {
     download_size_hint: String,
     detail: String,
     source_kind: String,
+    installable: bool,
+    manual_only: bool,
     repo_id: Option<String>,
     revision: Option<String>,
     file_policy: String,
@@ -738,6 +744,71 @@ struct LocalModelCatalogItem {
     expected_capabilities: Vec<String>,
     acceptance_note: Option<String>,
     evidence: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct ModelCapabilitiesResponse {
+    generated_at: String,
+    checked_at: String,
+    status: String,
+    model_store: ModelStoreStatusResponse,
+    capabilities: Vec<ModelCapabilityStatus>,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct ModelStoreStatusResponse {
+    path: String,
+    status: String,
+    writable: bool,
+    runtime_readable: bool,
+    next_action: String,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct ModelCapabilityStatus {
+    capability_id: String,
+    label: String,
+    model_kind: String,
+    status: String,
+    selected_model_id: Option<String>,
+    runtime_model_id: Option<String>,
+    current_model: Option<ModelCapabilityCurrentModel>,
+    installed_models: Vec<ModelCapabilityInstallableModel>,
+    installable_models: Vec<ModelCapabilityInstallableModel>,
+    download_jobs: Vec<ModelDownloadJobRecord>,
+    next_action: String,
+    runtime_ready: bool,
+    source_of_truth: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct ModelCapabilityCurrentModel {
+    model_endpoint_id: String,
+    model_name: String,
+    provider_key: String,
+    status: String,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct ModelCapabilityInstallableModel {
+    model_id: String,
+    display_name: String,
+    provider_key: String,
+    model_kind: String,
+    status: String,
+    installed: bool,
+    local_path: Option<String>,
+    download_job_id: Option<String>,
+    download_size_hint: String,
+    source_kind: String,
+    repo_id: Option<String>,
+    file_policy: String,
+    expected_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -791,6 +862,8 @@ struct ModelPoliciesRequest {
 struct ModelDownloadRequest {
     model_id: String,
     #[serde(default)]
+    capability_id: Option<String>,
+    #[serde(default)]
     display_name: Option<String>,
     #[serde(default)]
     provider_key: Option<String>,
@@ -800,6 +873,16 @@ struct ModelDownloadRequest {
     hf_endpoint: Option<String>,
     #[serde(default)]
     metadata: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelStoreUpdateRequest {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelCapabilitySelectionRequest {
+    model_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1111,6 +1194,12 @@ impl AdminApi {
             Method::Get if path == "/api/models/endpoints" => {
                 self.handle_model_endpoints(&identity_hints).boxed()
             }
+            Method::Get if path == "/api/models/capabilities" => {
+                self.handle_model_capabilities(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/models/store" => {
+                self.handle_model_store(&identity_hints).boxed()
+            }
             Method::Get if path == "/api/models/local-catalog" => {
                 self.handle_local_model_catalog(&identity_hints).boxed()
             }
@@ -1201,6 +1290,16 @@ impl AdminApi {
             Method::Post if path == "/api/models/local-downloads" => self
                 .handle_create_model_download(&mut request, &identity_hints)
                 .boxed(),
+            Method::Put if path == "/api/models/store" => self
+                .handle_update_model_store(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post
+                if path.starts_with("/api/models/capabilities/")
+                    && path.ends_with("/selection") =>
+            {
+                self.handle_select_model_capability(&path, &mut request, &identity_hints)
+                    .boxed()
+            }
             Method::Post
                 if path.starts_with("/api/models/local-downloads/")
                     && path.ends_with("/cancel") =>
@@ -1222,6 +1321,9 @@ impl AdminApi {
                 .boxed(),
             Method::Patch if path.starts_with("/api/devices/") => self
                 .handle_patch_device_metadata(path.as_str(), &mut request, &identity_hints)
+                .boxed(),
+            Method::Delete if path.starts_with("/api/devices/") => self
+                .handle_delete_device(path.as_str(), &identity_hints)
                 .boxed(),
             Method::Post
                 if path.starts_with("/api/tasks/approvals/") && path.ends_with("/approve") =>
@@ -1997,7 +2099,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
                 let endpoints = overlay_model_endpoints_with_runtime_truth(
@@ -2012,6 +2114,48 @@ impl AdminApi {
         }
     }
 
+    fn handle_model_capabilities(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let state = match self.admin_store.load_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let download_jobs = match self.admin_store.list_model_download_jobs() {
+            Ok(jobs) => jobs,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
+        let endpoints = overlay_model_endpoints_with_runtime_truth(
+            &state.models.endpoints,
+            &runtime_projection,
+        );
+        ok_json(&build_model_capabilities_response(
+            &state.models,
+            &endpoints,
+            &state.models.route_policies,
+            download_jobs,
+            &runtime_projection,
+        ))
+    }
+
+    fn handle_model_store(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.load_state() {
+            Ok(state) => ok_json(&build_model_store_status(&state.models)),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
     fn handle_local_model_catalog(
         &self,
         hints: &AccessIdentityHints,
@@ -2019,8 +2163,15 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
+        let state = match self.admin_store.load_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
         match self.admin_store.list_model_download_jobs() {
-            Ok(download_jobs) => ok_json(&build_local_model_catalog(download_jobs)),
+            Ok(download_jobs) => ok_json(&build_local_model_catalog_for_model_state(
+                &state.models,
+                download_jobs,
+            )),
             Err(error) => error_json(StatusCode(500), &error),
         }
     }
@@ -2033,15 +2184,18 @@ impl AdminApi {
             return error_json(StatusCode(403), &error);
         }
         match self.admin_store.list_model_download_jobs() {
-            Ok(jobs) => ok_json(&ModelDownloadJobsResponse {
-                generated_at: now_unix_string(),
-                checked_at: now_unix_string(),
-                status: model_download_jobs_status(&jobs).to_string(),
-                jobs: jobs.clone(),
-                downloads: jobs,
-                blockers: Vec::new(),
-                warnings: Vec::new(),
-            }),
+            Ok(jobs) => {
+                let latest_jobs = latest_model_download_jobs(&jobs);
+                ok_json(&ModelDownloadJobsResponse {
+                    generated_at: now_unix_string(),
+                    checked_at: now_unix_string(),
+                    status: model_download_jobs_status(&jobs).to_string(),
+                    jobs: latest_jobs.clone(),
+                    downloads: latest_jobs,
+                    blockers: Vec::new(),
+                    warnings: Vec::new(),
+                })
+            }
             Err(error) => error_json(StatusCode(500), &error),
         }
     }
@@ -2232,7 +2386,11 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        let catalog = build_local_model_catalog(Vec::new());
+        let state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let catalog = build_local_model_catalog_for_model_state(&state.models, Vec::new());
         let catalog_item = catalog
             .models
             .iter()
@@ -2254,7 +2412,12 @@ impl AdminApi {
             .as_deref()
             .and_then(non_empty_string)
             .or_else(|| catalog_item.and_then(|item| item.local_path.clone()))
-            .or_else(|| Some(default_model_download_target_path(&body.model_id)));
+            .or_else(|| {
+                Some(default_model_download_target_path_for_model_state(
+                    &state.models,
+                    &body.model_id,
+                ))
+            });
         let mut metadata = if body.metadata.is_null() {
             json!({})
         } else {
@@ -2271,14 +2434,26 @@ impl AdminApi {
                 object.insert("hf_endpoint".to_string(), json!(hf_endpoint));
             }
         }
-        match self.admin_store.create_model_download_job(
+        if let Some(capability_id) = body.capability_id.as_deref().and_then(non_empty_string) {
+            if !metadata.is_object() {
+                metadata = json!({});
+            }
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert("capability_id".to_string(), json!(capability_id));
+            }
+        }
+        match self.admin_store.create_or_update_model_download_job(
             &body.model_id,
             &display_name,
             &provider_key,
             target_path,
             redact_secret_json_value(metadata),
         ) {
-            Ok(job) => {
+            Ok(result) => {
+                let job = result.job;
+                if !result.should_spawn_worker {
+                    return ok_json(&ModelDownloadJobResponse::new(job));
+                }
                 let worker_store = AdminConsoleStore::new(
                     self.admin_store.path().to_path_buf(),
                     self.admin_store.registry_store().clone(),
@@ -2294,6 +2469,50 @@ impl AdminApi {
             }
             Err(error) => error_json(StatusCode(422), &error),
         }
+    }
+
+    fn handle_update_model_store(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let body: ModelStoreUpdateRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        match self.admin_store.save_model_store_root(&body.path) {
+            Ok(state) => ok_json(&build_model_store_status(&state.models)),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_select_model_capability(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let capability_id = match parse_model_capability_selection_path(path) {
+            Some(capability_id) => capability_id,
+            None => return error_json(StatusCode(400), "invalid model capability selection path"),
+        };
+        let body: ModelCapabilitySelectionRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        if let Err(error) = self
+            .admin_store
+            .save_model_capability_binding(&capability_id, &body.model_id)
+        {
+            return error_json(StatusCode(422), &error);
+        }
+        self.handle_model_capabilities(hints)
     }
 
     fn handle_cancel_model_download(
@@ -2872,6 +3091,25 @@ impl AdminApi {
         }
     }
 
+    fn handle_delete_device(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let device_id = match parse_device_metadata_path(path) {
+            Some(device_id) => device_id,
+            None => return error_json(StatusCode(400), "invalid device delete path"),
+        };
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.delete_device(&device_id) {
+            Ok(payload) => ok_json(&redact_state_snapshot(payload)),
+            Err(error) if error.contains("device not found") => error_json(StatusCode(404), &error),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
     fn handle_device_credential_status(
         &self,
         path: &str,
@@ -3210,6 +3448,7 @@ impl AdminApi {
             }
             Err(error) => return error_json(StatusCode(422), &error),
         };
+        let device = self.camera_device_with_runtime_credentials(&device);
         let mut settings = match self.admin_store.dvr_recording_settings() {
             Ok(settings) => settings,
             Err(error) => return error_json(StatusCode(500), &error),
@@ -3380,6 +3619,7 @@ impl AdminApi {
             Err(error) => return error_json(StatusCode(422), &error).boxed(),
         };
 
+        let device = self.camera_device_with_runtime_credentials(&device);
         let stream = match FfmpegMjpegStream::spawn(&device.primary_stream.url) {
             Ok(stream) => stream,
             Err(error) => {
@@ -3417,6 +3657,7 @@ impl AdminApi {
             Err(error) => return error_json(StatusCode(422), &error).boxed(),
         };
 
+        let device = self.camera_device_with_runtime_credentials(&device);
         let stream = match FfmpegMjpegStream::spawn(&device.primary_stream.url) {
             Ok(stream) => stream,
             Err(error) => {
@@ -3643,6 +3884,23 @@ impl AdminApi {
         self.current_state()
     }
 
+    fn delete_device(&self, device_id: &str) -> Result<StateResponse, String> {
+        let registry_store = self.admin_store.registry_store();
+        let mut devices = registry_store.load_devices()?;
+        let original_len = devices.len();
+        devices.retain(|device| device.device_id != device_id);
+        if devices.len() == original_len {
+            return Err(format!("device not found: {device_id}"));
+        }
+
+        let _ = self
+            .dvr_runtime
+            .stop_recording(device_id, Some(&self.public_origin));
+        registry_store.save_devices(&devices)?;
+        self.admin_store.forget_device(device_id)?;
+        self.current_state()
+    }
+
     fn analyze_camera(&self, principal: &AccessPrincipal, device_id: &str) -> TaskResponse {
         self.task_service
             .handle_task(self.build_camera_task_request(
@@ -3680,7 +3938,35 @@ impl AdminApi {
     }
 
     fn capture_camera_snapshot(&self, device_id: &str) -> Result<Vec<u8>, String> {
-        self.hub().capture_camera_snapshot(device_id)
+        let device = self.load_camera_device(device_id)?;
+        let device = self.camera_device_with_runtime_credentials(&device);
+        let adapter = CommandRtspAdapter::default();
+        let result = adapter.capture_snapshot(
+            &SnapshotCaptureRequest::new(
+                device.device_id,
+                device.primary_stream.url,
+                SnapshotFormat::Jpeg,
+                StorageTarget::LocalDisk,
+            )
+            .with_snapshot_url(device.snapshot_url),
+        )?;
+
+        base64::engine::general_purpose::STANDARD
+            .decode(result.bytes_base64.as_bytes())
+            .map_err(|error| format!("snapshot bytes decode failed: {error}"))
+    }
+
+    fn camera_device_with_runtime_credentials(&self, device: &CameraDevice) -> CameraDevice {
+        let Ok(state) = self.admin_store.load_or_create_state() else {
+            return device.clone();
+        };
+        let Some(stream_url) = camera_stream_url_with_credentials(device, &state) else {
+            return device.clone();
+        };
+        let mut resolved = device.clone();
+        resolved.primary_stream.url = stream_url;
+        resolved.primary_stream.requires_auth = true;
+        resolved
     }
 
     fn store_dvr_snapshot_media_item(&self, device_id: &str) -> Result<DvrTimelineSegment, String> {
@@ -4296,6 +4582,18 @@ fn parse_model_download_cancel_path(path: &str) -> Option<String> {
         None
     } else {
         percent_decode_path_segment(job_id).ok()
+    }
+}
+
+fn parse_model_capability_selection_path(path: &str) -> Option<String> {
+    let capability_id = path
+        .strip_prefix("/api/models/capabilities/")?
+        .strip_suffix("/selection")?
+        .trim_matches('/');
+    if capability_id.is_empty() || capability_id.contains('/') {
+        None
+    } else {
+        percent_decode_path_segment(capability_id).ok()
     }
 }
 
@@ -5325,6 +5623,8 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/harboros/status"
         || path == "/api/harboros/im-capability-map"
         || path == "/api/models/endpoints"
+        || path == "/api/models/capabilities"
+        || path == "/api/models/store"
         || path == "/api/models/local-catalog"
         || path == "/api/models/policies"
         || path == "/admin/models"
@@ -5349,6 +5649,8 @@ fn is_admin_surface_path(path: &str) -> bool {
         || (path.starts_with("/api/devices/") && path.ends_with("/credential-status"))
         || (path.starts_with("/api/devices/") && path.ends_with("/rtsp-check"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/share-link"))
+        || (path.starts_with("/api/cameras/") && path.ends_with("/snapshot.jpg"))
+        || (path.starts_with("/api/cameras/") && path.ends_with("/live.mjpeg"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/recordings/start"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/recordings/stop"))
         || (path.starts_with("/api/share-links/") && path.ends_with("/revoke"))
@@ -5358,6 +5660,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path.starts_with("/api/models/endpoints/")
         || path == "/api/models/local-downloads"
         || path.starts_with("/api/models/local-downloads/")
+        || (path.starts_with("/api/models/capabilities/") && path.ends_with("/selection"))
 }
 
 fn is_harbordesk_client_route(path: &str) -> bool {
@@ -7276,6 +7579,7 @@ fn build_rag_readiness_response(
     model_endpoints: &[ModelEndpoint],
     index_jobs: &[KnowledgeIndexJobRecord],
 ) -> RagReadinessResponse {
+    let model_endpoints = overlay_model_endpoints_with_runtime_truth(model_endpoints, runtime);
     let generated_at = now_unix_string();
     let index_dir = knowledge.index_root.clone();
     let index_path = Path::new(&index_dir);
@@ -7301,8 +7605,8 @@ fn build_rag_readiness_response(
         .iter()
         .filter(|root| Path::new(root.path.trim()).exists())
         .count();
-    let model_readiness = build_rag_model_readiness(model_endpoints);
-    let privacy_policy = build_rag_privacy_policy_component(knowledge, model_endpoints);
+    let model_readiness = build_rag_model_readiness(&model_endpoints);
+    let privacy_policy = build_rag_privacy_policy_component(knowledge, &model_endpoints);
 
     let source_roots = RagReadinessComponent {
         status: if existing_enabled_source_roots > 0 {
@@ -7411,7 +7715,7 @@ fn build_rag_readiness_response(
     };
     let resource_profiles = build_rag_resource_profiles(
         knowledge,
-        model_endpoints,
+        &model_endpoints,
         storage_writable,
         embedding_ready,
     );
@@ -7805,10 +8109,27 @@ fn harboros_im_capability(
 fn build_local_model_catalog(
     download_jobs: Vec<ModelDownloadJobRecord>,
 ) -> LocalModelCatalogResponse {
-    let cache_roots = local_model_cache_roots();
+    build_local_model_catalog_for_roots(local_model_cache_roots(), download_jobs)
+}
+
+fn build_local_model_catalog_for_model_state(
+    model_state: &AdminModelCenterState,
+    download_jobs: Vec<ModelDownloadJobRecord>,
+) -> LocalModelCatalogResponse {
+    build_local_model_catalog_for_roots(
+        local_model_cache_roots_for_model_state(model_state),
+        download_jobs,
+    )
+}
+
+fn build_local_model_catalog_for_roots(
+    cache_roots: Vec<String>,
+    download_jobs: Vec<ModelDownloadJobRecord>,
+) -> LocalModelCatalogResponse {
+    let latest_download_jobs = latest_model_download_jobs(&download_jobs);
     let models = local_model_catalog_specs()
         .into_iter()
-        .map(|spec| local_model_catalog_item(&cache_roots, &download_jobs, spec))
+        .map(|spec| local_model_catalog_item(&cache_roots, &latest_download_jobs, spec))
         .collect::<Vec<_>>();
     let generated_at = now_unix_string();
     LocalModelCatalogResponse {
@@ -7822,10 +8143,281 @@ fn build_local_model_catalog(
         .to_string(),
         cache_roots,
         models,
-        download_jobs: download_jobs.clone(),
-        downloads: download_jobs,
+        download_jobs: latest_download_jobs.clone(),
+        downloads: latest_download_jobs,
         blockers: Vec::new(),
         warnings: Vec::new(),
+    }
+}
+
+fn build_model_capabilities_response(
+    model_state: &AdminModelCenterState,
+    endpoints: &[ModelEndpoint],
+    route_policies: &[ModelRoutePolicy],
+    download_jobs: Vec<ModelDownloadJobRecord>,
+    runtime: &LocalModelRuntimeProjection,
+) -> ModelCapabilitiesResponse {
+    let download_jobs = latest_model_download_jobs(&download_jobs);
+    let catalog = build_local_model_catalog_for_model_state(model_state, download_jobs.clone());
+    let model_store = build_model_store_status(model_state);
+    let generated_at = now_unix_string();
+    let capabilities = vec![
+        build_model_capability_status(
+            model_state,
+            "semantic_router",
+            "问题理解",
+            ModelKind::Llm,
+            "semantic.router",
+            endpoints,
+            route_policies,
+            &catalog.models,
+            &download_jobs,
+            runtime,
+            true,
+        ),
+        build_model_capability_status(
+            model_state,
+            "embedder",
+            "向量检索",
+            ModelKind::Embedder,
+            "retrieval.embed",
+            endpoints,
+            route_policies,
+            &catalog.models,
+            &download_jobs,
+            runtime,
+            true,
+        ),
+        build_model_capability_status(
+            model_state,
+            "retrieval_answer",
+            "对话回答",
+            ModelKind::Llm,
+            "retrieval.answer",
+            endpoints,
+            route_policies,
+            &catalog.models,
+            &download_jobs,
+            runtime,
+            true,
+        ),
+        build_model_capability_status(
+            model_state,
+            "vlm",
+            "图片/视频理解",
+            ModelKind::Vlm,
+            "retrieval.vision_summary",
+            endpoints,
+            route_policies,
+            &catalog.models,
+            &download_jobs,
+            runtime,
+            false,
+        ),
+        build_model_capability_status(
+            model_state,
+            "ocr",
+            "文字识别",
+            ModelKind::Ocr,
+            "retrieval.ocr",
+            endpoints,
+            route_policies,
+            &catalog.models,
+            &download_jobs,
+            runtime,
+            false,
+        ),
+        build_model_capability_status(
+            model_state,
+            "asr",
+            "语音转文字",
+            ModelKind::Asr,
+            "retrieval.asr",
+            endpoints,
+            route_policies,
+            &catalog.models,
+            &download_jobs,
+            runtime,
+            false,
+        ),
+    ];
+    let blockers = capabilities
+        .iter()
+        .filter(|capability| matches!(capability.status.as_str(), "needs_model" | "degraded"))
+        .map(|capability| format!("{}: {}", capability.capability_id, capability.next_action))
+        .collect::<Vec<_>>();
+    let status = if capabilities
+        .iter()
+        .any(|capability| capability.status == "degraded")
+    {
+        "degraded"
+    } else if capabilities
+        .iter()
+        .any(|capability| capability.status == "needs_model")
+    {
+        "needs-config"
+    } else {
+        "ready"
+    }
+    .to_string();
+
+    ModelCapabilitiesResponse {
+        generated_at: generated_at.clone(),
+        checked_at: generated_at,
+        status,
+        model_store,
+        capabilities,
+        blockers,
+        warnings: Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_model_capability_status(
+    model_state: &AdminModelCenterState,
+    capability_id: &str,
+    label: &str,
+    model_kind: ModelKind,
+    route_policy_id: &str,
+    endpoints: &[ModelEndpoint],
+    route_policies: &[ModelRoutePolicy],
+    catalog_models: &[LocalModelCatalogItem],
+    download_jobs: &[ModelDownloadJobRecord],
+    runtime: &LocalModelRuntimeProjection,
+    runtime_bound: bool,
+) -> ModelCapabilityStatus {
+    let endpoint = select_model_endpoint(
+        endpoints,
+        preferred_endpoint_id_for_model_kind(model_kind),
+        model_kind,
+    );
+    let runtime_ready = model_capability_runtime_ready(model_kind, runtime, runtime_bound);
+    let selected_model_id = selected_model_id_for_capability(model_state, capability_id);
+    let installable_models = catalog_models
+        .iter()
+        .filter(|model| {
+            model.installable
+                && catalog_model_matches_kind_or_capability(model, model_kind, capability_id)
+        })
+        .filter(|model| !model.installed)
+        .map(model_capability_installable_model)
+        .collect::<Vec<_>>();
+    let installed_models = catalog_models
+        .iter()
+        .filter(|model| {
+            model.installed
+                && catalog_model_matches_kind_or_capability(model, model_kind, capability_id)
+        })
+        .map(model_capability_installable_model)
+        .collect::<Vec<_>>();
+    let capability_jobs = download_jobs
+        .iter()
+        .filter(|job| {
+            job.metadata
+                .get("capability_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == capability_id)
+                || catalog_models
+                    .iter()
+                    .find(|model| model.model_id == job.model_id)
+                    .is_some_and(|model| {
+                        catalog_model_matches_kind_or_capability(model, model_kind, capability_id)
+                    })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let active_download = capability_jobs.iter().any(model_download_job_is_active);
+    let installed_model = catalog_models
+        .iter()
+        .find(|model| {
+            selected_model_id
+                .as_ref()
+                .is_some_and(|selected| selected == &model.model_id)
+        })
+        .or_else(|| {
+            catalog_models.iter().find(|model| {
+                model.installed
+                    && catalog_model_matches_kind_or_capability(model, model_kind, capability_id)
+            })
+        });
+    let endpoint_ready = endpoint.is_some_and(|value| value.status == ModelEndpointStatus::Active);
+    let ready = if runtime_bound {
+        runtime_ready
+    } else {
+        endpoint_ready
+    };
+    let unsupported =
+        endpoint.is_none() && installable_models.is_empty() && capability_jobs.is_empty();
+    let status = if ready {
+        "ready"
+    } else if active_download {
+        "downloading"
+    } else if installed_model.is_some() {
+        "installed_not_running"
+    } else if unsupported {
+        "unsupported"
+    } else if endpoint.is_some() {
+        "degraded"
+    } else {
+        "needs_model"
+    }
+    .to_string();
+    let current_model = endpoint.map(|endpoint| ModelCapabilityCurrentModel {
+        model_endpoint_id: endpoint.model_endpoint_id.clone(),
+        model_name: runtime_model_name_for_kind(model_kind, runtime)
+            .unwrap_or_else(|| endpoint.model_name.clone()),
+        provider_key: endpoint.provider_key.clone(),
+        status: endpoint.status.as_str().to_string(),
+    });
+    let runtime_model_id = runtime_model_name_for_kind(model_kind, runtime);
+    let policy = find_route_policy(route_policies, route_policy_id);
+    let next_action = match status.as_str() {
+        "ready" => "可以使用".to_string(),
+        "downloading" => "等待模型下载完成".to_string(),
+        "installed_not_running" => "模型已安装，需要启动本地模型服务".to_string(),
+        "unsupported" => "暂不支持该能力".to_string(),
+        "degraded" => runtime
+            .error
+            .clone()
+            .unwrap_or_else(|| "模型服务需要检查".to_string()),
+        _ => "选择或安装模型".to_string(),
+    };
+    let mut evidence = vec![
+        format!("route_policy={route_policy_id}"),
+        format!("route_policy_status={}", policy_status_value(policy)),
+        format!("runtime_bound={runtime_bound}"),
+        format!("runtime_ready={runtime_ready}"),
+    ];
+    if let Some(endpoint) = endpoint {
+        evidence.push(format!(
+            "endpoint={} status={}",
+            endpoint.model_endpoint_id,
+            endpoint.status.as_str()
+        ));
+    }
+    if let Some(model) = installed_model {
+        evidence.push(format!("installed_model={}", model.model_id));
+    }
+
+    ModelCapabilityStatus {
+        capability_id: capability_id.to_string(),
+        label: label.to_string(),
+        model_kind: model_kind.as_str().to_string(),
+        status,
+        selected_model_id,
+        runtime_model_id,
+        current_model,
+        installed_models,
+        installable_models,
+        download_jobs: capability_jobs,
+        next_action,
+        runtime_ready,
+        source_of_truth: if runtime_bound {
+            "local inference runtime + route policy + model catalog".to_string()
+        } else {
+            "route policy + model endpoint + model catalog".to_string()
+        },
+        evidence,
     }
 }
 
@@ -7915,10 +8507,10 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             model_kind: "llm",
             recommended_hardware: "CPU 8GB+",
             download_size_hint: "1-2 GB",
-            source_kind: "manual_or_url",
-            repo_id: None,
+            source_kind: "huggingface",
+            repo_id: Some("Qwen/Qwen2.5-1.5B-Instruct"),
             revision: "main",
-            file_policy: "single_file_or_existing_cache",
+            file_policy: "runtime_snapshot",
             runtime_profiles: &["harbor-model-api-candle"],
             expected_capabilities: &["llm"],
             acceptance_note: Some("legacy-catalog"),
@@ -8021,10 +8613,14 @@ fn local_model_catalog_item(
         "needs-config"
     }
     .to_string();
+    let installable = local_model_catalog_spec_is_installable(&spec);
+    let manual_only = !installable;
     let mut evidence = vec![
         format!("model_id={}", spec.model_id),
         format!("source_kind={}", spec.source_kind),
         format!("file_policy={}", spec.file_policy),
+        format!("installable={installable}"),
+        format!("manual_only={manual_only}"),
     ];
     if let Some(repo_id) = spec.repo_id {
         evidence.push(format!("repo_id={repo_id}"));
@@ -8077,6 +8673,8 @@ fn local_model_catalog_item(
         download_size_hint: spec.download_size_hint.to_string(),
         detail,
         source_kind: spec.source_kind.to_string(),
+        installable,
+        manual_only,
         repo_id: spec.repo_id.map(str::to_string),
         revision: Some(spec.revision.to_string()),
         file_policy: spec.file_policy.to_string(),
@@ -8097,13 +8695,168 @@ fn local_model_catalog_item(
     }
 }
 
+fn local_model_catalog_spec_is_installable(spec: &LocalModelCatalogSpec) -> bool {
+    spec.source_kind == "huggingface" && spec.repo_id.is_some()
+}
+
+fn catalog_model_matches_kind(model: &LocalModelCatalogItem, kind: ModelKind) -> bool {
+    let model_kind = model.model_kind.trim().to_ascii_lowercase();
+    match kind {
+        ModelKind::Llm => {
+            model_kind == "llm"
+                || model_kind == "llm_vlm"
+                || model_kind == "llm+vlm"
+                || model.expected_capabilities.iter().any(|capability| {
+                    capability.eq_ignore_ascii_case("llm")
+                        || capability.eq_ignore_ascii_case("text_generation")
+                })
+        }
+        ModelKind::Vlm => {
+            model_kind == "vlm"
+                || model_kind == "llm_vlm"
+                || model_kind == "llm+vlm"
+                || model.expected_capabilities.iter().any(|capability| {
+                    let normalized = capability.to_ascii_lowercase();
+                    normalized.contains("vlm")
+                        || normalized.contains("vision")
+                        || normalized.contains("image")
+                })
+        }
+        ModelKind::Embedder => {
+            model_kind == "embedder"
+                || model_kind == "embedding"
+                || model.expected_capabilities.iter().any(|capability| {
+                    let normalized = capability.to_ascii_lowercase();
+                    normalized.contains("embed")
+                })
+        }
+        _ => model_kind == kind.as_str(),
+    }
+}
+
+fn catalog_model_matches_kind_or_capability(
+    model: &LocalModelCatalogItem,
+    kind: ModelKind,
+    capability_id: &str,
+) -> bool {
+    catalog_model_matches_kind(model, kind)
+        || model
+            .expected_capabilities
+            .iter()
+            .any(|capability| capability.eq_ignore_ascii_case(capability_id))
+}
+
+fn selected_model_id_for_capability(
+    model_state: &AdminModelCenterState,
+    capability_id: &str,
+) -> Option<String> {
+    model_state
+        .capability_bindings
+        .iter()
+        .find(|binding| binding.capability_id == capability_id)
+        .map(|binding| binding.model_id.clone())
+        .and_then(|model_id| non_empty_string(&model_id))
+}
+
+fn model_capability_installable_model(
+    model: &LocalModelCatalogItem,
+) -> ModelCapabilityInstallableModel {
+    ModelCapabilityInstallableModel {
+        model_id: model.model_id.clone(),
+        display_name: model.display_name.clone(),
+        provider_key: model.provider_key.clone(),
+        model_kind: model.model_kind.clone(),
+        status: model.status.clone(),
+        installed: model.installed,
+        local_path: model.local_path.clone(),
+        download_job_id: model.download_job_id.clone(),
+        download_size_hint: model.download_size_hint.clone(),
+        source_kind: model.source_kind.clone(),
+        repo_id: model.repo_id.clone(),
+        file_policy: model.file_policy.clone(),
+        expected_capabilities: model.expected_capabilities.clone(),
+    }
+}
+
+fn preferred_endpoint_id_for_model_kind(kind: ModelKind) -> &'static str {
+    match kind {
+        ModelKind::Llm => "llm-local-openai-compatible",
+        ModelKind::Vlm => "vlm-local-openai-compatible",
+        ModelKind::Ocr => "ocr-local-tesseract",
+        ModelKind::Asr => "asr-local",
+        ModelKind::Detector => "detector-local",
+        ModelKind::Embedder => "embed-local-openai-compatible",
+    }
+}
+
+fn model_capability_runtime_ready(
+    kind: ModelKind,
+    runtime: &LocalModelRuntimeProjection,
+    runtime_bound: bool,
+) -> bool {
+    if !runtime_bound {
+        return false;
+    }
+    if !(runtime.ready && runtime.backend_ready) {
+        return false;
+    }
+    match kind {
+        ModelKind::Llm => runtime.chat_model.is_some(),
+        ModelKind::Embedder => runtime.embedding_model.is_some(),
+        _ => false,
+    }
+}
+
+fn runtime_model_name_for_kind(
+    kind: ModelKind,
+    runtime: &LocalModelRuntimeProjection,
+) -> Option<String> {
+    match kind {
+        ModelKind::Llm => runtime.chat_model.clone(),
+        ModelKind::Embedder => runtime.embedding_model.clone(),
+        _ => None,
+    }
+}
+
+fn model_download_job_is_active(job: &ModelDownloadJobRecord) -> bool {
+    matches!(
+        job.status.as_str(),
+        "queued" | "running" | "downloading" | "installing"
+    )
+}
+
 fn latest_model_download_job<'a>(
     jobs: &'a [ModelDownloadJobRecord],
     model_id: &str,
 ) -> Option<&'a ModelDownloadJobRecord> {
     jobs.iter()
         .filter(|job| job.model_id == model_id)
-        .max_by(|left, right| left.updated_at.cmp(&right.updated_at))
+        .max_by(|left, right| {
+            if model_download_job_is_newer(left, right) {
+                std::cmp::Ordering::Greater
+            } else if model_download_job_is_newer(right, left) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+}
+
+fn latest_model_download_jobs(jobs: &[ModelDownloadJobRecord]) -> Vec<ModelDownloadJobRecord> {
+    let mut latest_jobs = latest_model_download_jobs_by_model(jobs)
+        .values()
+        .map(|job| (*job).clone())
+        .collect::<Vec<_>>();
+    latest_jobs.sort_by(|left, right| {
+        if model_download_job_is_newer(left, right) {
+            std::cmp::Ordering::Less
+        } else if model_download_job_is_newer(right, left) {
+            std::cmp::Ordering::Greater
+        } else {
+            left.job_id.cmp(&right.job_id)
+        }
+    });
+    latest_jobs
 }
 
 fn enrich_model_download_metadata(metadata: &mut Value, item: &LocalModelCatalogItem) {
@@ -8215,7 +8968,7 @@ fn mark_model_download_spawn_failed(
 ) -> ModelDownloadJobRecord {
     let now = now_unix_string();
     job.status = "failed".to_string();
-    job.progress_percent = Some(100);
+    job.progress_percent = job.progress_percent.or(Some(0));
     job.completed_at = Some(now.clone());
     job.updated_at = now;
     job.error_message = Some(error.clone());
@@ -8282,7 +9035,7 @@ fn mark_model_download_failed(
 ) {
     let now = now_unix_string();
     job.status = "failed".to_string();
-    job.progress_percent = Some(100);
+    job.progress_percent = job.progress_percent.or(Some(0));
     job.completed_at = Some(now.clone());
     job.updated_at = now;
     job.error_message = Some(error.clone());
@@ -8491,7 +9244,7 @@ fn run_huggingface_snapshot_download(
         .ok_or_else(|| "huggingface repo_id is required for snapshot download".to_string())?;
     let revision = model_download_metadata_string(&job.metadata, "revision")
         .unwrap_or_else(|| "main".to_string());
-    let hf_endpoint = model_download_huggingface_endpoint(&job.metadata);
+    let hf_endpoints = model_download_huggingface_endpoints(&job.metadata);
     let file_policy = model_download_metadata_string(&job.metadata, "file_policy")
         .unwrap_or_else(|| "runtime_snapshot".to_string());
     let allow_patterns = model_download_allow_patterns(&job.metadata);
@@ -8530,22 +9283,57 @@ fn run_huggingface_snapshot_download(
         )
     })?;
 
-    save_model_download_checkpoint(
-        store,
-        &job.job_id,
-        Some(1),
-        Some(0),
-        None,
-        format!("resolving Hugging Face snapshot {repo_id}@{revision} via {hf_endpoint}"),
-    );
-
+    let mut endpoint_errors = Vec::new();
+    let mut resolved_info = None;
+    for hf_endpoint in &hf_endpoints {
+        save_model_download_checkpoint(
+            store,
+            &job.job_id,
+            Some(1),
+            Some(0),
+            None,
+            format!("resolving Hugging Face snapshot {repo_id}@{revision} via {hf_endpoint}"),
+        );
+        let mut builder = HfApiBuilder::from_cache(HfCache::new(hf_cache_dir.clone()))
+            .with_progress(false)
+            .with_retries(3);
+        if let Some(token) = huggingface_token_from_env() {
+            builder = builder.with_token(Some(token));
+        }
+        builder = builder.with_endpoint(hf_endpoint.clone());
+        let api = match builder.build() {
+            Ok(api) => api,
+            Err(error) => {
+                endpoint_errors.push(format!("{hf_endpoint}: client init failed: {error}"));
+                continue;
+            }
+        };
+        let repo = api.repo(Repo::with_revision(
+            repo_id.clone(),
+            RepoType::Model,
+            revision.clone(),
+        ));
+        match repo.info() {
+            Ok(info) => {
+                resolved_info = Some((hf_endpoint.clone(), info));
+                break;
+            }
+            Err(error) => endpoint_errors.push(format!("{hf_endpoint}: {error}")),
+        }
+    }
+    let (hf_endpoint, info) = resolved_info.ok_or_else(|| {
+        format!(
+            "failed to read Hugging Face repo info for {repo_id} from configured endpoints: {}",
+            endpoint_errors.join("; ")
+        )
+    })?;
     let mut builder = HfApiBuilder::from_cache(HfCache::new(hf_cache_dir))
         .with_progress(false)
-        .with_retries(3);
+        .with_retries(3)
+        .with_endpoint(hf_endpoint.clone());
     if let Some(token) = huggingface_token_from_env() {
         builder = builder.with_token(Some(token));
     }
-    builder = builder.with_endpoint(hf_endpoint.clone());
     let api = builder
         .build()
         .map_err(|error| format!("failed to initialize Hugging Face client: {error}"))?;
@@ -8554,9 +9342,6 @@ fn run_huggingface_snapshot_download(
         RepoType::Model,
         revision.clone(),
     ));
-    let info = repo
-        .info()
-        .map_err(|error| format!("failed to read Hugging Face repo info for {repo_id}: {error}"))?;
     let resolved_sha = info.sha.clone();
     let mut files = info
         .siblings
@@ -8602,32 +9387,47 @@ fn run_huggingface_snapshot_download(
             Ok(cached) => Some(cached),
             Err(error) => {
                 let error_message = error.to_string();
-                if !huggingface_download_should_fallback_to_plain_http(&error_message) {
+                if !huggingface_download_should_fallback_to_plain_http(&error_message)
+                    && !huggingface_download_should_try_endpoint_fallback(&error_message)
+                {
                     return Err(format!(
                         "failed to download Hugging Face file {filename} from {repo_id}: {error_message}"
                     ));
                 }
-                let fallback_progress = HfModelDownloadProgress::new(
-                    store.cloned(),
-                    job.job_id.clone(),
-                    index,
-                    files.len(),
-                    bytes_written,
-                    filename.clone(),
-                );
-                download_huggingface_file_via_plain_http(
-                    &hf_endpoint,
-                    &repo_id,
-                    &revision,
-                    filename,
-                    &destination,
-                    fallback_progress,
-                )
-                .map_err(|fallback_error| {
-                    format!(
-                        "failed to download Hugging Face file {filename} from {repo_id}: {error_message}; plain HTTP fallback failed: {fallback_error}"
-                    )
-                })?;
+                let mut fallback_errors = Vec::new();
+                let mut fallback_ok = false;
+                for fallback_endpoint in &hf_endpoints {
+                    let fallback_progress = HfModelDownloadProgress::new(
+                        store.cloned(),
+                        job.job_id.clone(),
+                        index,
+                        files.len(),
+                        bytes_written,
+                        filename.clone(),
+                    );
+                    match download_huggingface_file_via_plain_http(
+                        fallback_endpoint,
+                        &repo_id,
+                        &revision,
+                        filename,
+                        &destination,
+                        fallback_progress,
+                    ) {
+                        Ok(()) => {
+                            fallback_ok = true;
+                            break;
+                        }
+                        Err(fallback_error) => {
+                            fallback_errors.push(format!("{fallback_endpoint}: {fallback_error}"))
+                        }
+                    }
+                }
+                if !fallback_ok {
+                    return Err(format!(
+                        "failed to download Hugging Face file {filename} from {repo_id}: {error_message}; endpoint fallbacks failed: {}",
+                        fallback_errors.join("; ")
+                    ));
+                }
                 None
             }
         };
@@ -8675,6 +9475,7 @@ fn run_huggingface_snapshot_download(
     let manifest = json!({
         "source_kind": "huggingface",
         "hf_endpoint": hf_endpoint,
+        "hf_endpoint_candidates": hf_endpoints,
         "repo_id": repo_id,
         "revision": revision,
         "resolved_sha": resolved_sha,
@@ -8710,6 +9511,16 @@ fn run_huggingface_snapshot_download(
 
 fn huggingface_download_should_fallback_to_plain_http(error_message: &str) -> bool {
     error_message.contains("Header Content-Range is missing")
+}
+
+fn huggingface_download_should_try_endpoint_fallback(error_message: &str) -> bool {
+    let normalized = error_message.to_ascii_lowercase();
+    normalized.contains("status code 404")
+        || normalized.contains("status code 403")
+        || normalized.contains("status code 429")
+        || normalized.contains("status code 5")
+        || normalized.contains("timed out")
+        || normalized.contains("connection")
 }
 
 fn download_huggingface_file_via_plain_http(
@@ -8922,13 +9733,49 @@ fn model_download_huggingface_repo_id(job: &ModelDownloadJobRecord) -> Option<St
 }
 
 fn model_download_huggingface_endpoint(metadata: &Value) -> String {
-    model_download_metadata_string(metadata, "hf_endpoint")
-        .or_else(|| {
-            env::var("HF_ENDPOINT")
-                .ok()
-                .and_then(|value| non_empty_string(&value))
-        })
+    model_download_huggingface_endpoints(metadata)
+        .into_iter()
+        .next()
         .unwrap_or_else(|| DEFAULT_HF_ENDPOINT.to_string())
+}
+
+fn model_download_huggingface_endpoints(metadata: &Value) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    if let Some(items) = metadata.get("hf_endpoints").and_then(Value::as_array) {
+        for item in items {
+            if let Some(value) = item.as_str() {
+                push_normalized_huggingface_endpoint(&mut endpoints, value);
+            }
+        }
+    }
+    if let Some(value) = model_download_metadata_string(metadata, "hf_endpoint") {
+        push_normalized_huggingface_endpoint(&mut endpoints, &value);
+    }
+    if let Ok(value) = env::var("HF_ENDPOINTS") {
+        for item in value.split([',', ';', '\n']) {
+            push_normalized_huggingface_endpoint(&mut endpoints, item);
+        }
+    }
+    if let Ok(value) = env::var("HF_ENDPOINT") {
+        push_normalized_huggingface_endpoint(&mut endpoints, &value);
+    }
+    push_normalized_huggingface_endpoint(&mut endpoints, DEFAULT_HF_ENDPOINT);
+    push_normalized_huggingface_endpoint(&mut endpoints, "https://huggingface.co");
+    endpoints
+}
+
+fn normalize_huggingface_endpoint(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_end_matches('/').to_string();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn push_normalized_huggingface_endpoint(endpoints: &mut Vec<String>, value: &str) {
+    let Some(endpoint) = normalize_huggingface_endpoint(value) else {
+        return;
+    };
+    if !endpoints.iter().any(|existing| existing == &endpoint) {
+        endpoints.push(endpoint);
+    }
 }
 
 fn model_download_metadata_string(metadata: &Value, key: &str) -> Option<String> {
@@ -9135,10 +9982,17 @@ fn model_download_source_file_path(source: &str) -> Option<PathBuf> {
 }
 
 fn default_model_download_target_path(model_id: &str) -> String {
-    let root = local_model_cache_roots()
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| ".harborbeacon/models".to_string());
+    default_model_download_target_path_in_root(&default_model_store_root(), model_id)
+}
+
+fn default_model_download_target_path_for_model_state(
+    model_state: &AdminModelCenterState,
+    model_id: &str,
+) -> String {
+    default_model_download_target_path_in_root(&model_store_root(model_state), model_id)
+}
+
+fn default_model_download_target_path_in_root(root: &str, model_id: &str) -> String {
     let slug = model_id
         .trim()
         .chars()
@@ -9151,7 +10005,7 @@ fn default_model_download_target_path(model_id: &str) -> String {
         })
         .collect::<String>()
         .to_ascii_lowercase();
-    Path::new(&root)
+    Path::new(root)
         .join(if slug.is_empty() {
             "model"
         } else {
@@ -9162,7 +10016,18 @@ fn default_model_download_target_path(model_id: &str) -> String {
 }
 
 fn local_model_cache_roots() -> Vec<String> {
-    let mut roots = Vec::new();
+    let mut roots = vec![default_model_store_root()];
+    append_legacy_model_cache_roots(&mut roots);
+    roots
+}
+
+fn local_model_cache_roots_for_model_state(model_state: &AdminModelCenterState) -> Vec<String> {
+    let mut roots = vec![model_store_root(model_state)];
+    append_legacy_model_cache_roots(&mut roots);
+    roots
+}
+
+fn append_legacy_model_cache_roots(roots: &mut Vec<String>) {
     for key in [
         "HARBOR_MODEL_CACHE_DIR",
         "HARBOR_MODEL_DIR",
@@ -9170,7 +10035,7 @@ fn local_model_cache_roots() -> Vec<String> {
     ] {
         if let Ok(value) = env::var(key) {
             if let Some(value) = non_empty_string(&value) {
-                push_unique_root(&mut roots, value);
+                push_unique_root(roots, value);
             }
         }
     }
@@ -9180,9 +10045,57 @@ fn local_model_cache_roots() -> Vec<String> {
         "/models".to_string(),
         ".harborbeacon/models".to_string(),
     ] {
-        push_unique_root(&mut roots, root);
+        push_unique_root(roots, root);
     }
-    roots
+}
+
+fn model_store_root(model_state: &AdminModelCenterState) -> String {
+    non_empty_string(&model_state.model_store_root).unwrap_or_else(default_model_store_root)
+}
+
+fn build_model_store_status(model_state: &AdminModelCenterState) -> ModelStoreStatusResponse {
+    let path = model_store_root(model_state);
+    let store_path = Path::new(&path);
+    let writable = path_can_accept_write(store_path);
+    let runtime_readable = if store_path.exists() {
+        fs::read_dir(store_path).is_ok()
+    } else {
+        writable
+    };
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+    if !writable {
+        blockers.push("模型保存位置不可写".to_string());
+    }
+    if !runtime_readable {
+        blockers.push("模型服务无法读取该位置".to_string());
+    }
+    if !store_path.exists() {
+        warnings.push("目录会在首次下载模型时自动创建".to_string());
+    }
+    let status = if !writable {
+        "not_writable"
+    } else if !runtime_readable {
+        "runtime_unreadable"
+    } else {
+        "ready"
+    }
+    .to_string();
+    let next_action = match status.as_str() {
+        "ready" => "可用".to_string(),
+        "not_writable" => "请选择 HarborOS 可写目录".to_string(),
+        "runtime_unreadable" => "请选择本地模型服务可读取的目录".to_string(),
+        _ => "需要检查模型保存位置".to_string(),
+    };
+    ModelStoreStatusResponse {
+        path,
+        status,
+        writable,
+        runtime_readable,
+        next_action,
+        blockers,
+        warnings,
+    }
 }
 
 fn push_unique_root(roots: &mut Vec<String>, root: String) {
@@ -9243,6 +10156,64 @@ fn build_rtsp_url_from_patch(
         format!("/{path}")
     };
     Ok(format!("rtsp://{host}:{port}{path}"))
+}
+
+fn camera_stream_url_with_credentials(
+    device: &CameraDevice,
+    state: &AdminConsoleState,
+) -> Option<String> {
+    let credential = state
+        .device_credentials
+        .iter()
+        .find(|credential| credential.device_id == device.device_id);
+    let username = credential
+        .and_then(|credential| non_empty_string(&credential.username))
+        .or_else(|| non_empty_string(&state.defaults.rtsp_username));
+    let password = credential
+        .and_then(|credential| non_empty_string(&credential.password))
+        .or_else(|| non_empty_string(&state.defaults.rtsp_password));
+    if username.is_none() && password.is_none() {
+        return None;
+    }
+
+    let host = device
+        .ip_address
+        .clone()
+        .or_else(|| rtsp_host_from_url(&device.primary_stream.url))?;
+    let port = credential
+        .and_then(|credential| credential.rtsp_port)
+        .or_else(|| rtsp_port_from_url(&device.primary_stream.url))
+        .unwrap_or(state.defaults.rtsp_port);
+    let path = credential
+        .and_then(|credential| {
+            credential
+                .rtsp_paths
+                .iter()
+                .find_map(|path| non_empty_string(path))
+        })
+        .or_else(|| rtsp_path_from_url(&device.primary_stream.url))
+        .or_else(|| {
+            state
+                .defaults
+                .rtsp_paths
+                .iter()
+                .find_map(|path| non_empty_string(path))
+        })
+        .unwrap_or_else(|| "/stream1".to_string());
+    let path = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
+
+    let mut url = Url::parse(&format!("rtsp://{host}:{port}{path}")).ok()?;
+    if let Some(username) = username {
+        let _ = url.set_username(&username);
+    }
+    if let Some(password) = password {
+        let _ = url.set_password(Some(&password));
+    }
+    Some(url.to_string())
 }
 
 fn redact_secret_json_value(mut value: Value) -> Value {
@@ -9571,15 +10542,20 @@ fn probe_local_model_runtime(endpoints: &[ModelEndpoint]) -> LocalModelRuntimePr
                 .find(|endpoint| is_builtin_local_openai_endpoint(endpoint))
         });
 
-    let base_url = metadata_string_value(&template.metadata, "base_url")
-        .or_else(|| {
-            fallback.and_then(|endpoint| metadata_string_value(&endpoint.metadata, "base_url"))
-        })
+    let template_is_builtin = is_builtin_local_openai_endpoint(&template);
+    let raw_base_url = metadata_string_value(&template.metadata, "base_url");
+    let fallback_base_url =
+        fallback.and_then(|endpoint| metadata_string_value(&endpoint.metadata, "base_url"));
+    let base_url = raw_base_url
+        .filter(|value| !(template_is_builtin && is_legacy_model_api_url(value)))
+        .or(fallback_base_url)
         .unwrap_or_default();
-    let healthz_url = metadata_string_value(&template.metadata, "healthz_url")
-        .or_else(|| {
-            fallback.and_then(|endpoint| metadata_string_value(&endpoint.metadata, "healthz_url"))
-        })
+    let raw_healthz_url = metadata_string_value(&template.metadata, "healthz_url");
+    let fallback_healthz_url =
+        fallback.and_then(|endpoint| metadata_string_value(&endpoint.metadata, "healthz_url"));
+    let healthz_url = raw_healthz_url
+        .filter(|value| !(template_is_builtin && is_legacy_model_api_url(value)))
+        .or(fallback_healthz_url)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| infer_healthz_url(&base_url));
     let api_key_configured = metadata_bool_value(&template.metadata, "api_key_configured")
@@ -9714,15 +10690,30 @@ fn overlay_model_endpoints_with_runtime_truth(
 
             if let Some(default_endpoint) = builtin_defaults.get(&overlayed.model_endpoint_id) {
                 if is_builtin_local_openai_endpoint(default_endpoint) {
-                    if metadata_missing_or_empty(&overlayed.metadata, "base_url") {
+                    let legacy_base_url = metadata_string_value(&overlayed.metadata, "base_url")
+                        .is_some_and(|value| is_legacy_model_api_url(&value));
+                    if metadata_missing_or_empty(&overlayed.metadata, "base_url") || legacy_base_url
+                    {
                         if let Some(base_url) =
                             metadata_string_value(&default_endpoint.metadata, "base_url")
                         {
                             set_metadata_string(&mut overlayed.metadata, "base_url", base_url);
                             projection_mismatch = true;
                         }
+                        if legacy_base_url {
+                            set_metadata_bool(
+                                &mut overlayed.metadata,
+                                "legacy_model_api_migrated",
+                                true,
+                            );
+                        }
                     }
-                    if metadata_missing_or_empty(&overlayed.metadata, "healthz_url") {
+                    let legacy_healthz_url =
+                        metadata_string_value(&overlayed.metadata, "healthz_url")
+                            .is_some_and(|value| is_legacy_model_api_url(&value));
+                    if metadata_missing_or_empty(&overlayed.metadata, "healthz_url")
+                        || legacy_healthz_url
+                    {
                         if let Some(healthz_url) =
                             metadata_string_value(&default_endpoint.metadata, "healthz_url")
                         {
@@ -9732,6 +10723,13 @@ fn overlay_model_endpoints_with_runtime_truth(
                                 healthz_url,
                             );
                             projection_mismatch = true;
+                        }
+                        if legacy_healthz_url {
+                            set_metadata_bool(
+                                &mut overlayed.metadata,
+                                "legacy_model_api_migrated",
+                                true,
+                            );
                         }
                     }
                     if metadata_missing_or_empty(&overlayed.metadata, "api_key") {
@@ -9791,11 +10789,12 @@ fn overlay_model_endpoints_with_runtime_truth(
                         );
                     }
 
-                    if matches!(overlayed.model_kind, ModelKind::Llm | ModelKind::Embedder)
-                        && runtime.ready
-                        && runtime.backend_ready
-                    {
-                        overlayed.status = ModelEndpointStatus::Active;
+                    if matches!(overlayed.model_kind, ModelKind::Llm | ModelKind::Embedder) {
+                        if runtime.ready && runtime.backend_ready {
+                            overlayed.status = ModelEndpointStatus::Active;
+                        } else if overlayed.status == ModelEndpointStatus::Active {
+                            overlayed.status = ModelEndpointStatus::Degraded;
+                        }
                     }
                 }
             }
@@ -9936,7 +10935,7 @@ fn build_embed_feature(
         format!("runtime_ready={runtime_ready}"),
     ];
     if let Some(kind) = runtime.backend_kind.as_ref() {
-        evidence.push(format!("4176.backend.kind={kind}"));
+        evidence.push(format!("local_inference.backend.kind={kind}"));
     }
     if let Some(model) = runtime.embedding_model.as_ref() {
         evidence.push(format!("embedding_model={model}"));
@@ -9957,7 +10956,7 @@ fn build_embed_feature(
         label: "Embedding retrieval".to_string(),
         owner_lane: "harbor-framework".to_string(),
         status: status.to_string(),
-        source_of_truth: "4176 /healthz + route_policy".to_string(),
+        source_of_truth: "local inference /healthz + route_policy".to_string(),
         current_option: endpoint
             .map(|value| {
                 format!(
@@ -10011,7 +11010,7 @@ fn build_answer_feature(
         format!("runtime_ready={runtime_ready}"),
     ];
     if let Some(kind) = runtime.backend_kind.as_ref() {
-        evidence.push(format!("4176.backend.kind={kind}"));
+        evidence.push(format!("local_inference.backend.kind={kind}"));
     }
     if let Some(model) = runtime.chat_model.as_ref() {
         evidence.push(format!("chat_model={model}"));
@@ -10032,7 +11031,7 @@ fn build_answer_feature(
         label: "Retrieval answer synthesis".to_string(),
         owner_lane: "harbor-framework".to_string(),
         status: status.to_string(),
-        source_of_truth: "4176 /healthz + route_policy".to_string(),
+        source_of_truth: "local inference /healthz + route_policy".to_string(),
         current_option: endpoint
             .map(|value| {
                 format!(
@@ -10329,6 +11328,11 @@ fn metadata_missing_or_empty(metadata: &Value, key: &str) -> bool {
     metadata_string_value(metadata, key)
         .map(|value| value.trim().is_empty())
         .unwrap_or(true)
+}
+
+fn is_legacy_model_api_url(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.contains("127.0.0.1:4176") || normalized.contains("localhost:4176")
 }
 
 fn metadata_string_value(metadata: &Value, key: &str) -> Option<String> {
@@ -11035,13 +12039,17 @@ fn parse_device_credential_status_path(path: &str) -> Option<String> {
     parse_device_scoped_path(path, "/credential-status")
 }
 
-fn parse_device_metadata_patch_path(path: &str) -> Option<String> {
+fn parse_device_metadata_path(path: &str) -> Option<String> {
     let device_id = path.strip_prefix("/api/devices/")?.trim();
     if device_id.is_empty() || device_id.contains('/') {
         None
     } else {
         percent_decode_path_segment(device_id).ok()
     }
+}
+
+fn parse_device_metadata_patch_path(path: &str) -> Option<String> {
+    parse_device_metadata_path(path)
 }
 
 fn parse_device_scoped_path(path: &str, suffix: &str) -> Option<String> {
@@ -11207,15 +12215,18 @@ mod tests {
         build_harboros_im_capability_map, build_harboros_status_response,
         build_hardware_readiness_response, build_knowledge_index_job,
         build_knowledge_index_status_response, build_local_model_catalog,
-        build_rag_readiness_response, build_release_readiness_response, build_rtsp_url_from_patch,
-        default_model_download_target_path, default_model_endpoints, ensure_local_admin_access,
-        ensure_local_camera_access, harbordesk_build_missing_response, has_forwarding_headers,
+        build_model_capabilities_response, build_rag_readiness_response,
+        build_release_readiness_response, build_rtsp_url_from_patch,
+        camera_stream_url_with_credentials, default_model_download_target_path,
+        default_model_endpoints, ensure_local_admin_access, ensure_local_camera_access,
+        harbordesk_build_missing_response, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbordesk_client_route,
-        is_harbordesk_surface_path, knowledge_preview_mime_supported,
+        is_harbordesk_surface_path, knowledge_preview_mime_supported, latest_model_download_jobs,
         live_bridge_provider_from_setup_status, local_model_catalog_item,
         local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
-        model_download_jobs_status, model_snapshot_file_allowed, normalize_unified_admin_path,
+        model_download_huggingface_endpoints, model_download_jobs_status,
+        model_snapshot_file_allowed, normalize_unified_admin_path,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
         parse_camera_analyze_path, parse_camera_live_page_path, parse_camera_live_stream_path,
         parse_camera_recording_start_path, parse_camera_recording_stop_path,
@@ -11233,8 +12244,9 @@ mod tests {
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
         redact_value_stream_credentials, release_item, request_identity_hints,
         resolve_harbordesk_asset_path, resolve_knowledge_preview_path, run_knowledge_index_jobs,
-        run_model_download_transfer, url_encode_path_segment, AdminApi, KnowledgeSearchApiRequest,
-        LocalModelRuntimeProjection, ManualAddRequest, DEFAULT_HF_ENDPOINT,
+        run_model_download_job, run_model_download_transfer, url_encode_path_segment, AdminApi,
+        KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
+        DEFAULT_HF_ENDPOINT,
     };
     use harborbeacon_local_agent::control_plane::media::{
         MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
@@ -11248,9 +12260,9 @@ mod tests {
         AccessAction, AccessIdentityHints, AccessPrincipal,
     };
     use harborbeacon_local_agent::runtime::admin_console::{
-        AdminConsoleState, AdminConsoleStore, BridgeProviderConfig, DeviceCredentialSecret,
-        DeviceEvidenceRecord, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
-        RemoteViewConfig,
+        default_model_route_policies, AdminConsoleState, AdminConsoleStore, AdminModelCenterState,
+        BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord, KnowledgeSettings,
+        KnowledgeSourceRoot, ModelDownloadJobRecord, RemoteViewConfig,
     };
     use harborbeacon_local_agent::runtime::hub::CameraHubService;
     use harborbeacon_local_agent::runtime::knowledge_index::{
@@ -11600,6 +12612,29 @@ mod tests {
     }
 
     #[test]
+    fn camera_stream_url_prefers_device_credentials_for_runtime_use() {
+        let mut state = AdminConsoleState::default();
+        state.defaults.rtsp_username = "default".to_string();
+        state.defaults.rtsp_password = "wrong".to_string();
+        state.defaults.rtsp_port = 554;
+        state.device_credentials.push(DeviceCredentialSecret {
+            device_id: "cam-1".to_string(),
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            rtsp_port: Some(8554),
+            rtsp_paths: vec!["stream2".to_string(), "/stream1".to_string()],
+            updated_at: Some("123".to_string()),
+            last_verified_at: None,
+        });
+        let mut device = CameraDevice::new("cam-1", "Living Room", "rtsp://192.168.3.73/stream1");
+        device.ip_address = Some("192.168.3.73".to_string());
+
+        let url = camera_stream_url_with_credentials(&device, &state).expect("stream url");
+
+        assert_eq!(url, "rtsp://admin:secret@192.168.3.73:8554/stream2");
+    }
+
+    #[test]
     fn stream_url_redaction_removes_rtsp_credentials() {
         assert_eq!(
             redact_stream_url_credentials("rtsp://admin:secret@192.168.3.73:8554/stream1"),
@@ -11880,7 +12915,10 @@ mod tests {
             "/api/share-links/share-link-1/revoke"
         ));
         assert!(is_admin_surface_path("/api/cameras/camera-1/snapshot"));
+        assert!(is_admin_surface_path("/api/cameras/camera-1/snapshot.jpg"));
+        assert!(is_admin_surface_path("/api/cameras/camera-1/live.mjpeg"));
         assert!(is_admin_surface_path("/api/cameras/camera-1/analyze"));
+        assert!(is_admin_surface_path("/api/models/capabilities"));
     }
 
     #[test]
@@ -11888,6 +12926,14 @@ mod tests {
         assert_eq!(
             normalize_unified_admin_path("/api/harbordesk/cameras/recording-settings"),
             "/api/cameras/recording-settings"
+        );
+        assert_eq!(
+            normalize_unified_admin_path("/api/harbordesk/cameras/camera-1/snapshot.jpg"),
+            "/api/cameras/camera-1/snapshot.jpg"
+        );
+        assert_eq!(
+            normalize_unified_admin_path("/api/harbordesk/models/capabilities"),
+            "/api/models/capabilities"
         );
         assert_eq!(
             normalize_unified_admin_path("/api/harbordesk"),
@@ -12235,6 +13281,92 @@ mod tests {
     }
 
     #[test]
+    fn latest_model_download_jobs_collapses_retries_by_model() {
+        let job =
+            |job_id: &str, model_id: &str, status: &str, requested_at: &str, updated_at: &str| {
+                ModelDownloadJobRecord {
+                    job_id: job_id.to_string(),
+                    model_id: model_id.to_string(),
+                    display_name: model_id.to_string(),
+                    provider_key: "qwen".to_string(),
+                    status: status.to_string(),
+                    requested_at: requested_at.to_string(),
+                    updated_at: updated_at.to_string(),
+                    target_path: None,
+                    progress_percent: None,
+                    bytes_downloaded: None,
+                    total_bytes: None,
+                    started_at: None,
+                    completed_at: None,
+                    error_message: None,
+                    message: String::new(),
+                    metadata: json!({}),
+                }
+            };
+
+        let jobs = latest_model_download_jobs(&[
+            job("job-old", "Qwen/Qwen3.5-4B", "failed", "1", "1"),
+            job("job-new", "Qwen/Qwen3.5-4B", "running", "2", "3"),
+            job("job-other", "Qwen/Qwen3-Embedding-0.6B", "failed", "2", "2"),
+        ]);
+
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["job-new", "job-other"]
+        );
+    }
+
+    #[test]
+    fn model_download_retry_reuses_failed_job_record() {
+        let admin_path = unique_store_path("harborbeacon-model-download-reuse-admin");
+        let registry_path = unique_store_path("harborbeacon-model-download-reuse-registry");
+        let store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let original = store
+            .create_model_download_job(
+                "Qwen/Qwen3.5-4B",
+                "Qwen3.5 4B",
+                "qwen",
+                Some("/tmp/qwen-old".to_string()),
+                json!({"source_kind": "huggingface"}),
+            )
+            .expect("create job");
+        let mut failed = original.clone();
+        failed.status = "failed".to_string();
+        failed.updated_at = "2".to_string();
+        failed.progress_percent = Some(87);
+        failed.error_message = Some("mirror failed".to_string());
+        store
+            .save_model_download_job(failed)
+            .expect("save failed job");
+
+        let retry = store
+            .create_or_update_model_download_job(
+                "Qwen/Qwen3.5-4B",
+                "Qwen3.5 4B",
+                "qwen",
+                Some("/tmp/qwen-new".to_string()),
+                json!({"source_kind": "huggingface", "hf_endpoint": "https://hf-mirror.com/"}),
+            )
+            .expect("retry job");
+
+        assert!(retry.should_spawn_worker);
+        assert_eq!(retry.job.job_id, original.job_id);
+        assert_eq!(retry.job.status, "queued");
+        assert_eq!(retry.job.progress_percent, Some(0));
+        assert_eq!(retry.job.error_message, None);
+        assert_eq!(retry.job.target_path.as_deref(), Some("/tmp/qwen-new"));
+        assert_eq!(store.list_model_download_jobs().unwrap().len(), 1);
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
     fn local_model_catalog_ignores_failed_huggingface_cache_only_directory() {
         let root = unique_store_path("model-cache-root").with_extension("");
         let target = root.join("qwen-qwen3.5-4b");
@@ -12307,6 +13439,54 @@ mod tests {
     }
 
     #[test]
+    fn local_model_catalog_marks_completed_download_target_installed() {
+        let root = unique_store_path("model-cache-root").with_extension("");
+        let target = root.join("qwen-completed-download");
+        fs::create_dir_all(&target).expect("create model target");
+        fs::write(target.join("config.json"), b"{}").expect("write model payload");
+        let job = ModelDownloadJobRecord {
+            job_id: "model-download-completed".to_string(),
+            model_id: "Qwen/Qwen3.5-4B".to_string(),
+            display_name: "Qwen3.5 4B".to_string(),
+            provider_key: "qwen".to_string(),
+            status: "completed".to_string(),
+            requested_at: "1".to_string(),
+            updated_at: "2".to_string(),
+            target_path: Some(target.display().to_string()),
+            progress_percent: Some(100),
+            bytes_downloaded: Some(2),
+            total_bytes: Some(2),
+            started_at: Some("1".to_string()),
+            completed_at: Some("2".to_string()),
+            error_message: None,
+            message: "download complete".to_string(),
+            metadata: json!({}),
+        };
+        let spec = local_model_catalog_specs()
+            .into_iter()
+            .find(|spec| spec.model_id == "Qwen/Qwen3.5-4B")
+            .expect("qwen live-test catalog spec");
+
+        let item = local_model_catalog_item(&[root.display().to_string()], &[job], spec);
+
+        assert!(item.installed);
+        assert_eq!(item.status, "ready");
+        let expected_path = target.display().to_string();
+        assert_eq!(item.local_path.as_deref(), Some(expected_path.as_str()));
+        assert_eq!(item.size_bytes, Some(2));
+        assert_eq!(
+            item.download_job_id.as_deref(),
+            Some("model-download-completed")
+        );
+        assert!(item
+            .evidence
+            .iter()
+            .any(|entry| entry == "latest_download_status=completed"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn local_model_catalog_surfaces_huggingface_qwen_live_test_models() {
         let catalog = build_local_model_catalog(Vec::new());
 
@@ -12344,6 +13524,18 @@ mod tests {
             Some("not-today-acceptance")
         );
 
+        let qwen25 = catalog
+            .models
+            .iter()
+            .find(|item| item.model_id == "qwen2.5-1.5b-instruct")
+            .expect("qwen2.5 catalog model");
+        assert_eq!(qwen25.source_kind, "huggingface");
+        assert_eq!(
+            qwen25.repo_id.as_deref(),
+            Some("Qwen/Qwen2.5-1.5B-Instruct")
+        );
+        assert!(qwen25.installable);
+
         let smolvlm = catalog
             .models
             .iter()
@@ -12361,6 +13553,59 @@ mod tests {
             .iter()
             .any(|profile| profile == "cpu-vlm-sidecar"));
         assert_eq!(smolvlm.acceptance_note.as_deref(), Some("vm-cpu-photo-rag"));
+    }
+
+    #[test]
+    fn local_model_catalog_marks_manual_legacy_models_manual_only() {
+        let catalog = build_local_model_catalog(Vec::new());
+
+        let legacy = catalog
+            .models
+            .iter()
+            .find(|item| item.model_id == "minicpm-v-2.6")
+            .expect("legacy manual VLM catalog model");
+        assert_eq!(legacy.source_kind, "manual_or_url");
+        assert!(!legacy.installable);
+        assert!(legacy.manual_only);
+        assert!(legacy.repo_id.is_none());
+    }
+
+    #[test]
+    fn model_capabilities_hide_manual_only_models_from_installable_choices() {
+        let runtime = LocalModelRuntimeProjection {
+            error: Some("runtime offline".to_string()),
+            ..Default::default()
+        };
+        let endpoints =
+            overlay_model_endpoints_with_runtime_truth(&default_model_endpoints(), &runtime);
+        let response = build_model_capabilities_response(
+            &AdminModelCenterState::default(),
+            &endpoints,
+            &default_model_route_policies(),
+            Vec::new(),
+            &runtime,
+        );
+
+        let embedder = response
+            .capabilities
+            .iter()
+            .find(|capability| capability.capability_id == "embedder")
+            .expect("embedder capability");
+        assert_ne!(embedder.status, "ready");
+        assert!(embedder
+            .installable_models
+            .iter()
+            .all(|model| { model.source_kind == "huggingface" && model.repo_id.is_some() }));
+
+        let vision = response
+            .capabilities
+            .iter()
+            .find(|capability| capability.capability_id == "vlm")
+            .expect("vision capability");
+        assert!(vision
+            .installable_models
+            .iter()
+            .all(|model| model.model_id != "minicpm-v-2.6"));
     }
 
     #[test]
@@ -12392,6 +13637,19 @@ mod tests {
     }
 
     #[test]
+    fn huggingface_endpoint_fallback_covers_common_mirror_failures() {
+        assert!(super::huggingface_download_should_try_endpoint_fallback(
+            "status code 404"
+        ));
+        assert!(super::huggingface_download_should_try_endpoint_fallback(
+            "operation timed out"
+        ));
+        assert!(!super::huggingface_download_should_try_endpoint_fallback(
+            "checksum mismatch"
+        ));
+    }
+
+    #[test]
     fn huggingface_resolve_url_uses_endpoint_repo_revision_and_file_path() {
         let url = huggingface_resolve_url(
             "https://hf-mirror.com/",
@@ -12412,11 +13670,11 @@ mod tests {
         let _guard = hf_endpoint_env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let env_guard = EnvGuard::set("HF_ENDPOINT", "https://env-mirror.example");
+        let env_guard = EnvGuard::set("HF_ENDPOINT", "https://env-mirror.example/");
 
         assert_eq!(
             model_download_huggingface_endpoint(&json!({
-                "hf_endpoint": "https://user-mirror.example"
+                "hf_endpoint": "https://user-mirror.example///"
             })),
             "https://user-mirror.example"
         );
@@ -12432,6 +13690,50 @@ mod tests {
             DEFAULT_HF_ENDPOINT
         );
         drop(remove_guard);
+    }
+
+    #[test]
+    fn huggingface_endpoint_candidates_dedupe_metadata_env_and_builtin_fallbacks() {
+        let _guard = hf_endpoint_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = EnvGuard::set(
+            "HF_ENDPOINTS",
+            "https://env-one.example/; https://hf-mirror.com/",
+        );
+        let _single_env_guard = EnvGuard::set("HF_ENDPOINT", "https://env-two.example/");
+
+        assert_eq!(
+            model_download_huggingface_endpoints(&json!({
+                "hf_endpoints": ["https://meta-one.example/", "https://meta-one.example///"],
+                "hf_endpoint": "https://meta-two.example/"
+            })),
+            vec![
+                "https://meta-one.example".to_string(),
+                "https://meta-two.example".to_string(),
+                "https://env-one.example".to_string(),
+                "https://hf-mirror.com".to_string(),
+                "https://env-two.example".to_string(),
+                "https://huggingface.co".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn huggingface_endpoint_does_not_generate_double_slash_repo_info_base() {
+        let endpoint = model_download_huggingface_endpoint(&json!({
+            "hf_endpoint": "https://hf-mirror.com/"
+        }));
+        let repo_info_url = format!(
+            "{}/api/models/{}/revision/{}",
+            endpoint, "Qwen/Qwen3.5-4B", "main"
+        );
+
+        assert_eq!(
+            repo_info_url,
+            "https://hf-mirror.com/api/models/Qwen/Qwen3.5-4B/revision/main"
+        );
+        assert!(!repo_info_url.contains(".com//api/"));
     }
 
     #[test]
@@ -12475,6 +13777,111 @@ mod tests {
 
         assert_eq!(stats.bytes_written, 11);
         assert_eq!(fs::read(&target_path).expect("read target"), b"model-bytes");
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn model_download_failed_job_preserves_last_progress() {
+        let admin_path = unique_store_path("harborbeacon-model-download-failed-admin");
+        let registry_path = unique_store_path("harborbeacon-model-download-failed-registry");
+        let store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let job = store
+            .create_model_download_job(
+                "missing-source-model",
+                "Missing source model",
+                "local",
+                Some(
+                    unique_store_path("harborbeacon-model-download-target")
+                        .display()
+                        .to_string(),
+                ),
+                json!({}),
+            )
+            .expect("create download job");
+
+        run_model_download_job(store.clone(), job.clone());
+
+        let saved = store
+            .model_download_job(&job.job_id)
+            .expect("load job")
+            .expect("job exists");
+        assert_eq!(saved.status, "failed");
+        assert_eq!(saved.progress_percent, Some(0));
+        assert!(saved
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("download source_url is required"));
+        assert!(saved.message.contains("download job failed"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn concurrent_model_download_workers_preserve_job_records() {
+        let admin_path = unique_store_path("harborbeacon-model-download-concurrent-admin");
+        let registry_path = unique_store_path("harborbeacon-model-download-concurrent-registry");
+        let source_path = unique_store_path("harborbeacon-model-download-concurrent-source");
+        let target_path = unique_store_path("harborbeacon-model-download-concurrent-target");
+        fs::write(&source_path, b"model-bytes").expect("write source");
+        let store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let copied = store
+            .create_model_download_job(
+                "concurrent-copy-model",
+                "Concurrent copy model",
+                "local",
+                Some(target_path.display().to_string()),
+                json!({"source_url": source_path.display().to_string()}),
+            )
+            .expect("create copy job");
+        let missing = store
+            .create_model_download_job(
+                "concurrent-missing-source-model",
+                "Concurrent missing source model",
+                "local",
+                Some(
+                    unique_store_path("harborbeacon-model-download-concurrent-missing-target")
+                        .display()
+                        .to_string(),
+                ),
+                json!({}),
+            )
+            .expect("create missing job");
+
+        let copy_store = store.clone();
+        let copy_thread = thread::spawn(move || run_model_download_job(copy_store, copied));
+        let missing_store = store.clone();
+        let missing_thread = thread::spawn(move || run_model_download_job(missing_store, missing));
+        copy_thread.join().expect("copy worker");
+        missing_thread.join().expect("missing worker");
+
+        let jobs = store.list_model_download_jobs().expect("list jobs");
+        let copied = jobs
+            .iter()
+            .find(|job| job.model_id == "concurrent-copy-model")
+            .expect("copy job preserved");
+        let missing = jobs
+            .iter()
+            .find(|job| job.model_id == "concurrent-missing-source-model")
+            .expect("missing job preserved");
+        assert_eq!(copied.status, "completed");
+        assert_eq!(missing.status, "failed");
+        assert!(missing
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("download source_url is required"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
         let _ = fs::remove_file(source_path);
         let _ = fs::remove_file(target_path);
     }
@@ -12559,6 +13966,67 @@ mod tests {
             .model_readiness
             .iter()
             .any(|card| card.label == "OCR" && card.status == "needs-config"));
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn rag_readiness_embedder_card_follows_runtime_truth() {
+        let source_root = unique_store_path("harborbeacon-rag-source-runtime-embedder");
+        let index_root = unique_store_path("harborbeacon-rag-index-runtime-embedder");
+        fs::create_dir_all(&source_root).expect("create rag source root");
+        let settings = KnowledgeSettings {
+            source_roots: vec![KnowledgeSourceRoot {
+                root_id: "test-root".to_string(),
+                label: "Test root".to_string(),
+                path: source_root.to_string_lossy().into_owned(),
+                enabled: true,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                last_indexed_at: None,
+            }],
+            index_root: index_root.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+
+        let response = build_rag_readiness_response(
+            &LocalModelRuntimeProjection {
+                ready: false,
+                backend_ready: false,
+                embedding_model: None,
+                error: Some("runtime offline".to_string()),
+                ..Default::default()
+            },
+            &settings,
+            &[ModelEndpoint {
+                model_endpoint_id: "embed-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Embedder,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+                capability_tags: Vec::new(),
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({}),
+            }],
+            &[],
+        );
+
+        let embedder = response
+            .model_readiness
+            .iter()
+            .find(|card| card.model_kind == "embedder")
+            .expect("embedder readiness card");
+        assert_eq!(embedder.status, "needs-config");
+        assert!(embedder
+            .blocker
+            .as_deref()
+            .is_some_and(|blocker| blocker.contains("degraded")));
+        assert!(response
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("Embedding model is not ready")));
         let _ = fs::remove_dir_all(source_root);
     }
 
@@ -13515,7 +14983,7 @@ mod tests {
         assert!(answer
             .evidence
             .iter()
-            .any(|entry| entry.contains("4176.backend.kind=candle")));
+            .any(|entry| entry.contains("local_inference.backend.kind=candle")));
 
         let vision = response
             .groups
@@ -13680,7 +15148,7 @@ mod tests {
         assert!(answer
             .evidence
             .iter()
-            .any(|entry| entry.contains("4176.backend.kind=candle")));
+            .any(|entry| entry.contains("local_inference.backend.kind=candle")));
 
         let proactive = response
             .groups

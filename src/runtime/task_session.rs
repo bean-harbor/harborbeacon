@@ -196,9 +196,7 @@ impl TaskConversationState {
                 Some(current) if current.operation == CAMERA_RECORD_CLIP_CONFIRMATION_OPERATION
             )
         {
-            self.pending_resume = pending
-                .as_ref()
-                .map(pending_resume_from_clip_confirmation);
+            self.pending_resume = pending.as_ref().map(pending_resume_from_clip_confirmation);
         }
     }
 
@@ -311,10 +309,9 @@ fn pending_clip_confirmation_from_resume(
     if pending_resume.operation != CAMERA_RECORD_CLIP_CONFIRMATION_OPERATION {
         return None;
     }
-    let mut pending = serde_json::from_value::<PendingTaskClipConfirmation>(
-        pending_resume.payload.clone(),
-    )
-    .ok()?;
+    let mut pending =
+        serde_json::from_value::<PendingTaskClipConfirmation>(pending_resume.payload.clone())
+            .ok()?;
     if pending.resume_token.trim().is_empty() {
         pending.resume_token = pending_resume.resume_token.clone();
     }
@@ -1597,7 +1594,10 @@ mod tests {
             .expect("recent task runs");
 
         assert_eq!(
-            recent.iter().map(|run| run.task_id.as_str()).collect::<Vec<_>>(),
+            recent
+                .iter()
+                .map(|run| run.task_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["task-5", "task-2", "task-4"]
         );
         assert!(recent.iter().all(|run| run.session_id == "sess-a"));

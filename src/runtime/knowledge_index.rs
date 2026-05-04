@@ -24,24 +24,8 @@ const MAX_CHUNK_CHARS: usize = 320;
 const INDEX_SCHEMA_VERSION: u32 = 1;
 const EMBEDDING_STORE_SCHEMA_VERSION: u32 = 1;
 const DOCUMENT_EXTENSIONS: &[&str] = &[
-    "txt",
-    "md",
-    "markdown",
-    "json",
-    "csv",
-    "html",
-    "htm",
-    "yaml",
-    "yml",
-    "log",
-    "xml",
-    "rss",
-    "atom",
-    "pdf",
-    "docx",
-    "pptx",
-    "xlsx",
-    "zip",
+    "txt", "md", "markdown", "json", "csv", "html", "htm", "yaml", "yml", "log", "xml", "rss",
+    "atom", "pdf", "docx", "pptx", "xlsx", "zip",
 ];
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "wav", "m4a", "flac", "aac", "ogg", "opus"];
@@ -399,10 +383,7 @@ fn load_manifest_state(path: &Path) -> Result<LoadedManifestState, String> {
         .iter()
         .map(|entry| (entry.path.clone(), entry.clone()))
         .collect::<HashMap<_, _>>();
-    Ok(LoadedManifestState {
-        manifest,
-        entries,
-    })
+    Ok(LoadedManifestState { manifest, entries })
 }
 
 fn save_manifest(path: &Path, manifest: &KnowledgeIndexManifest) -> Result<(), String> {
@@ -1345,8 +1326,11 @@ mod tests {
             r#"{"summary":"garage video sidecar","timestamp":"00:00:12","frame":"car entered"}"#,
         )
         .expect("write video sidecar");
-        fs::write(knowledge_root.join("media").join("opaque.wav"), b"no-sidecar")
-            .expect("write opaque audio");
+        fs::write(
+            knowledge_root.join("media").join("opaque.wav"),
+            b"no-sidecar",
+        )
+        .expect("write opaque audio");
 
         let service = KnowledgeIndexService::from_config(
             KnowledgeIndexConfig::new(index_root.clone()).expect("config"),
@@ -1357,13 +1341,11 @@ mod tests {
             .expect("index refresh");
 
         assert_eq!(snapshot.manifest.entries.len(), 2);
-        assert!(snapshot
-            .manifest
-            .entries
-            .iter()
-            .all(|entry| !entry.path.ends_with("doorbell.txt")
-                && !entry.path.ends_with("clip.json")
-                && !entry.path.ends_with("opaque.wav")));
+        assert!(snapshot.manifest.entries.iter().all(|entry| !entry
+            .path
+            .ends_with("doorbell.txt")
+            && !entry.path.ends_with("clip.json")
+            && !entry.path.ends_with("opaque.wav")));
 
         let audio = snapshot
             .manifest
@@ -1373,7 +1355,10 @@ mod tests {
             .expect("audio entry");
         assert!(audio.searchable_text.contains("courier arrived"));
         assert_eq!(audio.text_sources[0].source_kind, "transcript");
-        assert!(audio.sidecar_path.as_deref().is_some_and(|path| path.ends_with("doorbell.txt")));
+        assert!(audio
+            .sidecar_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("doorbell.txt")));
         assert!(!audio.chunks.is_empty());
 
         let video = snapshot
@@ -1384,7 +1369,10 @@ mod tests {
             .expect("video entry");
         assert!(video.searchable_text.contains("garage video sidecar"));
         assert_eq!(video.text_sources[0].source_kind, "video_sidecar");
-        assert!(video.sidecar_path.as_deref().is_some_and(|path| path.ends_with("clip.json")));
+        assert!(video
+            .sidecar_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("clip.json")));
         assert!(!video.chunks.is_empty());
 
         cleanup_dir(&knowledge_root);

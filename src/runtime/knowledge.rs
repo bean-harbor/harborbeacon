@@ -1547,6 +1547,7 @@ mod tests {
             models: AdminModelCenterState {
                 endpoints,
                 route_policies,
+                ..AdminModelCenterState::default()
             },
             ..AdminConsoleState::default()
         };
@@ -1587,6 +1588,7 @@ mod tests {
                     status: "active".to_string(),
                     metadata: json!({}),
                 }],
+                ..AdminModelCenterState::default()
             },
             ..AdminConsoleState::default()
         };

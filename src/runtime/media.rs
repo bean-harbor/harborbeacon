@@ -523,9 +523,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ArtifactIngestDisposition, ArtifactProvenance, ClipCaptureRequest,
-        ClipCaptureResult, MediaAssetKind, SnapshotCaptureRequest, SnapshotCaptureResult,
-        SnapshotFormat, StreamOpenRequest, StreamOpenResult,
+        ArtifactIngestDisposition, ArtifactProvenance, ClipCaptureRequest, ClipCaptureResult,
+        MediaAssetKind, SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotFormat,
+        StreamOpenRequest, StreamOpenResult,
     };
     use crate::connectors::storage::StorageTarget;
 
@@ -683,7 +683,10 @@ mod tests {
         assert_eq!(result.clip_length_seconds, 12);
         assert_eq!(result.keyframe_count, Some(4));
         assert_eq!(result.keyframe_interval_seconds, Some(3));
-        assert!(result.storage.relative_path.starts_with("clips/front_door_cam/"));
+        assert!(result
+            .storage
+            .relative_path
+            .starts_with("clips/front_door_cam/"));
         assert!(result.storage.relative_path.ends_with(".mp4"));
         assert!(result.index_sidecar_relative_path.ends_with(".json"));
         assert_eq!(
@@ -704,7 +707,10 @@ mod tests {
         );
 
         let encoded = serde_json::to_value(&result).expect("serialize");
-        assert_eq!(encoded["ingest_metadata"]["device_name"], json!("Front Door"));
+        assert_eq!(
+            encoded["ingest_metadata"]["device_name"],
+            json!("Front Door")
+        );
         assert_eq!(encoded["ingest_metadata"]["room"], json!("Entry"));
         assert_eq!(encoded["mime_type"], json!("video/mp4"));
 
