@@ -587,7 +587,9 @@ impl CommandRtspAdapter {
         password: Option<&str>,
     ) -> Result<ProbeOutcome, String> {
         if self.ffprobe_available() {
-            return self.probe_stream_url_with_ffprobe(stream_url);
+            if let Ok(outcome) = self.probe_stream_url_with_ffprobe(stream_url) {
+                return Ok(outcome);
+            }
         }
 
         self.probe_stream_url_via_rtsp_describe(ip_address, port, path, username, password)
@@ -1132,7 +1134,9 @@ fn escape_rtsp_userinfo(value: &str) -> String {
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     use base64::Engine as _;
 
@@ -1195,6 +1199,36 @@ mod tests {
         });
 
         format!("http://{address}/snapshot.jpg")
+    }
+
+    fn spawn_rtsp_describe_server(response: String) -> (String, u16, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind RTSP server");
+        let address = listener.local_addr().expect("RTSP server address");
+        let (request_sender, request_receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept RTSP request");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let bytes_read = stream.read(&mut buffer).expect("read RTSP request");
+                if bytes_read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..bytes_read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_sender
+                .send(String::from_utf8_lossy(&request).into_owned())
+                .expect("send RTSP request text");
+            stream
+                .write_all(response.as_bytes())
+                .expect("write RTSP response");
+        });
+
+        ("127.0.0.1".to_string(), address.port(), request_receiver)
     }
 
     #[test]
@@ -1309,6 +1343,50 @@ mod tests {
         assert!(result.stream_url.is_none());
         assert!(result.requires_auth);
         assert!(result.error_message.is_some());
+    }
+
+    #[test]
+    fn probe_falls_back_to_rtsp_describe_when_ffprobe_fails() {
+        let sdp = "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n";
+        let response = format!(
+            "RTSP/1.0 200 OK\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
+            sdp.len()
+        );
+        let (ip_address, port, request_receiver) = spawn_rtsp_describe_server(response);
+        let ffprobe_bin = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .to_string();
+        let adapter = CommandRtspAdapter::with_bins("ffmpeg-does-not-exist", ffprobe_bin);
+        let stream_url = CommandRtspAdapter::build_stream_url(
+            &ip_address,
+            port,
+            "/stream1",
+            Some("admin"),
+            Some("secret"),
+        );
+
+        let outcome = adapter
+            .probe_stream_url(
+                &stream_url,
+                &ip_address,
+                port,
+                "/stream1",
+                Some("admin"),
+                Some("secret"),
+            )
+            .expect("RTSP DESCRIBE fallback should validate the stream");
+
+        assert!(outcome.has_video);
+        let request = request_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("RTSP DESCRIBE request");
+        assert!(request.starts_with(&format!(
+            "DESCRIBE rtsp://{ip_address}:{port}/stream1 RTSP/1.0"
+        )));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: basic "));
     }
 
     #[test]

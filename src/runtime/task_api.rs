@@ -1005,6 +1005,8 @@ impl TaskApiService {
                 .get("rtsp_port")
                 .and_then(Value::as_u64)
                 .and_then(|value| u16::try_from(value).ok()),
+            rtsp_username: string_at_paths(&request.args, &["/rtsp_username"]),
+            rtsp_password: string_at_paths(&request.args, &["/rtsp_password"]),
         };
         let action = apply_governance_defaults(Action {
             domain: "camera".to_string(),
@@ -1016,6 +1018,7 @@ impl TaskApiService {
                 "cidr": scan_request.cidr.clone(),
                 "protocol": scan_request.protocol.clone(),
                 "rtsp_port": scan_request.rtsp_port,
+                "rtsp_username": scan_request.rtsp_username.clone(),
             }),
             risk_level: RiskLevel::Low,
             requires_approval: request_requires_approval(request),

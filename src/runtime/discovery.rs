@@ -168,10 +168,13 @@ impl DiscoveryService {
                 };
                 let result = self.rtsp.probe(&probe_request)?;
                 probe_results.push(result.clone());
-                if let Some(device) =
-                    result.into_camera_device(candidate, format!("cam-{}", candidate.candidate_id))
-                {
-                    connected_snapshot.upsert_camera_devices_preserving_platform_records(&[device]);
+                if can_promote_probe_result(&result, request) {
+                    if let Some(device) =
+                        result.into_camera_device(candidate, format!("cam-{}", candidate.candidate_id))
+                    {
+                        connected_snapshot
+                            .upsert_camera_devices_preserving_platform_records(&[device]);
+                    }
                 }
             }
         }
@@ -302,6 +305,15 @@ fn should_seed_rtsp_candidates(
     candidates: &[DiscoveryCandidate],
 ) -> bool {
     candidates.is_empty() && request.protocols.contains(&DiscoveryProtocol::RtspProbe)
+}
+
+fn can_promote_probe_result(result: &RtspProbeResult, request: &DiscoveryRequest) -> bool {
+    result.reachable
+        && (!result.requires_auth
+            || request
+                .rtsp_password
+                .as_deref()
+                .is_some_and(|password| !password.trim().is_empty()))
 }
 
 pub fn default_rtsp_paths() -> Vec<String> {
@@ -749,7 +761,7 @@ mod tests {
         let seen_requests = seen_requests.lock().expect("read probe requests");
 
         assert_eq!(result.candidates.len(), 254);
-        assert_eq!(result.connected_devices.len(), 254);
+        assert_eq!(result.connected_devices.len(), 0);
         assert_eq!(seen_requests.len(), 254);
     }
 
@@ -783,10 +795,7 @@ mod tests {
         assert!(seen_requests[0]
             .path_candidates
             .contains(&"/stream1".to_string()));
-        assert_eq!(
-            result.connected_devices[0].primary_stream.url,
-            "rtsp://192.168.1.30/ch1/main"
-        );
+        assert!(result.connected_devices.is_empty());
     }
 
     #[test]

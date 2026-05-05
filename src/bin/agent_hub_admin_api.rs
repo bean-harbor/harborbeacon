@@ -3850,11 +3850,7 @@ impl AdminApi {
                 principal,
                 "scan",
                 "扫描摄像头",
-                json!({
-                    "cidr": request.cidr,
-                    "protocol": request.protocol,
-                    "rtsp_port": request.rtsp_port,
-                }),
+                scan_request_task_args(&request),
             ));
         if response.status != TaskStatus::Completed {
             return Err(task_error_message(&response));
@@ -4506,6 +4502,16 @@ impl AdminApi {
             message: None,
         }
     }
+}
+
+fn scan_request_task_args(request: &ScanRequest) -> Value {
+    json!({
+        "cidr": request.cidr,
+        "protocol": request.protocol,
+        "rtsp_port": request.rtsp_port,
+        "rtsp_username": request.rtsp_username,
+        "rtsp_password": request.rtsp_password,
+    })
 }
 
 fn principal_skips_manual_camera_connect_approval(principal: &AccessPrincipal) -> bool {
@@ -12585,8 +12591,8 @@ mod tests {
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
         redact_value_stream_credentials, release_item, request_identity_hints,
         resolve_harbordesk_asset_path, resolve_knowledge_preview_path, run_knowledge_index_jobs,
-        run_model_download_job, run_model_download_transfer, url_encode_path_segment, AdminApi,
-        KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
+        run_model_download_job, run_model_download_transfer, scan_request_task_args,
+        url_encode_path_segment, AdminApi, KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
         ModelRuntimeActivationRequest, ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
     };
     use harborbeacon_local_agent::control_plane::media::{
@@ -12613,7 +12619,7 @@ mod tests {
     use harborbeacon_local_agent::runtime::remote_view;
     use harborbeacon_local_agent::runtime::task_api::TaskApiService;
     use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -12973,6 +12979,26 @@ mod tests {
         let url = camera_stream_url_with_credentials(&device, &state).expect("stream url");
 
         assert_eq!(url, "rtsp://admin:secret@192.168.3.73:8554/stream2");
+    }
+
+    #[test]
+    fn scan_request_task_args_preserve_rtsp_credentials_for_worker() {
+        let args = scan_request_task_args(&super::ScanRequest {
+            cidr: Some("192.168.3.231/32".to_string()),
+            protocol: Some("RTSP".to_string()),
+            rtsp_port: Some(554),
+            rtsp_username: Some("admin".to_string()),
+            rtsp_password: Some("fresh-secret".to_string()),
+        });
+
+        assert_eq!(
+            args.pointer("/rtsp_username").and_then(Value::as_str),
+            Some("admin")
+        );
+        assert_eq!(
+            args.pointer("/rtsp_password").and_then(Value::as_str),
+            Some("fresh-secret")
+        );
     }
 
     #[test]

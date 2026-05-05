@@ -48,6 +48,10 @@ pub struct HubScanRequest {
     pub protocol: Option<String>,
     #[serde(default)]
     pub rtsp_port: Option<u16>,
+    #[serde(default)]
+    pub rtsp_username: Option<String>,
+    #[serde(default)]
+    pub rtsp_password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,6 +123,12 @@ pub struct CameraHubService {
     admin_store: AdminConsoleStore,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RtspScanCredentials {
+    username: Option<String>,
+    password: Option<String>,
+}
+
 impl CameraHubService {
     pub fn new(admin_store: AdminConsoleStore) -> Self {
         Self { admin_store }
@@ -180,24 +190,33 @@ impl CameraHubService {
         request: HubScanRequest,
         public_origin: Option<&str>,
     ) -> Result<HubScanSummary, String> {
+        let HubScanRequest {
+            cidr,
+            protocol,
+            rtsp_port,
+            rtsp_username,
+            rtsp_password,
+        } = request;
         let mut defaults = self.load_admin_state()?.defaults;
-        if let Some(cidr) = request.cidr {
+        if let Some(cidr) = cidr {
             let trimmed = cidr.trim();
             if !trimmed.is_empty() {
                 defaults.cidr = trimmed.to_string();
             }
         }
-        if let Some(protocol) = request.protocol {
+        if let Some(protocol) = protocol {
             let trimmed = protocol.trim();
             if !trimmed.is_empty() {
                 defaults.discovery = trimmed.to_string();
             }
         }
-        if let Some(rtsp_port) = request.rtsp_port.filter(|port| *port > 0) {
+        if let Some(rtsp_port) = rtsp_port.filter(|port| *port > 0) {
             defaults.rtsp_port = rtsp_port;
         }
         defaults = sanitize_defaults(defaults);
         let state = self.admin_store.save_defaults(defaults)?;
+        let scan_credentials =
+            rtsp_scan_credentials(&state.defaults, rtsp_username, rtsp_password);
 
         let protocols = resolve_discovery_protocols(&state.defaults.discovery);
         if protocols.iter().any(|p| {
@@ -206,10 +225,15 @@ impl CameraHubService {
                 DiscoveryProtocol::Onvif | DiscoveryProtocol::Mdns | DiscoveryProtocol::Ssdp
             )
         }) {
-            return self.scan_with_discovery_service(&state, public_origin, protocols);
+            return self.scan_with_discovery_service(
+                &state,
+                public_origin,
+                protocols,
+                &scan_credentials,
+            );
         }
 
-        self.scan_with_rtsp_probe(&state, public_origin)
+        self.scan_with_rtsp_probe(&state, public_origin, &scan_credentials)
     }
 
     pub fn manual_add(
@@ -246,10 +270,7 @@ impl CameraHubService {
             .username
             .and_then(|value| non_empty_opt(&value))
             .or_else(|| non_empty_opt(&state.defaults.rtsp_username));
-        let password = request
-            .password
-            .and_then(|value| non_empty_opt(&value))
-            .or_else(|| non_empty_opt(&state.defaults.rtsp_password));
+        let password = request.password.and_then(|value| non_empty_opt(&value));
 
         let adapter = CommandRtspAdapter::default();
         let probe = adapter.probe(&RtspProbeRequest {
@@ -340,6 +361,7 @@ impl CameraHubService {
         &self,
         state: &AdminConsoleState,
         public_origin: Option<&str>,
+        scan_credentials: &RtspScanCredentials,
     ) -> Result<HubScanSummary, String> {
         let existing_devices = self.load_registered_cameras()?;
         let candidate_ips = collect_candidate_ips(
@@ -363,12 +385,24 @@ impl CameraHubService {
                     .and_then(|device| device.vendor.as_deref()),
                 existing.as_ref().and_then(|device| device.model.as_deref()),
             );
+            let saved_credential = existing.as_ref().and_then(|device| {
+                state
+                    .device_credentials
+                    .iter()
+                    .find(|credential| credential.device_id == device.device_id)
+            });
+            let username = saved_credential
+                .and_then(|credential| non_empty_opt(&credential.username))
+                .or_else(|| scan_credentials.username.clone());
+            let password = saved_credential
+                .and_then(|credential| non_empty_opt(&credential.password))
+                .or_else(|| scan_credentials.password.clone());
             let probe_request = RtspProbeRequest {
                 candidate_id: format!("rtsp-{}", ip.replace('.', "-")),
                 ip_address: ip.clone(),
                 port: state.defaults.rtsp_port,
-                username: non_empty_opt(&state.defaults.rtsp_username),
-                password: non_empty_opt(&state.defaults.rtsp_password),
+                username,
+                password,
                 path_candidates: path_candidates.clone(),
             };
             let probe = adapter.probe(&probe_request)?;
@@ -377,8 +411,10 @@ impl CameraHubService {
                     .error_message
                     .as_deref()
                     .is_some_and(looks_like_auth_error);
+            let has_password = probe_request.password.is_some();
+            let can_register = probe.reachable && can_register_rtsp_scan_result(requires_auth, has_password);
 
-            if probe.reachable {
+            if can_register {
                 let stream_url = probe
                     .stream_url
                     .clone()
@@ -422,6 +458,7 @@ impl CameraHubService {
                     rtsp_paths: path_candidates.clone(),
                 });
             } else {
+                let auth_note = "摄像头需要密码。请输入用户名/密码后重新扫描，或用“手动添加”接入。".to_string();
                 results.push(HubScanResultItem {
                     candidate_id: probe_request.candidate_id.clone(),
                     device_id: existing.as_ref().map(|device| device.device_id.clone()),
@@ -440,12 +477,16 @@ impl CameraHubService {
                     } else {
                         "RTSP / 未通过".to_string()
                     },
-                    note: probe
-                        .error_message
-                        .clone()
-                        .map(|value| humanize_probe_error(&value))
-                        .unwrap_or_else(|| "未发现可用视频流".to_string()),
-                    reachable: false,
+                    note: if requires_auth && !has_password {
+                        auth_note
+                    } else {
+                        probe
+                            .error_message
+                            .clone()
+                            .map(|value| humanize_probe_error(&value))
+                            .unwrap_or_else(|| "未发现可用视频流".to_string())
+                    },
+                    reachable: probe.reachable && !requires_auth,
                     registered: existing.is_some(),
                     requires_auth,
                     vendor: existing.as_ref().and_then(|device| device.vendor.clone()),
@@ -470,6 +511,7 @@ impl CameraHubService {
         state: &AdminConsoleState,
         public_origin: Option<&str>,
         protocols: Vec<DiscoveryProtocol>,
+        scan_credentials: &RtspScanCredentials,
     ) -> Result<HubScanSummary, String> {
         let service = DiscoveryService::new(
             Box::new(CommandRtspAdapter::default()),
@@ -483,8 +525,8 @@ impl CameraHubService {
             protocols,
             include_rtsp_probe: true,
             rtsp_port: Some(state.defaults.rtsp_port),
-            rtsp_username: non_empty_opt(&state.defaults.rtsp_username),
-            rtsp_password: non_empty_opt(&state.defaults.rtsp_password),
+            rtsp_username: scan_credentials.username.clone(),
+            rtsp_password: scan_credentials.password.clone(),
             rtsp_paths: state.defaults.rtsp_paths.clone(),
         })?;
 
@@ -510,6 +552,8 @@ impl CameraHubService {
                         .as_deref()
                         .is_some_and(looks_like_auth_error)
             });
+            let registered = device.is_some();
+            let verified = reachable && (!requires_auth || registered);
             let port = candidate.port.unwrap_or(state.defaults.rtsp_port);
             let vendor = candidate
                 .vendor
@@ -548,25 +592,25 @@ impl CameraHubService {
                     .unwrap_or_else(|| "待确认".to_string()),
                 ip: candidate.ip_address.clone(),
                 port,
-                protocol: if reachable {
+                protocol: if verified {
                     format!("{base} + RTSP / 已验证")
                 } else if requires_auth {
                     format!("{base} / 需密码")
                 } else {
                     format!("{base} / 已发现")
                 },
-                note: if reachable {
+                note: if verified {
                     format!("已通过 {base} 发现并完成 RTSP 验证，可直接加入设备库。")
                 } else if requires_auth {
-                    "已发现摄像头，但 RTSP 认证失败。回复“接入 序号”后，再发送“密码 xxxxxx”即可继续。".to_string()
+                    "已发现摄像头，但需要用户名/密码后才能接入。请在自动发现里填写密码后重新扫描，或用“手动添加”接入。".to_string()
                 } else {
                     probe
                         .and_then(|probe| probe.error_message.clone())
                         .map(|value| humanize_probe_error(&value))
                         .unwrap_or_else(|| "已发现 ONVIF 设备，但 RTSP 尚未验证成功；可以继续确认接入。".to_string())
                 },
-                reachable,
-                registered: device.is_some(),
+                reachable: verified,
+                registered,
                 requires_auth,
                 vendor,
                 model,
@@ -831,6 +875,26 @@ fn current_timestamp() -> String {
         .to_string()
 }
 
+fn rtsp_scan_credentials(
+    defaults: &AdminDefaults,
+    username: Option<String>,
+    password: Option<String>,
+) -> RtspScanCredentials {
+    RtspScanCredentials {
+        username: username
+            .as_deref()
+            .and_then(non_empty_opt)
+            .or_else(|| non_empty_opt(&defaults.rtsp_username)),
+        password: password
+            .as_deref()
+            .and_then(non_empty_opt),
+    }
+}
+
+fn can_register_rtsp_scan_result(requires_auth: bool, has_password: bool) -> bool {
+    !requires_auth || has_password
+}
+
 fn discover_open_rtsp_hosts(hosts: &[String], port: u16) -> Vec<String> {
     let mut handles = Vec::with_capacity(hosts.len());
     for ip in hosts {
@@ -924,6 +988,7 @@ fn normalize_network(network: Ipv4Addr, prefix: u8) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::{
+        can_register_rtsp_scan_result, rtsp_scan_credentials, AdminDefaults,
         bridge_provider_status_from_gateway_response, build_mobile_setup_url,
         effective_rtsp_path_candidates, humanize_probe_error, looks_like_auth_error, merge_camera,
         normalize_camera_metadata, resolve_discovery_protocols,
@@ -950,6 +1015,33 @@ mod tests {
             humanize_probe_error("rtsp://demo: 401 Unauthorized"),
             "RTSP 返回 401，说明摄像头需要密码。"
         );
+    }
+
+    #[test]
+    fn authenticated_scan_results_need_password_before_registration() {
+        assert!(can_register_rtsp_scan_result(false, false));
+        assert!(can_register_rtsp_scan_result(true, true));
+        assert!(!can_register_rtsp_scan_result(true, false));
+    }
+
+    #[test]
+    fn scan_credentials_do_not_reuse_default_password() {
+        let defaults = AdminDefaults {
+            rtsp_username: "admin".to_string(),
+            rtsp_password: "old-secret".to_string(),
+            ..AdminDefaults::default()
+        };
+
+        let without_explicit_password = rtsp_scan_credentials(&defaults, None, None);
+        assert_eq!(without_explicit_password.username.as_deref(), Some("admin"));
+        assert!(without_explicit_password.password.is_none());
+
+        let with_explicit_password = rtsp_scan_credentials(
+            &defaults,
+            Some("admin".to_string()),
+            Some("fresh-secret".to_string()),
+        );
+        assert_eq!(with_explicit_password.password.as_deref(), Some("fresh-secret"));
     }
 
     #[test]
