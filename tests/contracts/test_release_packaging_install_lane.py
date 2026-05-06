@@ -187,7 +187,7 @@ def test_release_packaging_runbook_records_builder_target_and_install_shape() ->
     required_phrases = [
         "192.168.3.223",
         "192.168.3.182",
-        "HarborDesk Angular `dist`",
+        "HarborNAS WebUI production `dist`",
         "HarborGate Rust binary",
         "不在机上执行 `cargo`、`rustc`、`node`、`npm` 或 `pip`",
         "bootstrap_release_builder.sh",

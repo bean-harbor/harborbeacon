@@ -1,6 +1,6 @@
 # HarborOS Release Packaging / Install Runbook
 
-更新时间：2026-04-30
+更新时间：2026-05-06
 
 ## 1. 目的
 
@@ -9,7 +9,10 @@
 - 怎样把当前已经接近可用的 HarborBeacon / HarborDesk / HarborGate，
   收成 **可重复安装、可升级、可回滚** 的 HarborOS release bundle
 
-它不是业务功能设计文档，也不是 HarborOS live smoke 的替代品。
+它不是业务功能设计文档，也不是 HarborOS live smoke 的替代品，更不是
+HarborBeacon 团队自建 ISO 的说明。最终 HarborOS ISO / 镜像构建流程由
+HarborOS / ISO 集成同事拥有；本 runbook 只定义我们交给对方的可嵌入
+release bundle、安装形态、配置模板和验证门禁。
 
 ## 2. 当前发布形态
 
@@ -17,9 +20,9 @@ release-v1 的默认形态固定为：
 
 - Linux builder 负责预构建 HarborBeacon Rust 二进制，包括统一入口 `harborbeacon-service`
 - Linux builder 负责预构建 HarborBeacon 单端口推理 facade 所需的内部模型 backend
-- Linux builder 负责构建 HarborDesk Angular `dist`
+- Linux builder 负责构建或接收 HarborNAS WebUI production `dist`
 - Linux builder 负责预构建 HarborGate Rust binary；HarborGate 主线不再打包 Python runtime fallback
-- HarborOS 目标机只负责部署与运行，不在机上执行 `cargo`、`rustc`、`node`、`npm` 或 `pip`
+- HarborOS 目标机或 HarborOS ISO 集成流程只负责部署与运行，不在机上执行 `cargo`、`rustc`、`node`、`npm` 或 `pip`
 - HarborBeacon Rust Linux 默认目标为 `x86_64-unknown-linux-musl`
 - 当目标为 musl 时，builder 使用 `cargo zigbuild --release --target <target>`，并要求 builder 上已有 `cargo-zigbuild` 与 `zig`
 - HarborBeacon 单端口封装本地 OpenAI-compatible 模型服务；`harbor-model-api`/Candle/VLM 只作为内部或过渡 backend，不再成为对外 systemd/API 契约
@@ -60,6 +63,14 @@ release-v1 的默认形态固定为：
   `harbor-release-20260430-rc2-beacona5f6da0-gate57ff759.tar.gz`
 - SHA256:
   `7119842506d38aac82c7e236b7f96a054244bb50be07c5e6b001ac7b0683484c`
+
+当前 handoff 增量 baseline：
+
+- HarborBeacon: `1b4f52dc`，安装脚本会保留并写入 `HARBOR_FFPROBE_BIN`。
+- HarborGate: `6795ea5`，Rust setup portal 返回 Harbor Assistant 入口。
+- HarborNAS WebUI: `11421f67d0`，摄像头扫描结果支持行内凭据接入与错误反馈。
+- `.82` live proof: WebUI r411 已部署，补 `HARBOR_FFPROBE_BIN` 后 TP1
+  摄像头恢复接入并设为默认。
 
 ## 3. 发布物结构
 
@@ -148,7 +159,7 @@ builder 预期：
 builder 结果至少应包含：
 
 - `harborbeacon-service` Linux release binary
-- HarborDesk Angular dist
+- HarborNAS WebUI production dist 中的 Harbor Assistant / HarborBot 页面
 - HarborGate Rust runtime binary: `harborgate/bin/harborgate`
 - `manifest.json`
 - `checksums.sha256`

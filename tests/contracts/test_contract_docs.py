@@ -158,6 +158,30 @@ def test_model_architecture_docs_keep_local_first_cloud_fallback_scope() -> None
     assert "Candle 不是唯一方向" in index
 
 
+def test_harboros_iso_handoff_docs_assign_image_build_ownership() -> None:
+    packaging = read_doc("docs/harboros-release-packaging-runbook.md")
+    iso = read_doc("docs/harbornas-iso-packaging-dependencies.md")
+
+    required_packaging_phrases = [
+        "自建 ISO 的说明",
+        "最终 HarborOS ISO / 镜像构建流程由",
+        "HarborOS / ISO 集成同事拥有",
+        "HarborBeacon 单端口封装本地 OpenAI-compatible 模型服务",
+        "HARBOR_FFPROBE_BIN",
+    ]
+    required_iso_phrases = [
+        "这份文档不是 HarborBeacon 团队自建 ISO 的说明",
+        "HarborOS / ISO 集成同事",
+        "HarborGate 已改为 Rust-only runtime",
+        "`harborbeacon.service` 单端口 `4174`",
+        "production dist",
+        "HARBOR_FFPROBE_BIN",
+    ]
+
+    assert all(phrase in packaging for phrase in required_packaging_phrases)
+    assert all(phrase in iso for phrase in required_iso_phrases)
+
+
 def test_runtime_truth_closeout_tracks_verification_matrix_and_blocker_owner() -> None:
     content = read_doc("docs/harbordesk-runtime-truth-closeout-2026-04-25.md")
 
