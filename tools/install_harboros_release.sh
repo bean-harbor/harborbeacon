@@ -67,6 +67,24 @@ resolve_ffmpeg_bin() {
   return 1
 }
 
+resolve_ffprobe_bin() {
+  local candidate
+  for candidate in "$@"; do
+    if [[ -n "${candidate}" && -f "${candidate}" ]] && "${candidate}" -version >/dev/null 2>&1; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+  if command -v ffprobe >/dev/null 2>&1; then
+    candidate="$(command -v ffprobe)"
+    if "${candidate}" -version >/dev/null 2>&1; then
+      echo "${candidate}"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 DEFAULT_INSTALL_ROOT="/var/lib/harborbeacon-agent-ci"
 INSTALL_ROOT="${DEFAULT_INSTALL_ROOT}"
 WRITABLE_ROOT=""
@@ -224,6 +242,7 @@ EXISTING_RELEASE_INSTALL_ROOT="${HARBOR_RELEASE_INSTALL_ROOT:-}"
 EXISTING_WRITABLE_ROOT="${HARBOR_HARBOROS_WRITABLE_ROOT:-}"
 EXISTING_KNOWLEDGE_INDEX_ROOT="${HARBOR_KNOWLEDGE_INDEX_ROOT:-}"
 EXISTING_FFMPEG_BIN="${HARBOR_FFMPEG_BIN:-}"
+EXISTING_FFPROBE_BIN="${HARBOR_FFPROBE_BIN:-}"
 EXISTING_MODEL_API_BACKEND="${HARBOR_MODEL_API_BACKEND:-}"
 EXISTING_MODEL_API_UPSTREAM_BASE_URL="${HARBOR_MODEL_API_UPSTREAM_BASE_URL:-}"
 EXISTING_MODEL_API_CHAT_MODEL="${HARBOR_MODEL_API_CHAT_MODEL:-}"
@@ -274,6 +293,10 @@ FFMPEG_BIN="$(resolve_ffmpeg_bin \
   "${EXISTING_FFMPEG_BIN}" \
   "${INSTALL_ROOT}/runtime/media-tools/bin/ffmpeg" \
   "${WRITABLE_ROOT}/media-tools/bin/ffmpeg" || true)"
+FFPROBE_BIN="$(resolve_ffprobe_bin \
+  "${EXISTING_FFPROBE_BIN}" \
+  "${INSTALL_ROOT}/runtime/media-tools/bin/ffprobe" \
+  "${WRITABLE_ROOT}/media-tools/bin/ffprobe" || true)"
 
 SERVICE_TOKEN="${SERVICE_TOKEN:-${HARBOR_TASK_API_BEARER_TOKEN:-${HARBORGATE_BEARER_TOKEN:-${IM_AGENT_SERVICE_TOKEN:-}}}}"
 if [[ -z "${SERVICE_TOKEN}" ]]; then
@@ -411,6 +434,7 @@ append_optional_env "WEIXIN_BOT_TOKEN" "${EXISTING_WEIXIN_BOT_TOKEN}"
 append_optional_env "WEIXIN_BASE_URL" "${EXISTING_WEIXIN_BASE_URL}"
 append_optional_env "WEIXIN_USER_ID" "${EXISTING_WEIXIN_USER_ID}"
 append_optional_env "HARBOR_FFMPEG_BIN" "${FFMPEG_BIN}"
+append_optional_env "HARBOR_FFPROBE_BIN" "${FFPROBE_BIN}"
 append_optional_env "HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID" "${EXISTING_MODEL_API_CANDLE_CHAT_MODEL_ID}"
 append_optional_env "HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID" "${EXISTING_MODEL_API_CANDLE_EMBEDDING_MODEL_ID}"
 append_optional_env "HARBOR_MODEL_API_CANDLE_CACHE_DIR" "${EXISTING_MODEL_API_CANDLE_CACHE_DIR}"
