@@ -18,7 +18,7 @@ export function prefersChineseUi(): boolean {
     return true;
   }
 
-  return true;
+  return false;
 }
 
 export function uiText(english: string, chinese: string): string {
