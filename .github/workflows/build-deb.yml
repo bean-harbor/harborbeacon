@@ -40,9 +40,9 @@ jobs:
       - name: Checkout HarborGate
         uses: actions/checkout@v4
         with:
-          repository: HarborNAS/HarborGate
+          repository: Bean-Harbor/HarborGate
           path: HarborGate
-          token: ${{ secrets.HARBORNAS_GITHUB_TOKEN || github.token }}
+          token: ${{ secrets.BEAN_HARBOR_GITHUB_TOKEN || github.token }}
 
       - name: Select HarborGate ref
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.harborgate_ref != '' }}

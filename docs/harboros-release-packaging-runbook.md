@@ -220,8 +220,8 @@ release artifact，用 `dpkg-deb --build` 生成 `.deb`，再通过
 workflow 固定步骤：
 
 1. checkout HarborBeacon
-2. checkout `HarborNAS/HarborGate`；私有仓库场景下优先使用
-   `HARBORNAS_GITHUB_TOKEN` secret
+2. checkout `Bean-Harbor/HarborGate`；私有仓库场景下优先使用
+   `BEAN_HARBOR_GITHUB_TOKEN` secret
 3. 运行 `tools/build_release_bundle.sh`
 4. 运行 `tools/verify_release_bundle.py --require-execute`
 5. 运行 `tools/build_harboros_deb.sh`
