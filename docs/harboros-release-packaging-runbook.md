@@ -1,12 +1,12 @@
 # HarborOS Release Packaging / Install Runbook
 
-更新时间：2026-05-06
+更新时间：2026-05-08
 
 ## 1. 目的
 
 这份 runbook 只回答一件事：
 
-- 怎样把当前已经接近可用的 HarborBeacon / HarborDesk / HarborGate，
+- 怎样把当前已经接近可用的 HarborBeacon / Harbor Assistant / HarborGate，
   收成 **可重复安装、可升级、可回滚** 的 HarborOS release bundle
 
 它不是业务功能设计文档，也不是 HarborOS live smoke 的替代品，更不是
@@ -28,7 +28,7 @@ release-v1 的默认形态固定为：
 - HarborBeacon 单端口封装本地 OpenAI-compatible 模型服务；`harbor-model-api`/Candle/VLM 只作为内部或过渡 backend，不再成为对外 systemd/API 契约
 - Model Center 是共享能力层：release 默认保持 local-first，云端只作为 `semantic.router` 与 `retrieval.answer` 的受控 fallback
 - `llm-cloud-siliconflow` preset 使用 `https://api.siliconflow.cn/v1`，API key 由 endpoint metadata secret 保存并通过 admin API redaction 返回
-- 本地模型下载默认 mirror 为 `https://hf-mirror.com`；实际优先级为 HarborDesk 输入 mirror -> `HF_ENDPOINT` -> 默认 mirror
+- 本地模型下载默认 mirror 为 `https://hf-mirror.com`；实际优先级为 Harbor Assistant 输入 mirror -> `HF_ENDPOINT` -> 默认 mirror
 
 当前默认 builder：
 
@@ -66,11 +66,16 @@ release-v1 的默认形态固定为：
 
 当前 handoff 增量 baseline：
 
-- HarborBeacon: `1b4f52dc`，安装脚本会保留并写入 `HARBOR_FFPROBE_BIN`。
-- HarborGate: `6795ea5`，Rust setup portal 返回 Harbor Assistant 入口。
-- HarborNAS WebUI: `11421f67d0`，摄像头扫描结果支持行内凭据接入与错误反馈。
-- `.82` live proof: WebUI r411 已部署，补 `HARBOR_FFPROBE_BIN` 后 TP1
-  摄像头恢复接入并设为默认。
+- Harbor Assistant-only cleanup: removed legacy HarborDesk / removed legacy HarborBot / removed legacy HarborCam active routes and removed legacy `/api/harbordesk/**`; HarborOS 集成面只保留 `/ui/harbor-assistant` 与 `/api/harbor-assistant/**`。
+- Media tools packaging: release bundle 必须带
+  `media-tools/bin/ffmpeg` 与 `media-tools/bin/ffprobe`，installer 会安装到
+  `/var/lib/harborbeacon-agent-ci/runtime/media-tools/bin/` 并写入
+  `HARBOR_FFMPEG_BIN` / `HARBOR_FFPROBE_BIN`。
+- Debian delivery: GitHub Actions 通过 `.github/workflows/build-deb.yml`
+  产出 `harborbeacon-harboros-deb-<version>` artifact，内含
+  `harborbeacon-harboros-release_<version>_amd64.deb` 和 checksum。
+- `.82` live proof: bundled media tools 安装后，TP-IPC validation 通过，
+  Harbor Assistant snapshot endpoint 返回 `200 image/jpeg`。
 
 ## 3. 发布物结构
 
@@ -82,11 +87,18 @@ harbor-release-<version>/
     harborbeacon-service
     validate-contract-schemas
     run-e2e-suite
-  harbordesk/dist/harbordesk/
+  harbor-assistant/dist/harbor-assistant/
   harborgate/bin/harborgate
   install/
     install_harboros_release.sh
     rollback_harboros_release.sh
+    verify_release_bundle.py
+  media-tools/
+    bin/
+      ffmpeg
+      ffprobe
+    NOTICE.txt
+    provenance.json
   templates/
     bin/
       harbor-agent-hub-helper
@@ -129,6 +141,25 @@ export BOOTSTRAP_BUILDER_IF_NEEDED=1
 bash ./tools/build_release_bundle.sh
 ```
 
+FFmpeg / ffprobe 是必需 release artifact，不再依赖 HarborOS 现场预装。
+默认 media tools 为 BtbN `ffmpeg-master-latest-linux64-lgpl.tar.xz`
+(`linux64` x86_64 glibc>=2.28，`lgpl` 排除 GPL-only 库)。如果构建机不能联网，
+先下载该 tarball，再显式传入：
+
+```bash
+export HARBOR_MEDIA_TOOLS_ARCHIVE=/path/to/ffmpeg-master-latest-linux64-lgpl.tar.xz
+export HARBOR_MEDIA_TOOLS_SHA256=<archive-sha256>
+bash ./tools/build_release_bundle.sh
+```
+
+构建完成后必须运行 bundle verifier：
+
+```bash
+python3 ./tools/verify_release_bundle.py \
+  dist/release-bundles/harbor-release-<version>.tar.gz \
+  --require-execute
+```
+
 如果要显式指定版本或输出目录：
 
 ```bash
@@ -159,8 +190,12 @@ builder 预期：
 builder 结果至少应包含：
 
 - `harborbeacon-service` Linux release binary
-- HarborNAS WebUI production dist 中的 Harbor Assistant / HarborBot 页面
+- HarborNAS WebUI production dist 中的 Harbor Assistant 页面
 - HarborGate Rust runtime binary: `harborgate/bin/harborgate`
+- BtbN LGPL static media tools: `media-tools/bin/ffmpeg` 与
+  `media-tools/bin/ffprobe`
+- `media-tools/provenance.json`，记录 source URL、archive sha256、variant
+  与 `ffmpeg -version` / `ffprobe -version`
 - `manifest.json`
 - `checksums.sha256`
 - `harbor-release-<version>.tar.gz`
@@ -169,7 +204,64 @@ builder 结果至少应包含：
 可以作为过渡二进制或 benchmark 工具存在，但不再是 release bundle 的主
 systemd/API contract。
 
-## 4.1 Model Backend Benchmark Gate
+## 4.1 GitHub Actions / Debian 包交付
+
+本仓新增 `.github/workflows/build-deb.yml`，参考
+`HarborNAS/featured-photos` 的 release workflow 形态：在 Linux runner 上构建
+release artifact，用 `dpkg-deb --build` 生成 `.deb`，再通过
+`actions/upload-artifact` 交给 HarborOS / ISO 集成同事。
+
+触发方式：
+
+- `workflow_dispatch`，可手工输入 `release_version`
+- `push` 到 `main` / `master`
+- `push` tag `v*` 或 `harbor-release-*`
+
+workflow 固定步骤：
+
+1. checkout HarborBeacon
+2. checkout `HarborNAS/HarborGate`；私有仓库场景下优先使用
+   `HARBORNAS_GITHUB_TOKEN` secret
+3. 运行 `tools/build_release_bundle.sh`
+4. 运行 `tools/verify_release_bundle.py --require-execute`
+5. 运行 `tools/build_harboros_deb.sh`
+6. 上传 release bundle 与 `.deb` artifact
+7. 如果配置了 `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、
+   `HARBOROS_R2_ENDPOINT` 和 `HARBOROS_R2_BUCKET`，tag 或手工触发时按
+   featured-photos 同款路径上传到 R2 `deb/`
+
+HarborOS 同事取包顺序：
+
+1. 优先下载 Actions artifact `harborbeacon-harboros-deb-<version>`。
+2. 如果 HarborOS 发布链已经接入 R2，则从 R2 `deb/` 取同名 `.deb` 和
+   `.deb.sha256`。
+3. 如需排查 bundle 内容，再下载 companion artifact
+   `harborbeacon-release-bundle-<version>`。
+
+Debian package 名称固定为 `harborbeacon-harboros-release`。它是一个 carrier
+package，不在 `dpkg -i` 阶段启动或重启 HarborBeacon 服务，也不写入现场凭据。
+包内只放入已验证 release bundle、安装脚本和两个 helper：
+
+- `/usr/lib/harborbeacon-harboros-release/bundles/harbor-release-<version>.tar.gz`
+- `/usr/lib/harborbeacon-harboros-release/install/install_harboros_release.sh`
+- `/usr/lib/harborbeacon-harboros-release/install/verify_release_bundle.py`
+- `/usr/sbin/install-harborbeacon-release`
+- `/usr/sbin/verify-harborbeacon-release`
+
+HarborOS ISO 或 first-boot 集成流程应显式调用：
+
+```bash
+sudo verify-harborbeacon-release --require-execute
+sudo install-harborbeacon-release \
+  --install-root /var/lib/harborbeacon-agent-ci \
+  --writable-root /mnt/software/harborbeacon-agent-ci
+```
+
+这样 `.deb` 可以进入 HarborOS 打包链，但服务渲染、env-file、bundled
+`ffmpeg` / `ffprobe` 安装、systemd restart 与 rollback 仍由 release bundle
+内的 installer 拥有。
+
+## 4.2 Model Backend Benchmark Gate
 
 在把 HarborOS 的默认 backend 从 `openai_proxy` 切到 `candle` 之前，先跑
 repo-local benchmark lane。
@@ -248,6 +340,10 @@ sudo bash ./install_harboros_release.sh \
 - 显式写入 `HARBORBEACON_ADMIN_API_TOKEN=<service-token>`
 - 显式写入 `HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4174/api/inference/v1`
 - 显式写入 `HARBOR_MODEL_API_TOKEN=<service-token>`
+- 把 bundled media tools 安装到 `${install-root}/runtime/media-tools/bin/`
+- 验证 `ffmpeg -version` 与 `ffprobe -version` 可执行；默认失败即停止安装
+- 显式写入 `HARBOR_FFMPEG_BIN=/var/lib/harborbeacon-agent-ci/runtime/media-tools/bin/ffmpeg`
+- 显式写入 `HARBOR_FFPROBE_BIN=/var/lib/harborbeacon-agent-ci/runtime/media-tools/bin/ffprobe`
 - 写入 `HARBOR_HARBOROS_WRITABLE_ROOT=<writable-root>`
 - 安装/更新 2 个 systemd 服务单元
 - 旧 unit 被 disable/remove，避免旧多端口拓扑在升级后继续漂移
@@ -327,6 +423,13 @@ artifact，而不是在当前 release 里改 env 开关。
 - HarborGate admin sync 依赖 `:4174`，不要再让它 fallback 到旧 task API 端口
 - 本地 OpenAI-compatible 模型服务固定通过 `:4174/api/inference/v1` 暴露；HarborBeacon 继续拥有检索语义、排序和引用包装
 - `HARBOR_KNOWLEDGE_INDEX_ROOT` 必须指向 writable root，例如 `/mnt/software/harborbeacon-agent-ci/knowledge-index`；不要让 retrieval 回落到相对路径 `.harborbeacon/knowledge-index`
+- `harbor-agent-hub-helper health` 必须显示 `media_tools.ffmpeg.ok=true`
+  与 `media_tools.ffprobe.ok=true`
+- camera live acceptance 必须确认
+  `/api/harbor-assistant/cameras/<device-id>/snapshot.jpg` 返回 `200 image/jpeg`
+- `verify-harborbeacon-release --require-execute` 必须能验证 `.deb` 内置 bundle
+- removed legacy HarborDesk / removed legacy HarborBot / removed legacy HarborCam route 不应继续作为 active UI 入口存在
+- removed legacy `/api/harbordesk/**` 不应继续作为 active HarborBeacon Admin API 前缀存在
 
 Windows host：
 
@@ -361,7 +464,7 @@ bash ./tools/run_harboros_vm_smoke.sh \
 - 不新增新的框架对象
 - 不新增新的 cross-repo 接口
 - 不新增新的 use-case 专用 admin API
-- 不新造 HarborDesk 独立账号体系
+- 不新造 Harbor Assistant 独立账号体系
 
 它只负责把现有 v1 能力收成正式安装形态。
 
@@ -379,7 +482,9 @@ bash ./tools/run_harboros_vm_smoke.sh \
    - clean install 没有 Weixin 凭据，因此 `harborgate.service` 内部 Weixin runtime 应被视为 skipped，而不是 bundle 损坏
 4. bundle incompleteness
    - 缺 HarborGate Rust binary `harborgate/bin/harborgate`
-   - 缺 HarborDesk dist
+   - 缺 HarborNAS WebUI production dist / Harbor Assistant 页面
+   - 缺 `media-tools/bin/ffmpeg` 或 `media-tools/bin/ffprobe`
+   - `manifest.json` 缺 `components.media_tools`
    - 缺 systemd units / env-file / install script
 5. builder / host dependency gap
    - builder 缺 `cargo-zigbuild` / `zig`

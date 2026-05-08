@@ -26,5 +26,5 @@ fi
 exec "${BIN_PATH}" \
   --bind "${HARBOR_HTTP_BIND:-0.0.0.0:4174}" \
   --public-origin "${HARBOR_PUBLIC_ORIGIN:-http://harborbeacon.local:4174}" \
-  --harbordesk-dist "${HARBORDESK_DIST:-${WORKSPACE_ROOT}/frontend/harbordesk/dist/harbordesk}" \
+  --harbor-assistant-dist "${HARBOR_ASSISTANT_DIST:-${WORKSPACE_ROOT}/frontend/harbor-assistant/dist/harbor-assistant}" \
   "$@"

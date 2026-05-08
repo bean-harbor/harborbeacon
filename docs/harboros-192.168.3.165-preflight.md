@@ -147,7 +147,7 @@ The architect-facing closeout can cite these exact statements:
 - no evidence line should collapse that root back to `/mnt/agent-ci` or
   `/data/agent-ci`
 
-## HarborDesk Summary
+## Harbor Assistant Summary
 
 The admin surface can safely reuse these proof labels without expanding the
 HarborOS boundary:

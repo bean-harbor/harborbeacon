@@ -26,7 +26,7 @@ fi
 exec "${BIN_PATH}" \
   --bind "${HARBOR_HTTP_BIND:-0.0.0.0:4174}" \
   --public-origin "${HARBOR_PUBLIC_ORIGIN:-http://harborbeacon.local:4174}" \
-  --harbordesk-dist "${HARBORDESK_DIST:-${WORKSPACE_ROOT}/frontend/harbordesk/dist/harbordesk}" \
+  --harbor-assistant-dist "${HARBOR_ASSISTANT_DIST:-${WORKSPACE_ROOT}/frontend/harbor-assistant/dist/harbor-assistant}" \
   --admin-state "${HARBOR_TASK_API_ADMIN_STATE:-.harborbeacon/admin-console.json}" \
   --device-registry "${HARBOR_TASK_API_DEVICE_REGISTRY:-.harborbeacon/device-registry.json}" \
   --conversations "${HARBOR_TASK_API_CONVERSATIONS:-.harborbeacon/task-api-conversations.json}" \

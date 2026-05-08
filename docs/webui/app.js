@@ -19,7 +19,7 @@ const state = {
     boundUser: "未配置",
     channel: "Harbor IM Bridge",
     qrToken: "http://127.0.0.1:4174/setup/mobile?session=PENDING",
-    staticQrToken: "http://harbordesk.local:4174/setup/mobile",
+    staticQrToken: "http://harbor-assistant.local:4174/setup/mobile",
   },
   bridgeProvider: {
     configured: false,
@@ -85,7 +85,7 @@ const state = {
   events: [
     {
       type: "info",
-      title: "正在连接 HarborDesk 管理 API",
+      title: "正在连接 Harbor Assistant 管理 API",
       body: "页面启动后会读取真实的绑定状态、默认策略和设备库，而不是继续使用演示假数据。",
       time: "刚刚",
     },
@@ -1001,7 +1001,7 @@ function mapBinding(binding) {
     boundUser: binding?.bound_user || "未配置",
     channel: binding?.channel || "Harbor IM Bridge",
     qrToken: binding?.setup_url || binding?.qr_token || "http://127.0.0.1:4174/setup/mobile?session=PENDING",
-    staticQrToken: binding?.static_setup_url || binding?.setup_url || "http://harbordesk.local:4174/setup/mobile",
+    staticQrToken: binding?.static_setup_url || binding?.setup_url || "http://harbor-assistant.local:4174/setup/mobile",
   };
 }
 
@@ -2565,7 +2565,7 @@ function renderAccessMemberSignals() {
     loading
       ? "Account Management is waiting for the workspace, member, and identity binding projections."
       : blocker
-        ? "Account Management hit a backend blocker, so HarborDesk shows the current governance evidence instead of a mock member list."
+        ? "Account Management hit a backend blocker, so Harbor Assistant shows the current governance evidence instead of a mock member list."
         : empty
           ? "The workspace is reachable, but no members or identity bindings have been projected yet."
           : "Account Management is ready for member roles, default proactive delivery, and binding governance.",
@@ -2717,11 +2717,11 @@ function renderGatewayStatus() {
     renderFeatureList(
       els.gatewayChannelList,
       [],
-      "HarborDesk 还拿不到 source-bound queue/failure signals；当前轮次只能显示明确 blocker。"
+      "Harbor Assistant 还拿不到 source-bound queue/failure signals；当前轮次只能显示明确 blocker。"
     );
     if (els.gatewayStatusNote) {
       els.gatewayStatusNote.textContent =
-        "Feishu baseline / Weixin parity 的实时信号尚未到达 HarborDesk；请确认 HarborGate 状态面可读。";
+        "Feishu baseline / Weixin parity 的实时信号尚未到达 Harbor Assistant；请确认 HarborGate 状态面可读。";
     }
     return;
   }
@@ -2776,7 +2776,7 @@ function renderGatewayStatus() {
     );
   } else {
     weixinLines.push(
-      "Weixin parity track · waiting for HarborGate setup/status read surface before HarborDesk can show ingress and context-token signals."
+      "Weixin parity track · waiting for HarborGate setup/status read surface before Harbor Assistant can show ingress and context-token signals."
     );
   }
 
@@ -2795,7 +2795,7 @@ function renderGatewayStatus() {
   if (els.gatewayStatusNote) {
     els.gatewayStatusNote.textContent =
       gateway.source === "harborgate_status"
-        ? "HarborDesk 正在显示 HarborGate 的真实 setup/status、Feishu baseline、Weixin parity，以及 source-bound queue/failure signals。"
+        ? "Harbor Assistant 正在显示 HarborGate 的真实 setup/status、Feishu baseline、Weixin parity，以及 source-bound queue/failure signals。"
         : "当前只拿到了 HarborBeacon 本地 bridge summary；如果要显示 Feishu/Weixin 的细粒度 parity 信号，还需要 HarborGate setup/status 同源可读。";
   }
 
@@ -2804,8 +2804,8 @@ function renderGatewayStatus() {
     gateway.source === "harborgate_status" ? "success" : "empty",
     "IM Gateway page state",
     gateway.source === "harborgate_status"
-      ? "HarborDesk is showing same-origin HarborGate setup/status with Feishu baseline and Weixin parity side by side."
-      : "HarborDesk only has a local bridge summary right now; full parity data needs HarborGate same-origin state.",
+      ? "Harbor Assistant is showing same-origin HarborGate setup/status with Feishu baseline and Weixin parity side by side."
+      : "Harbor Assistant only has a local bridge summary right now; full parity data needs HarborGate same-origin state.",
     [
       `feishu = ${feishu ? "present" : "pending"}`,
       `weixin = ${weixin ? "present" : "pending"}`,
@@ -2843,7 +2843,7 @@ function renderModelsPolicies() {
     loading
       ? "Model Center is waiting for endpoint, route policy, and feature-availability projections."
       : blocker
-        ? "At least one model-center read path has a backend blocker; HarborDesk will show the exact endpoint/policy gap instead of pretending policy state exists."
+        ? "At least one model-center read path has a backend blocker; Harbor Assistant will show the exact endpoint/policy gap instead of pretending policy state exists."
         : empty
           ? "Model Center is reachable, but there are no endpoints, route policies, or feature-availability rows projected yet."
           : "Model Center is showing endpoint status, runtime-overlay alignment, and route policy/fallback order side by side.",
@@ -3260,7 +3260,7 @@ function renderHarborOsSummary() {
     ]
   );
   const liveStatusLines = [
-    "live_status=HarborDesk keeps HarborOS live status separate from proof summary",
+    "live_status=Harbor Assistant keeps HarborOS live status separate from proof summary",
     `route_order=${HARBOROS_ROUTE_ORDER.join(" -> ")}`,
     "writable_root=/mnt/software/harborbeacon-agent-ci",
   ];
@@ -3277,7 +3277,7 @@ function renderHarborOsSummary() {
   renderFeatureList(els.harborosProofSummaryList, proofSummaryLines, "等待 HarborOS proof summary block。");
   if (els.harborosProofNote) {
     els.harborosProofNote.textContent =
-      "HarborDesk renders HarborOS live status and proof summary separately. The live block describes current system-domain state; the proof block carries the reviewer-facing evidence rows and verifier lines.";
+      "Harbor Assistant renders HarborOS live status and proof summary separately. The live block describes current system-domain state; the proof block carries the reviewer-facing evidence rows and verifier lines.";
   }
 }
 
@@ -3620,7 +3620,7 @@ async function handleMemberRoleSave(member, select, button) {
       try {
         await loadAccountManagement({ silent: true });
       } catch (_error) {
-        // Keep HarborDesk usable even if the summary read model lags behind the write.
+        // Keep Harbor Assistant usable even if the summary read model lags behind the write.
       }
       state.lastCommand = `调整 ${member.displayName} 的访问角色`;
       renderAll();
@@ -3728,7 +3728,7 @@ async function handleModelEndpointSave(endpoint, item, button) {
       pushEvent({
         type: "normal",
         title: `模型端点已保存：${endpoint.modelEndpointId}`,
-        body: `Endpoint 的 status/kind/provider/route posture 已保存，并刷新了 HarborDesk 的模型中心视图。`,
+        body: `Endpoint 的 status/kind/provider/route posture 已保存，并刷新了 Harbor Assistant 的模型中心视图。`,
         time: "刚刚",
       });
       showToast(`已保存 ${endpoint.modelEndpointId}。`);
@@ -3832,7 +3832,7 @@ async function handleModelPoliciesSave(button) {
       pushEvent({
         type: "normal",
         title: "Route policies 已保存",
-        body: "默认路由与 fallback order 已写回后端，HarborDesk 会刷新模型中心读面。",
+        body: "默认路由与 fallback order 已写回后端，Harbor Assistant 会刷新模型中心读面。",
         time: "刚刚",
       });
       showToast("已保存 route policies。");
@@ -4417,7 +4417,7 @@ async function boot() {
     try {
       await loadModelCenter({ silent: true });
     } catch (_error) {
-      // Keep HarborDesk usable even if the model center is temporarily unavailable.
+      // Keep Harbor Assistant usable even if the model center is temporarily unavailable.
     }
     state.lastCommand = state.cameras.length ? "已载入设备库" : "等待首次接入";
     renderAll();
@@ -4445,7 +4445,7 @@ async function boot() {
     pushEvent({
       type: "warning",
       title: "本地管理 API 未连接",
-      body: `请先启动 HarborDesk 管理 API。当前尝试连接：${API_BASE}。错误：${error.message}`,
+      body: `请先启动 Harbor Assistant 管理 API。当前尝试连接：${API_BASE}。错误：${error.message}`,
       time: "刚刚",
     });
     renderEvents();

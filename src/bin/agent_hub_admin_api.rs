@@ -86,7 +86,7 @@ struct Cli {
     admin_state: PathBuf,
     device_registry: PathBuf,
     conversations: PathBuf,
-    harbordesk_dist: PathBuf,
+    harbor_assistant_dist: PathBuf,
     public_origin: String,
 }
 
@@ -105,7 +105,7 @@ fn fail(message: &str) -> ! {
 
 fn print_usage() {
     eprintln!(
-        "Usage: agent-hub-admin-api [--bind ADDR] [--admin-state PATH] [--device-registry PATH] [--conversations PATH] [--harbordesk-dist PATH] [--public-origin URL]"
+        "Usage: agent-hub-admin-api [--bind ADDR] [--admin-state PATH] [--device-registry PATH] [--conversations PATH] [--harbor-assistant-dist PATH] [--public-origin URL]"
     );
 }
 
@@ -116,7 +116,7 @@ impl Default for Cli {
             admin_state: PathBuf::from(".harborbeacon/admin-console.json"),
             device_registry: PathBuf::from(".harborbeacon/device-registry.json"),
             conversations: PathBuf::from(".harborbeacon/task-api-conversations.json"),
-            harbordesk_dist: PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            harbor_assistant_dist: PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
             public_origin: "http://harborbeacon.local:4174".to_string(),
         }
     }
@@ -160,13 +160,13 @@ impl Cli {
                 value if value.starts_with("--conversations=") => {
                     cli.conversations = PathBuf::from(value["--conversations=".len()..].to_string())
                 }
-                "--harbordesk-dist" => {
-                    cli.harbordesk_dist =
-                        PathBuf::from(take_value(&args, &mut index, "--harbordesk-dist"))
+                "--harbor-assistant-dist" => {
+                    cli.harbor_assistant_dist =
+                        PathBuf::from(take_value(&args, &mut index, "--harbor-assistant-dist"))
                 }
-                value if value.starts_with("--harbordesk-dist=") => {
-                    cli.harbordesk_dist =
-                        PathBuf::from(value["--harbordesk-dist=".len()..].to_string())
+                value if value.starts_with("--harbor-assistant-dist=") => {
+                    cli.harbor_assistant_dist =
+                        PathBuf::from(value["--harbor-assistant-dist=".len()..].to_string())
                 }
                 "--public-origin" => {
                     cli.public_origin = take_value(&args, &mut index, "--public-origin")
@@ -197,7 +197,7 @@ pub struct AdminApi {
     admin_store: AdminConsoleStore,
     task_service: TaskApiService,
     dvr_runtime: DvrRuntime,
-    harbordesk_dist: PathBuf,
+    harbor_assistant_dist: PathBuf,
     public_origin: String,
     model_runtime_activation: Option<ModelRuntimeActivationHandler>,
 }
@@ -1056,14 +1056,14 @@ impl AdminApi {
     pub fn new(
         admin_store: AdminConsoleStore,
         task_service: TaskApiService,
-        harbordesk_dist: PathBuf,
+        harbor_assistant_dist: PathBuf,
         public_origin: String,
     ) -> Self {
         Self {
             admin_store,
             task_service,
             dvr_runtime: DvrRuntime::default(),
-            harbordesk_dist,
+            harbor_assistant_dist,
             public_origin,
             model_runtime_activation: None,
         }
@@ -1119,7 +1119,7 @@ impl AdminApi {
         authorize_access(&state, hints, action, &format!("camera:{device_id}"), true)
     }
 
-    fn handle_harbordesk(
+    fn handle_harbor_assistant(
         &self,
         path: &str,
         hints: &AccessIdentityHints,
@@ -1128,23 +1128,23 @@ impl AdminApi {
             return error_json(StatusCode(403), &error);
         }
 
-        let dist_root = resolve_state_path(&self.harbordesk_dist);
+        let dist_root = resolve_state_path(&self.harbor_assistant_dist);
         if !dist_root.exists() {
-            return harbordesk_build_missing_response(&dist_root);
+            return harbor_assistant_build_missing_response(&dist_root);
         }
 
-        if let Some(asset_path) = resolve_harbordesk_asset_path(&dist_root, path) {
+        if let Some(asset_path) = resolve_harbor_assistant_asset_path(&dist_root, path) {
             if asset_path.is_file() {
                 return static_file_response(&asset_path);
             }
         }
 
-        if is_harbordesk_client_route(path) {
+        if is_harbor_assistant_client_route(path) {
             let index_path = dist_root.join("index.html");
             if index_path.is_file() {
                 return static_file_response(&index_path);
             }
-            return harbordesk_build_missing_response(&dist_root);
+            return harbor_assistant_build_missing_response(&dist_root);
         }
 
         error_json(StatusCode(404), "route not found")
@@ -1158,7 +1158,7 @@ impl AdminApi {
         let headers = request.headers().to_vec();
         let identity_hints = request_identity_hints(&raw_url, &headers);
 
-        if is_admin_surface_path(path.as_str()) || is_harbordesk_surface_path(path.as_str()) {
+        if is_admin_surface_path(path.as_str()) || is_harbor_assistant_surface_path(path.as_str()) {
             if let Err(error) = ensure_local_admin_access(remote_addr, &headers) {
                 let _ = request.respond(error_json(StatusCode(403), &error).boxed());
                 return;
@@ -1454,8 +1454,8 @@ impl AdminApi {
             Method::Delete if path.starts_with("/api/admin/notification-targets/") => self
                 .handle_delete_notification_target(path.as_str(), &identity_hints)
                 .boxed(),
-            Method::Get if is_harbordesk_surface_path(path.as_str()) => self
-                .handle_harbordesk(path.as_str(), &identity_hints)
+            Method::Get if is_harbor_assistant_surface_path(path.as_str()) => self
+                .handle_harbor_assistant(path.as_str(), &identity_hints)
                 .boxed(),
             Method::Options => no_content().boxed(),
             _ => error_json(StatusCode(404), "route not found").boxed(),
@@ -1974,7 +1974,7 @@ impl AdminApi {
         if settings.enabled_source_root_paths().is_empty() {
             return error_json(
                 StatusCode(422),
-                "请先在 HarborDesk 配置并启用至少一个知识源目录。",
+                "请先在 Harbor Assistant 配置并启用至少一个知识源目录。",
             );
         }
         if let Ok(jobs) = self.admin_store.list_knowledge_index_jobs() {
@@ -4531,7 +4531,7 @@ fn main() {
     let api = AdminApi::new(
         admin_store,
         task_service,
-        cli.harbordesk_dist,
+        cli.harbor_assistant_dist,
         cli.public_origin,
     );
 
@@ -4566,11 +4566,10 @@ fn normalize_unified_admin_url(raw_url: &str) -> String {
 }
 
 fn normalize_unified_admin_path(path: &str) -> String {
-    if let Some(tail) = path.strip_prefix("/api/harbordesk") {
-        let tail = tail.trim_start_matches('/');
-        if tail.is_empty() {
-            return "/api/state".to_string();
-        }
+    if path == "/api/harbor-assistant" {
+        return "/api/state".to_string();
+    }
+    if let Some(tail) = path.strip_prefix("/api/harbor-assistant/") {
         return format!("/api/{tail}");
     }
     let Some(tail) = path.strip_prefix("/api/admin") else {
@@ -5800,7 +5799,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || (path.starts_with("/api/models/capabilities/") && path.ends_with("/selection"))
 }
 
-fn is_harbordesk_client_route(path: &str) -> bool {
+fn is_harbor_assistant_client_route(path: &str) -> bool {
     matches!(
         path,
         "/" | "/overview"
@@ -5814,7 +5813,7 @@ fn is_harbordesk_client_route(path: &str) -> bool {
     )
 }
 
-fn looks_like_harbordesk_asset_path(path: &str) -> bool {
+fn looks_like_harbor_assistant_asset_path(path: &str) -> bool {
     path.starts_with("/assets/")
         || [
             ".js",
@@ -5833,12 +5832,12 @@ fn looks_like_harbordesk_asset_path(path: &str) -> bool {
         .any(|extension| path.ends_with(extension))
 }
 
-fn is_harbordesk_surface_path(path: &str) -> bool {
-    is_harbordesk_client_route(path) || looks_like_harbordesk_asset_path(path)
+fn is_harbor_assistant_surface_path(path: &str) -> bool {
+    is_harbor_assistant_client_route(path) || looks_like_harbor_assistant_asset_path(path)
 }
 
-fn resolve_harbordesk_asset_path(dist_root: &Path, request_path: &str) -> Option<PathBuf> {
-    if !looks_like_harbordesk_asset_path(request_path) {
+fn resolve_harbor_assistant_asset_path(dist_root: &Path, request_path: &str) -> Option<PathBuf> {
+    if !looks_like_harbor_assistant_asset_path(request_path) {
         return None;
     }
 
@@ -5907,9 +5906,9 @@ fn static_file_response(path: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
     response
 }
 
-fn harbordesk_build_missing_response(dist_root: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
+fn harbor_assistant_build_missing_response(dist_root: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
     let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>HarborDesk build missing</title></head><body><h1>HarborDesk build missing</h1><p>Angular build output was not found at <code>{}</code>.</p><p>Run <code>npm install</code> and <code>npm run build</code> under <code>frontend/harbordesk</code>, or pass <code>--harbordesk-dist</code>.</p></body></html>",
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Harbor Assistant build missing</title></head><body><h1>Harbor Assistant build missing</h1><p>Angular build output was not found at <code>{}</code>.</p><p>Run <code>npm install</code> and <code>npm run build</code> under <code>frontend/harbor-assistant</code>, or pass <code>--harbor-assistant-dist</code>.</p></body></html>",
         dist_root.display()
     );
     let mut response = Response::from_string(body).with_status_code(StatusCode(503));
@@ -6228,7 +6227,7 @@ fn build_release_readiness_response(
                     "needs-config"
                 },
                 &default_camera_summary,
-                "Default camera is configured in HarborDesk Devices & AIoT.",
+                "Default camera is configured in Harbor Assistant Devices & AIoT.",
                 "GET /api/state",
                 "/devices-aiot",
                 vec![format!("registered_devices={}", devices.len())],
@@ -6302,14 +6301,14 @@ fn build_release_readiness_response(
         checked_at: generated_at,
         status: overall_status.clone(),
         summary: format!(
-            "Release readiness is {overall_status}; HarborDesk stays on :4174 and HarborOS WebUI stays on /ui/ or 80/443."
+            "Release readiness is {overall_status}; Harbor Assistant stays on :4174 and HarborOS WebUI stays on /ui/ or 80/443."
         ),
         overall_status,
         harbor_desk: ReadinessSurfaceSummary {
             admin_origin: public_origin.to_string(),
             admin_port: public_origin_port(public_origin).unwrap_or(4174),
             harboros_webui: harboros_webui_url(public_origin),
-            note: "HarborDesk uses port 4174; HarborOS WebUI stays on /ui/ or 80/443.".to_string(),
+            note: "Harbor Assistant uses port 4174; HarborOS WebUI stays on /ui/ or 80/443.".to_string(),
         },
         groups,
         checklist,
@@ -6327,9 +6326,9 @@ fn release_readiness_deep_links(
     let origin = public_origin.trim_end_matches('/');
     vec![
         ReleaseReadinessDeepLink {
-            label: "HarborDesk Overview (:4174)".to_string(),
+            label: "Harbor Assistant Overview (:4174)".to_string(),
             href: format!("{origin}/overview"),
-            detail: "Release readiness entry in HarborDesk.".to_string(),
+            detail: "Release readiness entry in Harbor Assistant.".to_string(),
             endpoint: "GET /api/release/readiness".to_string(),
         },
         ReleaseReadinessDeepLink {
@@ -6347,13 +6346,13 @@ fn release_readiness_deep_links(
         ReleaseReadinessDeepLink {
             label: "HarborOS System Domain".to_string(),
             href: format!("{origin}/harboros"),
-            detail: "System Domain status inside HarborDesk, not AIoT device control.".to_string(),
+            detail: "System Domain status inside Harbor Assistant, not AIoT device control.".to_string(),
             endpoint: "GET /api/harboros/status".to_string(),
         },
         ReleaseReadinessDeepLink {
             label: "HarborOS WebUI (/ui/)".to_string(),
             href: harboros.webui_url.clone(),
-            detail: "HarborOS WebUI stays on /ui/ or ports 80/443, separate from HarborDesk :4174."
+            detail: "HarborOS WebUI stays on /ui/ or ports 80/443, separate from Harbor Assistant :4174."
                 .to_string(),
             endpoint: "HarborOS WebUI /ui/ or 80/443".to_string(),
         },
@@ -7036,7 +7035,7 @@ fn resolve_admin_search_source_scope(
             }
         }
         _ => Err(format!(
-            "Unsupported HarborBot source_scope {}; expected dvr_library, nas_files, or all.",
+            "Unsupported Harbor Assistant Search source_scope {}; expected dvr_library, nas_files, or all.",
             scope
         )),
     }
@@ -7050,7 +7049,7 @@ fn build_admin_knowledge_search_request(
 ) -> Result<KnowledgeSearchRequest, String> {
     let query = payload.query.trim();
     if query.is_empty() {
-        return Err("HarborBot search requires a non-empty query.".to_string());
+        return Err("Harbor Assistant Search search requires a non-empty query.".to_string());
     }
     let configured_roots = settings.enabled_source_root_paths();
     if configured_roots.is_empty() {
@@ -7809,7 +7808,7 @@ fn build_rag_readiness_response(
             enabled_source_roots.len(),
             existing_enabled_source_roots
         ),
-        detail: "Knowledge source roots are configured in HarborDesk and are the only roots eligible for search or benchmark.".to_string(),
+        detail: "Knowledge source roots are configured in Harbor Assistant and are the only roots eligible for search or benchmark.".to_string(),
         evidence: knowledge
             .source_roots
             .iter()
@@ -7838,7 +7837,7 @@ fn build_rag_readiness_response(
             format!("Index directory not created yet: {index_dir}")
         },
         detail:
-            "RAG index path is persisted in knowledge.index_root and is managed from HarborDesk."
+            "RAG index path is persisted in knowledge.index_root and is managed from Harbor Assistant."
                 .to_string(),
         evidence: vec![
             format!("index_dir={index_dir}"),
@@ -8153,16 +8152,16 @@ fn build_harboros_status_response(public_origin: &str) -> HarborOsStatusResponse
         .unwrap_or_else(|| "unknown".to_string());
     let services = vec![
         HarborOsServiceStatus {
-            service_id: "harbordesk-admin-api".to_string(),
-            label: "HarborDesk Admin API".to_string(),
+            service_id: "harbor-assistant-admin-api".to_string(),
+            label: "Harbor Assistant Admin API".to_string(),
             status: "ready".to_string(),
-            detail: "Current process serves HarborDesk on port 4174.".to_string(),
+            detail: "Current process serves Harbor Assistant on port 4174.".to_string(),
         },
         HarborOsServiceStatus {
             service_id: "harboros-webui".to_string(),
             label: "HarborOS WebUI".to_string(),
             status: "external".to_string(),
-            detail: format!("Expected at {webui_url}; HarborDesk does not own this port."),
+            detail: format!("Expected at {webui_url}; Harbor Assistant does not own this port."),
         },
         HarborOsServiceStatus {
             service_id: "writable-root".to_string(),
@@ -12565,11 +12564,11 @@ mod tests {
         build_release_readiness_response, build_rtsp_url_from_patch,
         camera_stream_url_with_credentials, default_model_download_target_path,
         default_model_endpoints, ensure_local_admin_access, ensure_local_camera_access,
-        harbordesk_build_missing_response, has_forwarding_headers,
+        harbor_assistant_build_missing_response, has_forwarding_headers,
         hardware_class_for_probe,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
-        identity_query_suffix, is_admin_surface_path, is_harbordesk_client_route,
-        is_harbordesk_surface_path, knowledge_preview_mime_supported, latest_model_download_jobs,
+        identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
+        is_harbor_assistant_surface_path, knowledge_preview_mime_supported, latest_model_download_jobs,
         live_bridge_provider_from_setup_status, local_model_catalog_item,
         local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
         model_download_huggingface_endpoints, model_download_jobs_status,
@@ -12590,7 +12589,7 @@ mod tests {
         redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
         redact_value_stream_credentials, release_item, request_identity_hints,
-        resolve_harbordesk_asset_path, resolve_knowledge_preview_path, run_knowledge_index_jobs,
+        resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path, run_knowledge_index_jobs,
         run_model_download_job, run_model_download_transfer, scan_request_task_args,
         url_encode_path_segment, AdminApi, KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
         ModelRuntimeActivationRequest, ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
@@ -12714,7 +12713,7 @@ mod tests {
             let api = AdminApi::new(
                 admin_store,
                 task_service,
-                PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+                PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
                 "http://harborbeacon.local:4174".to_string(),
             );
 
@@ -12754,7 +12753,7 @@ mod tests {
         let api = AdminApi::new(
             admin_store,
             task_service,
-            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
             "http://harborbeacon.local:4174".to_string(),
         );
 
@@ -12828,7 +12827,7 @@ mod tests {
         let api = AdminApi::new(
             admin_store,
             task_service,
-            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
             "http://harborbeacon.local:4174".to_string(),
         );
         let hints = AccessIdentityHints {
@@ -13289,45 +13288,55 @@ mod tests {
     }
 
     #[test]
-    fn harbordesk_api_prefix_normalizes_to_admin_api_routes() {
+    fn harbor_assistant_api_prefix_normalizes_to_admin_api_routes() {
         assert_eq!(
-            normalize_unified_admin_path("/api/harbordesk/cameras/recording-settings"),
+            normalize_unified_admin_path("/api/harbor-assistant/cameras/recording-settings"),
             "/api/cameras/recording-settings"
         );
         assert_eq!(
-            normalize_unified_admin_path("/api/harbordesk/cameras/camera-1/snapshot.jpg"),
+            normalize_unified_admin_path("/api/harbor-assistant/cameras/camera-1/snapshot.jpg"),
             "/api/cameras/camera-1/snapshot.jpg"
         );
         assert_eq!(
-            normalize_unified_admin_path("/api/harbordesk/models/capabilities"),
+            normalize_unified_admin_path("/api/harbor-assistant/models/capabilities"),
             "/api/models/capabilities"
         );
         assert_eq!(
-            normalize_unified_admin_path("/api/harbordesk"),
+            normalize_unified_admin_path("/api/harbor-assistant"),
             "/api/state"
         );
-    }
-
-    #[test]
-    fn harbordesk_client_routes_are_identified() {
-        assert!(is_harbordesk_client_route("/"));
-        assert!(is_harbordesk_client_route("/overview"));
-        assert!(is_harbordesk_client_route("/models-policies"));
-        assert!(is_harbordesk_surface_path("/assets/runtime.js"));
-        assert!(is_harbordesk_surface_path("/main.js"));
-        assert!(!is_harbordesk_surface_path("/api/state"));
-        assert!(!is_harbordesk_surface_path("/setup/mobile"));
-    }
-
-    #[test]
-    fn harbordesk_asset_paths_reject_parent_segments() {
-        let root = PathBuf::from("C:/harbordesk-dist");
+        let removed_prefix = format!("/api/{}desk", "harbor");
+        let removed_state = format!("{removed_prefix}/state");
         assert_eq!(
-            resolve_harbordesk_asset_path(&root, "/assets/main.js"),
+            normalize_unified_admin_path(removed_state.as_str()),
+            removed_state
+        );
+        assert_eq!(
+            normalize_unified_admin_path("/api/harbor-assistant-v2/state"),
+            "/api/harbor-assistant-v2/state"
+        );
+    }
+
+    #[test]
+    fn harbor_assistant_client_routes_are_identified() {
+        assert!(is_harbor_assistant_client_route("/"));
+        assert!(is_harbor_assistant_client_route("/overview"));
+        assert!(is_harbor_assistant_client_route("/models-policies"));
+        assert!(is_harbor_assistant_surface_path("/assets/runtime.js"));
+        assert!(is_harbor_assistant_surface_path("/main.js"));
+        assert!(!is_harbor_assistant_surface_path("/api/state"));
+        assert!(!is_harbor_assistant_surface_path("/setup/mobile"));
+    }
+
+    #[test]
+    fn harbor_assistant_asset_paths_reject_parent_segments() {
+        let root = PathBuf::from("C:/harbor-assistant-dist");
+        assert_eq!(
+            resolve_harbor_assistant_asset_path(&root, "/assets/main.js"),
             Some(root.join("assets").join("main.js"))
         );
-        assert_eq!(resolve_harbordesk_asset_path(&root, "/../secret.txt"), None);
-        assert_eq!(resolve_harbordesk_asset_path(&root, "/overview"), None);
+        assert_eq!(resolve_harbor_assistant_asset_path(&root, "/../secret.txt"), None);
+        assert_eq!(resolve_harbor_assistant_asset_path(&root, "/overview"), None);
     }
 
     #[test]
@@ -13375,9 +13384,9 @@ mod tests {
     }
 
     #[test]
-    fn harbordesk_build_missing_response_mentions_dist_path() {
+    fn harbor_assistant_build_missing_response_mentions_dist_path() {
         let response =
-            harbordesk_build_missing_response(Path::new("frontend/harbordesk/dist/harbordesk"));
+            harbor_assistant_build_missing_response(Path::new("frontend/harbor-assistant/dist/harbor-assistant"));
         assert_eq!(response.status_code(), StatusCode(503));
     }
 
@@ -14722,12 +14731,12 @@ mod tests {
 
     #[test]
     fn knowledge_preview_allows_indexed_files_under_enabled_source_root() {
-        let source_root = unique_store_path("harborbot-preview-source");
-        let index_root = unique_store_path("harborbot-preview-index");
+        let source_root = unique_store_path("harbor-assistant-search-preview-source");
+        let index_root = unique_store_path("harbor-assistant-search-preview-index");
         fs::create_dir_all(&source_root).expect("create source root");
         fs::create_dir_all(&index_root).expect("create index root");
         let indexed_path = source_root.join("indexed.md");
-        fs::write(&indexed_path, "HarborBot indexed preview").expect("write indexed file");
+        fs::write(&indexed_path, "Harbor Assistant Search indexed preview").expect("write indexed file");
         let service = KnowledgeIndexService::from_config(
             KnowledgeIndexConfig::new(index_root.clone()).unwrap(),
         )
@@ -14762,9 +14771,9 @@ mod tests {
 
     #[test]
     fn knowledge_preview_rejects_outside_unindexed_directory_and_unsupported_files() {
-        let source_root = unique_store_path("harborbot-preview-guard-source");
-        let outside_root = unique_store_path("harborbot-preview-guard-outside");
-        let index_root = unique_store_path("harborbot-preview-guard-index");
+        let source_root = unique_store_path("harbor-assistant-search-preview-guard-source");
+        let outside_root = unique_store_path("harbor-assistant-search-preview-guard-outside");
+        let index_root = unique_store_path("harbor-assistant-search-preview-guard-index");
         fs::create_dir_all(&source_root).expect("create source root");
         fs::create_dir_all(&outside_root).expect("create outside root");
         fs::create_dir_all(&index_root).expect("create index root");
@@ -15143,7 +15152,7 @@ mod tests {
         let api = AdminApi::new(
             admin_store,
             task_service,
-            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
             "http://harborbeacon.local:4174".to_string(),
         );
         let response = api
@@ -15237,7 +15246,7 @@ mod tests {
         let api = AdminApi::new(
             admin_store.clone(),
             task_service,
-            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
             "http://harborbeacon.local:4174".to_string(),
         )
         .with_model_runtime_activation_handler(Arc::new(move |request| {
@@ -15746,7 +15755,7 @@ mod tests {
         let api = AdminApi::new(
             admin_store,
             task_service,
-            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
             "http://harborbeacon.local:4174".to_string(),
         );
 
@@ -15802,7 +15811,7 @@ mod tests {
         let api = AdminApi::new(
             admin_store,
             task_service,
-            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
             "http://harborbeacon.local:4174".to_string(),
         );
 
@@ -15865,7 +15874,7 @@ mod tests {
         let api = AdminApi::new(
             admin_store,
             task_service,
-            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
             "http://harborbeacon.local:4174".to_string(),
         );
 

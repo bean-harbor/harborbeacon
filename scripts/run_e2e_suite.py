@@ -507,7 +507,7 @@ def main() -> int:
 
     proof_pack_summary = {
         "live_status_summary": [
-            "HarborDesk live status stays separate from proof summary.",
+            "Harbor Assistant live status stays separate from proof summary.",
             f"route_order={' -> '.join(HARBOROS_ROUTE_ORDER)}",
             f"writable_root={config.mutation_root}",
         ],

@@ -1,4 +1,4 @@
-import { HarborDeskPageId } from './page-registry';
+import { HarborAssistantPageId } from './page-registry';
 
 export type PageKind = 'loading' | 'empty' | 'blocker' | 'success';
 export type MetricTone = 'neutral' | 'good' | 'warn' | 'danger';
@@ -1089,7 +1089,7 @@ export interface RuntimeAlignmentSummary {
 }
 
 export interface DeskPageModel {
-  pageId: HarborDeskPageId;
+  pageId: HarborAssistantPageId;
   title: string;
   eyebrow: string;
   summary: string;

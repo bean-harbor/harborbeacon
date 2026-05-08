@@ -6,5 +6,5 @@ import { appConfig } from './app/app.config';
 import { AppComponent } from './app/app.component';
 
 bootstrapApplication(AppComponent, appConfig).catch((error) => {
-  console.error('HarborDesk failed to bootstrap', error);
+  console.error('Harbor Assistant failed to bootstrap', error);
 });

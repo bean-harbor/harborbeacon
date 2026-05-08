@@ -12,7 +12,7 @@ def test_aiot_closeout_docs_lock_device_native_ownership() -> None:
     required_phrases = [
         "## Devices & AIoT Admin Summary",
         "This round is VLM-first. The device lane should make image, snapshot, still-frame, and DVR segment artifacts easy to ingest through the existing knowledge pipeline, while leaving audio transcript extraction as follow-up work.",
-        "This evidence pack is VLM-first: it treats image, snapshot, still-frame, clip, and local DVR segment artifacts as the first-version input surface for HarborDesk retrieval.",
+        "This evidence pack is VLM-first: it treats image, snapshot, still-frame, clip, and local DVR segment artifacts as the first-version input surface for Harbor Assistant retrieval.",
         "the Home Device Domain owns `camera.scan`, `camera.connect`, `camera.snapshot`, `camera.share_link` (`camera.live_view` stays a compatibility alias), `device.inspect`, and `device.control`",
         "snapshot stays media-only, share output stays a signed link artifact, inspect stays read-only, and control stays device-native",
         "the device lane owns snapshot and analyze-derived image evidence, while `discover`, `connect`, `inspect`, `control`, `ptz`, and `open_stream` stay runtime/control only",
@@ -25,7 +25,7 @@ def test_aiot_closeout_docs_lock_device_native_ownership() -> None:
         "retrieval evidence stays separate from runtime control",
         "HarborOS does not own device control",
         "the primary retrieval candidate is the persisted snapshot image plus its sidecar",
-        "image, snapshot, still-frame, and local DVR segment inputs are the first-version VLM surface for HarborDesk; video understanding uses keyframe sidecars",
+        "image, snapshot, still-frame, and local DVR segment inputs are the first-version VLM surface for Harbor Assistant; video understanding uses keyframe sidecars",
         "The Home Device Domain owns discovery, preview, share-link, inspect, and control actions in this shell.",
         "The UI keeps retrieval evidence separate from runtime control, and keeps device control separate from IM and HarborOS system control.",
         "Waiting for AIoT boundary summary from the admin-plane: owned device actions, non-regression notes, retrieval/control separation, and HarborOS non-ownership.",

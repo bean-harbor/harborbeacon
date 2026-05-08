@@ -29,7 +29,7 @@ struct Cli {
     admin_state: PathBuf,
     device_registry: PathBuf,
     conversations: PathBuf,
-    harbordesk_dist: PathBuf,
+    harbor_assistant_dist: PathBuf,
     public_origin: String,
     service_token: Option<String>,
 }
@@ -41,7 +41,7 @@ impl Default for Cli {
             admin_state: PathBuf::from(".harborbeacon/admin-console.json"),
             device_registry: PathBuf::from(".harborbeacon/device-registry.json"),
             conversations: PathBuf::from(".harborbeacon/task-api-conversations.json"),
-            harbordesk_dist: PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            harbor_assistant_dist: PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
             public_origin: "http://harborbeacon.local:4174".to_string(),
             service_token: None,
         }
@@ -86,13 +86,13 @@ impl Cli {
                 value if value.starts_with("--conversations=") => {
                     cli.conversations = PathBuf::from(value["--conversations=".len()..].to_string())
                 }
-                "--harbordesk-dist" => {
-                    cli.harbordesk_dist =
-                        PathBuf::from(take_value(&args, &mut index, "--harbordesk-dist"))
+                "--harbor-assistant-dist" => {
+                    cli.harbor_assistant_dist =
+                        PathBuf::from(take_value(&args, &mut index, "--harbor-assistant-dist"))
                 }
-                value if value.starts_with("--harbordesk-dist=") => {
-                    cli.harbordesk_dist =
-                        PathBuf::from(value["--harbordesk-dist=".len()..].to_string())
+                value if value.starts_with("--harbor-assistant-dist=") => {
+                    cli.harbor_assistant_dist =
+                        PathBuf::from(value["--harbor-assistant-dist=".len()..].to_string())
                 }
                 "--public-origin" => {
                     cli.public_origin = take_value(&args, &mut index, "--public-origin")
@@ -143,7 +143,7 @@ impl HarborBeaconService {
             admin_api: agent_hub_admin_api::AdminApi::new(
                 admin_store,
                 task_service.clone(),
-                cli.harbordesk_dist.clone(),
+                cli.harbor_assistant_dist.clone(),
                 cli.public_origin.clone(),
             )
             .with_model_runtime_activation_handler(model_runtime_activation),
@@ -421,6 +421,6 @@ fn fail(message: &str) -> ! {
 
 fn print_usage() {
     eprintln!(
-        "Usage: harborbeacon-service [--bind ADDR] [--admin-state PATH] [--device-registry PATH] [--conversations PATH] [--harbordesk-dist PATH] [--public-origin URL] [--service-token TOKEN]"
+        "Usage: harborbeacon-service [--bind ADDR] [--admin-state PATH] [--device-registry PATH] [--conversations PATH] [--harbor-assistant-dist PATH] [--public-origin URL] [--service-token TOKEN]"
     );
 }

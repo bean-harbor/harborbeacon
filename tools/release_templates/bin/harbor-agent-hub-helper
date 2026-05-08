@@ -260,6 +260,30 @@ def summarize_endpoint(name: str, url: str, response: dict[str, object]) -> dict
     return summary
 
 
+def media_tool_status(runtime_env: dict[str, str], env_key: str, command_name: str) -> dict[str, object]:
+    path_value = runtime_env.get(env_key, "").strip()
+    summary: dict[str, object] = {
+        "env": env_key,
+        "name": command_name,
+        "path": path_value,
+        "ok": False,
+    }
+    if not path_value:
+        summary["error"] = "not configured"
+        return summary
+    path = Path(path_value)
+    if not path.is_file():
+        summary["error"] = "not found"
+        return summary
+    result = run_command([path_value, "-version"])
+    if result.returncode != 0:
+        summary["error"] = (result.stderr or result.stdout or "version probe failed").strip()
+        return summary
+    summary["ok"] = True
+    summary["version"] = (result.stdout.splitlines() or [""])[0].strip()
+    return summary
+
+
 def gateway_auth_headers(runtime_env: dict[str, str]) -> dict[str, str]:
     headers = {"X-Contract-Version": runtime_env.get("IM_AGENT_CONTRACT_VERSION", DEFAULT_CONTRACT_VERSION)}
     token = (
@@ -416,6 +440,10 @@ def build_health_payload(runtime_env: dict[str, str], env_file: str) -> dict[str
         "release_version": runtime_env.get("HARBOR_RELEASE_VERSION", ""),
         "services": build_status_payload(runtime_env, env_file)["services"],
         "http_endpoints": endpoints,
+        "media_tools": {
+            "ffmpeg": media_tool_status(runtime_env, "HARBOR_FFMPEG_BIN", "ffmpeg"),
+            "ffprobe": media_tool_status(runtime_env, "HARBOR_FFPROBE_BIN", "ffprobe"),
+        },
         "gateway_status": gateway_summary,
         "weixin_runtime": weixin_summary,
     }

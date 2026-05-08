@@ -138,7 +138,7 @@ Current provider model:
 - cloud: controlled OpenAI-compatible fallback, currently preset as `llm-cloud-siliconflow`
 - model execution is a shared capability layer, not a HarborOS / AIoT / IM business domain
 - secrets are persisted server-side and returned through the admin API in redacted form; empty API key saves do not overwrite an existing endpoint secret
-- local model downloads prefer HarborDesk mirror input, then `HF_ENDPOINT`, then `https://hf-mirror.com`
+- local model downloads prefer Harbor Assistant mirror input, then `HF_ENDPOINT`, then `https://hf-mirror.com`
 
 Current defaults:
 
@@ -153,7 +153,7 @@ Runtime-truth rule:
 
 - `GET /api/feature-availability` is the grouped read-model for runtime truth, route policy, account management, and gateway status
 - local runtime truth from `/api/inference/healthz` may override stale stored endpoint projection for the built-in LLM/embedder rows
-- HarborDesk keeps `projection_mismatch` visible instead of silently flattening runtime truth back into stored admin state
+- Harbor Assistant keeps `projection_mismatch` visible instead of silently flattening runtime truth back into stored admin state
 - LLM fallback audit records selected endpoint, attempted endpoints, and fallback reason without logging plaintext keys or full sensitive prompts
 
 ## Executable CI Scaffold

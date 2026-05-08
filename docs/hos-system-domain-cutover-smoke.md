@@ -42,7 +42,7 @@ delivery, or device-native control.
 
 ## Admin Surface Summary
 
-Use these fields when a unified HarborDesk view needs one compact proof row:
+Use these fields when a unified Harbor Assistant view needs one compact proof row:
 
 - `action_summary`: `HarborOS service query proof`, `HarborOS files list proof`,
   `Approved HarborOS service restart`, `Approved HarborOS file copy`, or

@@ -10,12 +10,14 @@ Options:
   --install-root PATH    Exec-capable install root (default: /var/lib/harborbeacon-agent-ci)
   --writable-root PATH   HarborOS writable root (default: /mnt/software/harborbeacon-agent-ci when available; otherwise <install-root>/writable)
   --service-user USER    systemd service user (default: sudo caller)
-  --hostname NAME        Public hostname hint for HarborDesk (default: harborbeacon)
+  --hostname NAME        Public hostname hint for Harbor Assistant (default: harborbeacon)
   --env-file PATH        Environment file path (default: /etc/default/harborbeacon-agent-hub)
   --service-token TOKEN  Shared bearer token for HarborBeacon <-> HarborGate traffic
-  --public-origin URL    HarborDesk public origin override
+  --public-origin URL    Harbor Assistant public origin override
   --gateway-public-origin URL  HarborGate public origin override
   --skip-start           Install/update units but do not restart services
+  --allow-missing-media-tools
+                         Developer override: do not fail when bundled ffmpeg/ffprobe are absent
   -h, --help             Show help
 EOF
 }
@@ -85,6 +87,63 @@ resolve_ffprobe_bin() {
   return 1
 }
 
+media_tool_version_line() {
+  local label="$1"
+  local binary_path="$2"
+  if [[ ! -f "${binary_path}" ]]; then
+    echo "${label} not found: ${binary_path}" >&2
+    return 1
+  fi
+  if ! "${binary_path}" -version >/dev/null 2>&1; then
+    echo "${label} failed to execute: ${binary_path}" >&2
+    return 1
+  fi
+  "${binary_path}" -version | head -n 1
+}
+
+install_bundled_media_tools() {
+  local source_dir="${RELEASE_DIR}/media-tools/bin"
+  local target_dir="${RUNTIME_DIR}/media-tools/bin"
+  local ffmpeg_target="${target_dir}/ffmpeg"
+  local ffprobe_target="${target_dir}/ffprobe"
+
+  FFMPEG_BIN=""
+  FFPROBE_BIN=""
+
+  if [[ -f "${source_dir}/ffmpeg" && -f "${source_dir}/ffprobe" ]]; then
+    mkdir -p "${target_dir}"
+    cp "${source_dir}/ffmpeg" "${ffmpeg_target}"
+    cp "${source_dir}/ffprobe" "${ffprobe_target}"
+    chmod 0755 "${ffmpeg_target}" "${ffprobe_target}"
+    if media_tool_version_line ffmpeg "${ffmpeg_target}" >/dev/null \
+      && media_tool_version_line ffprobe "${ffprobe_target}" >/dev/null; then
+      FFMPEG_BIN="${ffmpeg_target}"
+      FFPROBE_BIN="${ffprobe_target}"
+      return 0
+    fi
+    if [[ "${ALLOW_MISSING_MEDIA_TOOLS}" -ne 1 ]]; then
+      echo "bundled media tools are present but not executable on this host" >&2
+      exit 1
+    fi
+    echo "warning: bundled media tools failed validation; continuing because --allow-missing-media-tools was set" >&2
+  elif [[ "${ALLOW_MISSING_MEDIA_TOOLS}" -ne 1 ]]; then
+    echo "bundle is missing required media-tools/bin/ffmpeg and media-tools/bin/ffprobe" >&2
+    echo "rebuild the release with bundled BtbN linux64-lgpl media tools or pass --allow-missing-media-tools for a dev-only install" >&2
+    exit 1
+  else
+    echo "warning: bundled media tools are absent; continuing because --allow-missing-media-tools was set" >&2
+  fi
+
+  FFMPEG_BIN="$(resolve_ffmpeg_bin \
+    "${EXISTING_FFMPEG_BIN}" \
+    "${INSTALL_ROOT}/runtime/media-tools/bin/ffmpeg" \
+    "${WRITABLE_ROOT}/media-tools/bin/ffmpeg" || true)"
+  FFPROBE_BIN="$(resolve_ffprobe_bin \
+    "${EXISTING_FFPROBE_BIN}" \
+    "${INSTALL_ROOT}/runtime/media-tools/bin/ffprobe" \
+    "${WRITABLE_ROOT}/media-tools/bin/ffprobe" || true)"
+}
+
 DEFAULT_INSTALL_ROOT="/var/lib/harborbeacon-agent-ci"
 INSTALL_ROOT="${DEFAULT_INSTALL_ROOT}"
 WRITABLE_ROOT=""
@@ -95,6 +154,7 @@ SERVICE_TOKEN=""
 PUBLIC_ORIGIN=""
 GATEWAY_PUBLIC_ORIGIN=""
 SKIP_START=0
+ALLOW_MISSING_MEDIA_TOOLS=0
 BUNDLE_PATH=""
 INSTALL_ROOT_SET=0
 WRITABLE_ROOT_SET=0
@@ -153,6 +213,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-start)
       SKIP_START=1
+      shift
+      ;;
+    --allow-missing-media-tools)
+      ALLOW_MISSING_MEDIA_TOOLS=1
       shift
       ;;
     -h|--help)
@@ -289,15 +353,6 @@ else
   MODEL_CACHE_DIR="${WRITABLE_ROOT}/models"
 fi
 
-FFMPEG_BIN="$(resolve_ffmpeg_bin \
-  "${EXISTING_FFMPEG_BIN}" \
-  "${INSTALL_ROOT}/runtime/media-tools/bin/ffmpeg" \
-  "${WRITABLE_ROOT}/media-tools/bin/ffmpeg" || true)"
-FFPROBE_BIN="$(resolve_ffprobe_bin \
-  "${EXISTING_FFPROBE_BIN}" \
-  "${INSTALL_ROOT}/runtime/media-tools/bin/ffprobe" \
-  "${WRITABLE_ROOT}/media-tools/bin/ffprobe" || true)"
-
 SERVICE_TOKEN="${SERVICE_TOKEN:-${HARBOR_TASK_API_BEARER_TOKEN:-${HARBORGATE_BEARER_TOKEN:-${IM_AGENT_SERVICE_TOKEN:-}}}}"
 if [[ -z "${SERVICE_TOKEN}" ]]; then
   SERVICE_TOKEN="$(random_token)"
@@ -327,6 +382,8 @@ mkdir -p \
 rm -rf "${RELEASE_DIR}"
 mkdir -p "${RELEASE_DIR}"
 cp -R "${BUNDLE_DIR}/." "${RELEASE_DIR}/"
+
+install_bundled_media_tools
 
 rm -f "${CURRENT_LINK}"
 ln -sfn "${RELEASE_DIR}" "${CURRENT_LINK}"
@@ -371,12 +428,22 @@ append_optional_env() {
   fi
 }
 
+append_required_env() {
+  local key="$1"
+  local value="${2:-}"
+  if [[ -z "${value}" ]]; then
+    echo "missing required env value for ${key}" >&2
+    exit 1
+  fi
+  printf '%s=%s\n' "${key}" "${value}" >> "${ENV_FILE}"
+}
+
 cat > "${ENV_FILE}" <<EOF
-# HarborBeacon / HarborDesk / HarborGate release runtime
+# HarborBeacon / Harbor Assistant / HarborGate release runtime
 WORKSPACE_ROOT=${CURRENT_LINK}
 HARBOR_HTTP_BIND=0.0.0.0:4174
 HARBOR_PUBLIC_ORIGIN=${PUBLIC_ORIGIN}
-HARBORDESK_DIST=${CURRENT_LINK}/harbordesk/dist/harbordesk
+HARBOR_ASSISTANT_DIST=${CURRENT_LINK}/harbor-assistant/dist/harbor-assistant
 HARBOR_HARBOROS_USER=${HARBOROS_PRINCIPAL}
 HARBOR_HARBOROS_WRITABLE_ROOT=${WRITABLE_ROOT}
 HARBOR_KNOWLEDGE_INDEX_ROOT=${EXISTING_KNOWLEDGE_INDEX_ROOT:-${WRITABLE_ROOT}/knowledge-index}
@@ -433,8 +500,13 @@ append_optional_env "WEIXIN_ACCOUNT_ID" "${EXISTING_WEIXIN_ACCOUNT_ID}"
 append_optional_env "WEIXIN_BOT_TOKEN" "${EXISTING_WEIXIN_BOT_TOKEN}"
 append_optional_env "WEIXIN_BASE_URL" "${EXISTING_WEIXIN_BASE_URL}"
 append_optional_env "WEIXIN_USER_ID" "${EXISTING_WEIXIN_USER_ID}"
-append_optional_env "HARBOR_FFMPEG_BIN" "${FFMPEG_BIN}"
-append_optional_env "HARBOR_FFPROBE_BIN" "${FFPROBE_BIN}"
+if [[ "${ALLOW_MISSING_MEDIA_TOOLS}" -eq 1 ]]; then
+  append_optional_env "HARBOR_FFMPEG_BIN" "${FFMPEG_BIN}"
+  append_optional_env "HARBOR_FFPROBE_BIN" "${FFPROBE_BIN}"
+else
+  append_required_env "HARBOR_FFMPEG_BIN" "${FFMPEG_BIN}"
+  append_required_env "HARBOR_FFPROBE_BIN" "${FFPROBE_BIN}"
+fi
 append_optional_env "HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID" "${EXISTING_MODEL_API_CANDLE_CHAT_MODEL_ID}"
 append_optional_env "HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID" "${EXISTING_MODEL_API_CANDLE_EMBEDDING_MODEL_ID}"
 append_optional_env "HARBOR_MODEL_API_CANDLE_CACHE_DIR" "${EXISTING_MODEL_API_CANDLE_CACHE_DIR}"
@@ -477,6 +549,7 @@ echo "Model cache  : ${MODEL_CACHE_DIR}"
 echo "Current link : ${CURRENT_LINK}"
 echo "Env file     : ${ENV_FILE}"
 echo "Service user : ${SERVICE_USER}"
+echo "Media tools  : ffmpeg=${FFMPEG_BIN:-missing} ffprobe=${FFPROBE_BIN:-missing}"
 echo "Core services: ${CORE_SERVICE_STATUS}"
 echo "Legacy units : disabled/removed (${LEGACY_SERVICES[*]})"
 echo "Helper       : ${STATUS_HELPER_LINK}"

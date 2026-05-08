@@ -3,9 +3,9 @@ import re
 from conftest import read_doc
 
 
-def test_rag_admin_endpoints_are_exposed_by_backend_and_harbordesk() -> None:
+def test_rag_admin_endpoints_are_exposed_by_backend_and_harbor_assistant() -> None:
     backend = read_doc("src/bin/agent_hub_admin_api.rs")
-    service = read_doc("frontend/harbordesk/src/app/core/admin-api.service.ts")
+    service = read_doc("frontend/harbor-assistant/src/app/core/admin-api.service.ts")
 
     required_routes = [
         ("GET", "/api/rag/readiness"),
@@ -26,11 +26,11 @@ def test_rag_admin_endpoints_are_exposed_by_backend_and_harbordesk() -> None:
     assert "/cancel`" in service
 
 
-def test_camera_dvr_admin_endpoints_are_exposed_by_backend_and_harbordesk() -> None:
+def test_camera_dvr_admin_endpoints_are_exposed_by_backend_and_harbor_assistant() -> None:
     backend = read_doc("src/bin/agent_hub_admin_api.rs")
-    service = read_doc("frontend/harbordesk/src/app/core/admin-api.service.ts")
-    types = read_doc("frontend/harbordesk/src/app/core/admin-api.types.ts")
-    panel = read_doc("frontend/harbordesk/src/app/shared/page-state-panel.component.html")
+    service = read_doc("frontend/harbor-assistant/src/app/core/admin-api.service.ts")
+    types = read_doc("frontend/harbor-assistant/src/app/core/admin-api.types.ts")
+    panel = read_doc("frontend/harbor-assistant/src/app/shared/page-state-panel.component.html")
 
     required_backend_routes = [
         "/api/cameras/recording-settings",
@@ -90,8 +90,8 @@ def test_camera_dvr_sidecars_reuse_multimodal_rag_boundary() -> None:
         assert action in camera_skill
 
 
-def test_harbordesk_admin_service_uses_same_origin_beacon_api_only() -> None:
-    service = read_doc("frontend/harbordesk/src/app/core/admin-api.service.ts")
+def test_harbor_assistant_admin_service_uses_same_origin_beacon_api_only() -> None:
+    service = read_doc("frontend/harbor-assistant/src/app/core/admin-api.service.ts")
 
     direct_calls = re.findall(r"this\.http\.(?:get|post|put|delete)<", service)
     literal_calls = re.findall(
@@ -113,14 +113,14 @@ def test_harbordesk_admin_service_uses_same_origin_beacon_api_only() -> None:
     assert "this.http.get<" in service
     assert "private apiUrl(path: string): string" in service
     assert "private resolveApiBase(): string" in service
-    assert "'/api/harbordesk' : '/api'" in service
+    assert "'/api/harbor-assistant' : '/api'" in service
     assert "http://" not in service
     assert "https://" not in service
 
 
-def test_harbordesk_index_run_copy_preserves_async_job_boundary() -> None:
-    component = read_doc("frontend/harbordesk/src/app/pages/desk-page.component.ts")
-    panel = read_doc("frontend/harbordesk/src/app/shared/page-state-panel.component.html")
+def test_harbor_assistant_index_run_copy_preserves_async_job_boundary() -> None:
+    component = read_doc("frontend/harbor-assistant/src/app/pages/desk-page.component.ts")
+    panel = read_doc("frontend/harbor-assistant/src/app/shared/page-state-panel.component.html")
 
     message_body = component.split("private knowledgeIndexRunMessage", 1)[1].split(
         "private runDeviceAction", 1

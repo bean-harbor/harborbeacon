@@ -818,9 +818,9 @@ def slide_seven(prs: Presentation):
         Inches(3.9),
         Inches(11.6),
         Inches(1.45),
-        "HarborDesk / WebUI / live pages",
+        "Harbor Assistant / WebUI / live pages",
         [
-            "HarborDesk、绑定页、live view、share page 都属于产品面；它们负责展示、配置和交互，任务状态和审批链继续回到同一套 runtime 里。",
+            "Harbor Assistant、绑定页、live view、share page 都属于产品面；它们负责展示、配置和交互，任务状态和审批链继续回到同一套 runtime 里。",
         ],
         accent=NAVY,
         body_size=12,

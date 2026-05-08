@@ -547,7 +547,7 @@ fn request_policy_blocker(request: &KnowledgeSearchRequest) -> Option<String> {
         && request.privacy_level == PrivacyLevel::StrictLocal
     {
         return Some(
-            "resource_profile=cloud_allowed 与 workspace strict_local 隐私策略冲突；请先在 HarborDesk 明确启用可审计的云策略。"
+            "resource_profile=cloud_allowed 与 workspace strict_local 隐私策略冲突；请先在 Harbor Assistant 明确启用可审计的云策略。"
                 .to_string(),
         );
     }
@@ -667,7 +667,7 @@ fn knowledge_index_service(index_root: Option<&str>) -> Result<KnowledgeIndexSer
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }) else {
-        return Err("请先在 HarborDesk 配置 knowledge.index_root，再运行知识库检索。".to_string());
+        return Err("请先在 Harbor Assistant 配置 knowledge.index_root，再运行知识库检索。".to_string());
     };
     KnowledgeIndexService::from_config(KnowledgeIndexConfig::new(PathBuf::from(index_root))?)
 }
@@ -797,7 +797,7 @@ fn resolve_roots(
         .collect::<Vec<_>>();
 
     if configured.is_empty() {
-        return Err("请先在 HarborDesk 配置并启用至少一个知识源目录。".to_string());
+        return Err("请先在 Harbor Assistant 配置并启用至少一个知识源目录。".to_string());
     }
 
     let requested = request_roots
@@ -817,7 +817,7 @@ fn resolve_roots(
                 .any(|configured_root| path_is_same_or_inside(&requested_root, configured_root));
             if !inside_configured {
                 return Err(format!(
-                    "请求的知识源目录未在 HarborDesk 启用，不能扩权检索：{requested_root}"
+                    "请求的知识源目录未在 Harbor Assistant 启用，不能扩权检索：{requested_root}"
                 ));
             }
             allowed.push(requested_root);
@@ -838,7 +838,7 @@ fn resolve_roots(
 
     if roots.is_empty() {
         return Err(
-            "未找到可检索的已配置知识源目录；请先通过 HarborDesk 配置并确认目录存在。".to_string(),
+            "未找到可检索的已配置知识源目录；请先通过 Harbor Assistant 配置并确认目录存在。".to_string(),
         );
     }
 

@@ -2,7 +2,7 @@
 
 ## What AIoT Produces
 
-- This evidence pack is VLM-first: it treats image, snapshot, still-frame, clip, and local DVR segment artifacts as the first-version input surface for HarborDesk retrieval.
+- This evidence pack is VLM-first: it treats image, snapshot, still-frame, clip, and local DVR segment artifacts as the first-version input surface for Harbor Assistant retrieval.
 - release-v1 extends that same file-oriented evidence model to rolling video segments, but retrieval still uses keyframes and sidecars rather than a DVR-specific model chain.
 - a stable snapshot image path under `.harborbeacon/vision/snapshots/<device>-<timestamp>.jpg`
 - a stable JSON sidecar next to that image file
@@ -61,7 +61,7 @@ Framework retrieval should treat the snapshot image and its sidecar as the
 primary citation candidate, and the annotated image as a secondary preview or
 derived citation candidate when present.
 
-For HarborDesk, this stays the first-version VLM input path: image, snapshot,
+For Harbor Assistant, this stays the first-version VLM input path: image, snapshot,
 still-frame, clip, and DVR segment evidence are in scope. Rolling video is
 represented as media artifacts with keyframe-derived retrieval evidence, not as
 a separate continuous-video model stack.

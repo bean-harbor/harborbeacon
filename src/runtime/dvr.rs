@@ -178,7 +178,7 @@ impl DvrRuntime {
     ) -> Result<DvrRecordingStatus, String> {
         let settings = sanitize_dvr_recording_settings(settings.clone());
         if !settings.continuous_recording_enabled {
-            return Err("continuous DVR recording is disabled in HarborDesk settings".to_string());
+            return Err("continuous DVR recording is disabled in Harbor Assistant settings".to_string());
         }
         let ffmpeg_bin = resolve_ffmpeg_bin().ok_or_else(|| {
             format!(

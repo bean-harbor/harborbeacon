@@ -9,10 +9,10 @@
 > 协作术语统一以 `HarborBeacon-Harbor-Collaboration-Contract-v2` 与 `harbor-*` lane 命名为准。
 >
 > 当前进展快照（2026-04-30）
-> 已合并：HarborBeacon v2.0 turn core、MMRAG/knowledge search/preview、VLM sidecar packaging、HarborDesk validation/docs、HarborGate v2.0 delivery guard、HarborNAS WebUI HarborDesk/HarborBot native pages。
+> 已合并：HarborBeacon v2.0 turn core、MMRAG/knowledge search/preview、VLM sidecar packaging、Harbor Assistant validation/docs、HarborGate v2.0 delivery guard、HarborNAS WebUI Harbor Assistant/Search native pages。
 > 已部署：`.82` post-merge RC2
 > `20260430-rc2-beacona5f6da0-gate57ff759`。
-> 已验证：`/ui/harbordesk`、`/ui/harborbot`、knowledge search/preview、protected
+> 已验证：`/ui/harbor-assistant`、`/ui/harbor-assistant?tab=search`、knowledge search/preview、protected
 > `POST /api/web/turns` content retrieval and local-first architecture explanation；
 > `/api/turns` 仅作为 deprecated alias 保留。
 > 下一阶段：先补 release evidence/rollback notes，再推进 local model promotion
@@ -36,7 +36,7 @@
 - Home Agent Hub 已验证出的 artifact / event / long-running task / 补参机制，后续应反哺平台抽象
 - 模型能力按共享能力层治理，不再把 Candle、sidecar、Mistral 或 SiliconFlow 各自写成业务域；统一通过 Model Center endpoint + route policy 决策。
 - 当前模型路线保持 local-first；云端 fallback 只进入 `semantic.router` 与 `retrieval.answer`，并要求 endpoint redaction、attempt audit 和 policy gate。
-- Hugging Face 模型下载走 mirror-aware download job：HarborDesk 输入 mirror 优先，其次 `HF_ENDPOINT`，最后默认 `https://hf-mirror.com`。
+- Hugging Face 模型下载走 mirror-aware download job：Harbor Assistant 输入 mirror 优先，其次 `HF_ENDPOINT`，最后默认 `https://hf-mirror.com`。
 
 执行优先级强约束:
 
@@ -252,7 +252,7 @@ P0:
 
 P1:
 
-1. Harden HarborDesk and HarborBot as product surfaces while keeping them on real `/api/harbordesk/*` APIs.
+1. Harden Harbor Assistant and Search as product surfaces while keeping them on real `/api/harbor-assistant/*` APIs.
 2. Extend release packaging toward HarborNAS ISO integration without changing the v2.0 public contract.
 3. Add local-first observability: fallback ratio, local/backend readiness, policy decision evidence, and failed-promotion reasons.
 

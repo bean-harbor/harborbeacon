@@ -6,14 +6,14 @@ This watchlist is for the Home Device Domain cutover day. It keeps camera
 journeys observable without widening into IM transport or HarborOS system
 control.
 
-This round is VLM-first for the HarborDesk device page: image, snapshot,
+This round is VLM-first for the Harbor Assistant device page: image, snapshot,
 still-frame, and local DVR segment inputs are first-version surfaces. Continuous
 video is stored as low-bitrate rolling segments and indexed through keyframe
 sidecars, not through a DVR-specific model chain.
 
 Release-v1 adds local DVR capture as media artifacts, but the device lane must
 continue to express it through the existing recording policy, camera profile,
-and HarborDesk DVR settings records rather than a new use-case profile object.
+and Harbor Assistant DVR settings records rather than a new use-case profile object.
 
 ## Devices & AIoT Admin Summary
 
@@ -25,7 +25,7 @@ and HarborDesk DVR settings records rather than a new use-case profile object.
   stays a signed link artifact, inspect stays read-only, and control stays
   device-native.
 - DVR watch: release-v1 surfaces segment length, retention, stream kind, and
-  keyframe hints; HarborDesk continues to use the existing recording policy,
+  keyframe hints; Harbor Assistant continues to use the existing recording policy,
   camera profile records, and DVR settings.
 - Non-regression: `route_key` stays opaque routing metadata, `resume_token`
   stays business-flow continuation, camera control never becomes HarborOS
@@ -38,7 +38,7 @@ and HarborDesk DVR settings records rather than a new use-case profile object.
 - explicit coverage for `discover`, `snapshot`, `share_link`, `inspect`, and
   `control` while staying inside the device domain
 - snapshot, live view share (`camera.share_link`, with `camera.live_view` accepted as a compatibility alias), and analyze flows where the current codebase supports them
-- image, snapshot, still-frame, and local DVR segment inputs are the first-version VLM surface for HarborDesk; video understanding uses keyframe sidecars
+- image, snapshot, still-frame, and local DVR segment inputs are the first-version VLM surface for Harbor Assistant; video understanding uses keyframe sidecars
 - media/control separation in the device runtime
 - legacy fallback when `route_key` is absent
 
@@ -104,7 +104,7 @@ Date: 2026-04-19
 Boundary proof:
 
 - `discover`, `snapshot`, `share_link`, `inspect`, and `control` stay owned by the Home Device Domain.
-- HarborDesk's device page treats image, snapshot, still-frame, and DVR segment inputs as the first-version VLM surface.
+- Harbor Assistant's device page treats image, snapshot, still-frame, and DVR segment inputs as the first-version VLM surface.
 - short clips and rolling DVR segments stay media artifacts with keyframe-derived retrieval evidence, not a separate continuous-video model stack.
 - `camera.share_link` remains the canonical device-lane action; `camera.live_view` stays a compatibility alias only.
 - `inspect` stays read-only and device-owned.

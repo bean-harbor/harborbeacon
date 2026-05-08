@@ -1,6 +1,6 @@
 import { prefersChineseUi } from './ui-locale';
 
-export type HarborDeskPageId =
+export type HarborAssistantPageId =
   | 'overview'
   | 'im-gateway'
   | 'account-management'
@@ -10,8 +10,8 @@ export type HarborDeskPageId =
   | 'models-policies'
   | 'system-settings';
 
-export interface HarborDeskPageDefinition {
-  id: HarborDeskPageId;
+export interface HarborAssistantPageDefinition {
+  id: HarborAssistantPageId;
   path: string;
   label: string;
   labelZh: string;
@@ -20,7 +20,7 @@ export interface HarborDeskPageDefinition {
   accent: 'teal' | 'amber' | 'sky' | 'rose';
 }
 
-export const HARBORDESK_PAGES: readonly HarborDeskPageDefinition[] = [
+export const HARBOR_ASSISTANT_PAGES: readonly HarborAssistantPageDefinition[] = [
   { id: 'overview', path: 'overview', label: 'Overview', labelZh: '总览', tagline: 'Release readiness and status digest', taglineZh: '发布 readiness 与状态摘要', accent: 'teal' },
   { id: 'im-gateway', path: 'im-gateway', label: 'IM Gateway', labelZh: 'IM 网关', tagline: 'Bridge state and source-bound delivery', taglineZh: '微信、飞书与回传状态', accent: 'sky' },
   { id: 'account-management', path: 'account-management', label: 'Account Management', labelZh: '账号与通知', tagline: 'Members, roles, and binding availability', taglineZh: '成员、角色与通知目标', accent: 'amber' },
@@ -31,17 +31,17 @@ export const HARBORDESK_PAGES: readonly HarborDeskPageDefinition[] = [
   { id: 'system-settings', path: 'system-settings', label: 'System Settings', labelZh: '系统设置', tagline: 'Routing, gateway status, and blockers', taglineZh: '路由、网关状态与阻塞项', accent: 'rose' }
 ] as const;
 
-export function pageById(pageId: HarborDeskPageId): HarborDeskPageDefinition {
-  const page = HARBORDESK_PAGES.find((candidate) => candidate.id === pageId);
+export function pageById(pageId: HarborAssistantPageId): HarborAssistantPageDefinition {
+  const page = HARBOR_ASSISTANT_PAGES.find((candidate) => candidate.id === pageId);
   if (!page) {
-    throw new Error(`Unknown HarborDesk page id: ${pageId}`);
+    throw new Error(`Unknown Harbor Assistant page id: ${pageId}`);
   }
   return page;
 }
 
-export function localizedHarborDeskPages(): HarborDeskPageDefinition[] {
+export function localizedHarborAssistantPages(): HarborAssistantPageDefinition[] {
   const useChinese = prefersChineseUi();
-  return HARBORDESK_PAGES.map((page) => ({
+  return HARBOR_ASSISTANT_PAGES.map((page) => ({
     ...page,
     label: useChinese ? page.labelZh : page.label,
     tagline: useChinese ? page.taglineZh : page.tagline

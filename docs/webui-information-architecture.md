@@ -1,10 +1,10 @@
-# HarborDesk Information Architecture
+# Harbor Assistant Information Architecture
 
 更新时间：2026-04-19
 
 ## 1. 设计原则
 
-- HarborDesk 是 HarborBeacon 的统一管理壳，不拆成单独前端仓库或框架
+- Harbor Assistant 是 HarborBeacon 的统一管理壳，不拆成单独前端仓库或框架
 - 一套 WebUI 贯穿 HarborGate、HarborBeacon、HarborOS 和 AIoT
 - 第一屏优先展示真实状态、审批、账户、设备和系统边界
 - 如果后端能力还没落位，UI 保持 wiring-ready，并明确标注 blocker
@@ -46,7 +46,7 @@
 - `Account Management` 里的 proactive delivery default 以成员粒度展示，binding availability 只能反映后端提供的可绑定状态
 - `Tasks & Approvals` 里的回复与投递失败是不同信号源，前端不能把它们合并成单一“通知结果”
 - `Models & Policies` 必须把 endpoint status/test result/kind/provider/route policy/fallback order、SiliconFlow API key 输入、HF mirror URL 输入放在同一页的清晰操作位里，而不是散落成静态说明
-- HarborDesk 不把 cloud fallback 展示成默认架构；UI 文案必须保持 local-first，并明确云端只进入 `semantic.router` / `retrieval.answer` 的受控 fallback。
+- Harbor Assistant 不把 cloud fallback 展示成默认架构；UI 文案必须保持 local-first，并明确云端只进入 `semantic.router` / `retrieval.answer` 的受控 fallback。
 
 ## 6. 共享能力
 
@@ -57,6 +57,6 @@
 
 ## 7. 交付与构建
 
-- HarborDesk Angular workspace 位于 `frontend/harbordesk`
+- Harbor Assistant Angular workspace 位于 `frontend/harbor-assistant`
 - 开发态通过 `proxy.conf.json` 将 `/api` 代理到本机同源 admin API
-- 生产构建输出目录为 `frontend/harbordesk/dist/harbordesk`
+- 生产构建输出目录为 `frontend/harbor-assistant/dist/harbor-assistant`

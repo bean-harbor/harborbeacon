@@ -1,0 +1,201 @@
+name: HarborOS Deb Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release/deb version seed. Defaults to <ref>-<sha>."
+        required: false
+        type: string
+      harborgate_ref:
+        description: "Optional HarborGate ref to package with this HarborBeacon build."
+        required: false
+        type: string
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - "v*"
+      - "harbor-release-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout HarborBeacon
+        uses: actions/checkout@v4
+        with:
+          path: HarborBeacon
+
+      - name: Checkout HarborGate
+        uses: actions/checkout@v4
+        with:
+          repository: HarborNAS/HarborGate
+          path: HarborGate
+          token: ${{ secrets.HARBORNAS_GITHUB_TOKEN || github.token }}
+
+      - name: Select HarborGate ref
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.harborgate_ref != '' }}
+        working-directory: HarborGate
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "${{ inputs.harborgate_ref }}"
+          git checkout --detach FETCH_HEAD
+
+      - name: Derive release version
+        id: version
+        env:
+          INPUT_RELEASE_VERSION: ${{ inputs.release_version || '' }}
+        run: |
+          set -euo pipefail
+          raw="${INPUT_RELEASE_VERSION:-}"
+          if [[ -z "${raw}" ]]; then
+            raw="${GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+          fi
+          safe="$(python3 - "${raw}" <<'PY'
+          import re
+          import sys
+
+          raw = sys.argv[1].strip()
+          safe = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("._-")
+          print(safe or "snapshot")
+          PY
+          )"
+          echo "release_version=${safe}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install package build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            dpkg-dev \
+            file \
+            git \
+            gzip \
+            jq \
+            pkg-config \
+            python3 \
+            python3-pip \
+            tar \
+            xz-utils
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: HarborBeacon/frontend/harbor-assistant/package-lock.json
+
+      - name: Cache cargo builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            HarborBeacon/target
+            HarborGate/target
+          key: ${{ runner.os }}-harbor-release-${{ hashFiles('HarborBeacon/Cargo.lock', 'HarborGate/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-harbor-release-
+
+      - name: Build release bundle
+        working-directory: HarborBeacon
+        env:
+          HARBORGATE_REPO: ${{ github.workspace }}/HarborGate
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          OUT_DIR: ${{ github.workspace }}/artifacts/release-bundles
+          RUST_TARGET: x86_64-unknown-linux-musl
+          BOOTSTRAP_BUILDER_IF_NEEDED: "1"
+        run: |
+          set -euo pipefail
+          bash ./tools/build_release_bundle.sh
+
+      - name: Verify release bundle
+        working-directory: HarborBeacon
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          OUT_DIR: ${{ github.workspace }}/artifacts/release-bundles
+        run: |
+          set -euo pipefail
+          python3 ./tools/verify_release_bundle.py \
+            "${OUT_DIR}/harbor-release-${RELEASE_VERSION}.tar.gz" \
+            --require-execute
+
+      - name: Build deb package
+        working-directory: HarborBeacon
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          BUNDLE_DIR: ${{ github.workspace }}/artifacts/release-bundles
+          DEB_DIR: ${{ github.workspace }}/artifacts/deb
+        run: |
+          set -euo pipefail
+          bash ./tools/build_harboros_deb.sh \
+            --bundle "${BUNDLE_DIR}/harbor-release-${RELEASE_VERSION}.tar.gz" \
+            --output-dir "${DEB_DIR}" \
+            --version "${RELEASE_VERSION}"
+
+      - name: Upload deb package
+        uses: actions/upload-artifact@v4
+        with:
+          name: harborbeacon-harboros-deb-${{ steps.version.outputs.release_version }}
+          path: |
+            artifacts/deb/*.deb
+            artifacts/deb/*.deb.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: harborbeacon-release-bundle-${{ steps.version.outputs.release_version }}
+          path: |
+            artifacts/release-bundles/harbor-release-*.tar.gz
+            artifacts/release-bundles/harbor-release-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Optional R2 deb upload
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          HARBOROS_R2_ENDPOINT: ${{ vars.HARBOROS_R2_ENDPOINT || '' }}
+          HARBOROS_R2_BUCKET: ${{ vars.HARBOROS_R2_BUCKET || 'harboros-update' }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" != "workflow_dispatch" && "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "Skipping R2 upload for non-tag push."
+            exit 0
+          fi
+          if [[ -z "${AWS_ACCESS_KEY_ID:-}" || -z "${AWS_SECRET_ACCESS_KEY:-}" || -z "${HARBOROS_R2_ENDPOINT:-}" || -z "${HARBOROS_R2_BUCKET:-}" ]]; then
+            echo "Skipping R2 upload; R2 credentials or bucket vars are not configured."
+            exit 0
+          fi
+          python3 -m pip install --user awscli
+          for artifact in artifacts/deb/*.deb artifacts/deb/*.deb.sha256; do
+            [[ -f "${artifact}" ]] || continue
+            "${HOME}/.local/bin/aws" s3api put-object \
+              --endpoint-url "${HARBOROS_R2_ENDPOINT}" \
+              --bucket "${HARBOROS_R2_BUCKET}" \
+              --key "deb/$(basename "${artifact}")" \
+              --body "${artifact}"
+          done

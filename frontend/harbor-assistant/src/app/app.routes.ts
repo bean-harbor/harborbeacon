@@ -1,15 +1,15 @@
 import { Routes } from '@angular/router';
 
-import { HARBORDESK_PAGES } from './core/page-registry';
+import { HARBOR_ASSISTANT_PAGES } from './core/page-registry';
 import { DeskPageComponent } from './pages/desk-page.component';
 
 export const routes: Routes = [
   {
     path: '',
     pathMatch: 'full',
-    redirectTo: HARBORDESK_PAGES[0].path
+    redirectTo: HARBOR_ASSISTANT_PAGES[0].path
   },
-  ...HARBORDESK_PAGES.map((page) => ({
+  ...HARBOR_ASSISTANT_PAGES.map((page) => ({
     path: page.path,
     component: DeskPageComponent,
     data: {
@@ -18,6 +18,6 @@ export const routes: Routes = [
   })),
   {
     path: '**',
-    redirectTo: HARBORDESK_PAGES[0].path
+    redirectTo: HARBOR_ASSISTANT_PAGES[0].path
   }
 ];

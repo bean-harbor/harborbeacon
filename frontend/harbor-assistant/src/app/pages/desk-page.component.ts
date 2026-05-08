@@ -22,8 +22,8 @@ import {
   RtspCheckResult,
   StartLocalModelDownloadRequest
 } from '../core/admin-api.types';
-import { HarborDeskAdminApiService } from '../core/admin-api.service';
-import { HarborDeskPageId } from '../core/page-registry';
+import { HarborAssistantAdminApiService } from '../core/admin-api.service';
+import { HarborAssistantPageId } from '../core/page-registry';
 import { uiText } from '../core/ui-locale';
 import { PageStatePanelComponent } from '../shared/page-state-panel.component';
 
@@ -89,7 +89,7 @@ import { PageStatePanelComponent } from '../shared/page-state-panel.component';
 })
 export class DeskPageComponent implements OnDestroy {
   private readonly route = inject(ActivatedRoute);
-  private readonly api = inject(HarborDeskAdminApiService);
+  private readonly api = inject(HarborAssistantAdminApiService);
   private readonly refresh$ = new BehaviorSubject(0);
 
   protected savingMemberId: string | null = null;
@@ -119,7 +119,7 @@ export class DeskPageComponent implements OnDestroy {
   protected knowledgePreviewError: string | null = null;
 
   protected readonly state$ = combineLatest([this.route.data, this.refresh$]).pipe(
-    switchMap(([data]) => this.api.observePage(data['pageId'] as HarborDeskPageId))
+    switchMap(([data]) => this.api.observePage(data['pageId'] as HarborAssistantPageId))
   );
 
   protected updateDefaultDeliverySurface(userId: string, surface: DeliverySurface): void {
@@ -362,7 +362,7 @@ export class DeskPageComponent implements OnDestroy {
     this.saveError = null;
     this.saveSuccess = null;
     this.api
-      .runDeviceValidation(deviceId, { scope: 'all', reason: 'harbordesk-devices-aiot' })
+      .runDeviceValidation(deviceId, { scope: 'all', reason: 'harbor-assistant-camera' })
       .pipe(
         tap((result) => {
           const message = result.summary ?? this.text('Device validation run accepted.', '设备验收运行请求已接收。');
@@ -394,7 +394,7 @@ export class DeskPageComponent implements OnDestroy {
     this.saveError = null;
     this.saveSuccess = null;
     this.api
-      .runReleaseReadiness({ scope: 'all', reason: 'harbordesk-overview' })
+      .runReleaseReadiness({ scope: 'all', reason: 'harbor-assistant-overview' })
       .pipe(
         tap((result) => {
           this.saveSuccess = result.summary || this.text('Release readiness run accepted.', '发布 readiness 运行请求已接收。');

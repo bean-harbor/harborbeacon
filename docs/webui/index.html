@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>HarborDesk</title>
+    <title>Harbor Assistant</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
@@ -13,7 +13,7 @@
         <div class="brand">
           <div class="brand-badge">HD</div>
           <div>
-            <p class="eyebrow">HarborDesk</p>
+            <p class="eyebrow">Harbor Assistant</p>
             <h1>Unified Admin Shell</h1>
           </div>
         </div>
@@ -57,10 +57,10 @@
         <section class="workspace-section active" data-view-section="overview">
           <header class="hero">
             <div class="hero-copy">
-              <p class="eyebrow">HarborDesk Overview</p>
+              <p class="eyebrow">Harbor Assistant Overview</p>
               <h2>One release shell for HarborGate, HarborBeacon, HarborOS, and AIoT.</h2>
               <p class="hero-text">
-                HarborDesk is the unified admin surface for binding, account governance, task
+                Harbor Assistant is the unified admin surface for binding, account governance, task
                 approvals, device operations, policy defaults, and system settings. The product is
                 intentionally release-oriented: the UI exposes real state, surfaces backend gaps,
                 and keeps day-to-day operator work in one place.
@@ -114,7 +114,7 @@
               <div class="panel-header">
                 <div>
                   <p class="eyebrow">Overview / Operating Model</p>
-                  <h3>What HarborDesk is responsible for</h3>
+                  <h3>What Harbor Assistant is responsible for</h3>
                 </div>
                 <span class="status-chip">Unified control plane</span>
               </div>
@@ -167,20 +167,20 @@
               <article class="subpanel qr-panel">
                 <div class="subpanel-head">
                   <h4>Mobile setup QR</h4>
-                  <span class="subpanel-note">Open the same HarborDesk shell from a phone.</span>
+                  <span class="subpanel-note">Open the same Harbor Assistant shell from a phone.</span>
                 </div>
 
                 <div class="qr-frame">
                   <img
                     id="qr-image"
-                    alt="HarborDesk mobile setup QR"
+                    alt="Harbor Assistant mobile setup QR"
                     style="width: 100%; height: 100%; object-fit: contain;"
                   />
                 </div>
-                <div class="qr-token" id="qr-token">http://harbordesk.local:4174/setup/mobile</div>
+                <div class="qr-token" id="qr-token">http://harbor-assistant.local:4174/setup/mobile</div>
                 <p class="qr-instruction" id="qr-instruction">
                   Scan to open the mobile setup page for the same admin shell, then provide the
-                  bridge provider credentials that connect HarborDesk to IM.
+                  bridge provider credentials that connect Harbor Assistant to IM.
                 </p>
 
                 <div class="status-list">
@@ -210,7 +210,7 @@
                   <li>Enter the bridge app id and app secret.</li>
                   <li>Persist the binding and verify the gateway state.</li>
                   <li>Use IM for day-to-day commands after the gateway is connected.</li>
-                  <li>Return to HarborDesk for oversight, policy, and audit work.</li>
+                  <li>Return to Harbor Assistant for oversight, policy, and audit work.</li>
                 </ol>
 
                 <div class="command-cloud">
@@ -252,7 +252,7 @@
               <article class="stack-card">
                 <h4>Feishu baseline</h4>
                 <p class="scan-result-note">
-                  Feishu stays as the baseline signal; HarborDesk only shows the real same-origin
+                  Feishu stays as the baseline signal; Harbor Assistant only shows the real same-origin
                   state that HarborGate exposes.
                 </p>
                 <ul id="gateway-feishu-list" class="feature-list"></ul>
@@ -633,7 +633,7 @@
                 <h4>Boundary note</h4>
                 <p id="harboros-proof-note" class="scan-result-note">
                   HarborOS live status and proof summary are rendered separately. If the live
-                  status block is not exposed yet, HarborDesk must show the blocker rather than
+                  status block is not exposed yet, Harbor Assistant must show the blocker rather than
                   pretend proof rows are real-time state.
                 </p>
               </article>

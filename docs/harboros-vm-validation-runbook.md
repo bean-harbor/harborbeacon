@@ -236,7 +236,7 @@ bash ./tools/run_harboros_vm_smoke.sh \
 - release install root 可以不同，当前默认是 `/var/lib/harborbeacon-agent-ci`
 - 这条 root 不应被简化成 `/mnt/agent-ci` 或 `/data/agent-ci`
 
-## 8.1 HarborDesk 摘要字段
+## 8.1 Harbor Assistant 摘要字段
 
 如果要把这份 proof pack 挂到统一 admin surface，建议直接沿用这些
 字段。IM 双通道 readiness 和 proactive delivery 归 IM lane；HarborOS
@@ -245,7 +245,7 @@ bash ./tools/run_harboros_vm_smoke.sh \
 - `action_summary`: `HarborOS service query proof`, `HarborOS files list
   proof`, `Approved HarborOS service restart`, `Approved HarborOS file copy`,
   `Approved HarborOS file move`
-- `live_status_summary`: HarborDesk live status keeps route order and writable
+- `live_status_summary`: Harbor Assistant live status keeps route order and writable
   root visible, but does not pretend to be proof evidence
 - `proof_summary`: service/files proof labels, verifier line labels, and pause
   conditions for review

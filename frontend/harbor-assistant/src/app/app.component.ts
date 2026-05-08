@@ -1,7 +1,7 @@
 import { Component } from '@angular/core';
 import { RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
 
-import { localizedHarborDeskPages } from './core/page-registry';
+import { localizedHarborAssistantPages } from './core/page-registry';
 import { prefersChineseUi, uiText } from './core/ui-locale';
 
 @Component({
@@ -13,7 +13,7 @@ import { prefersChineseUi, uiText } from './core/ui-locale';
 })
 export class AppComponent {
   protected readonly isChineseUi = prefersChineseUi();
-  protected readonly pages = localizedHarborDeskPages();
+  protected readonly pages = localizedHarborAssistantPages();
 
   constructor() {
     document.documentElement.lang = this.isChineseUi ? 'zh-CN' : 'en';

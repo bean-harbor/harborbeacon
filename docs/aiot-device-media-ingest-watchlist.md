@@ -4,7 +4,7 @@
 
 This watchlist defines the device-domain metadata contract for multimodal
 ingest. It is VLM-first: the first-version input surface is image, snapshot,
-still-frame, and local DVR segment content for the HarborDesk device page.
+still-frame, and local DVR segment content for the Harbor Assistant device page.
 Continuous video is stored as rolling media segments and summarized through
 keyframe sidecars, while audio transcript extraction stays follow-up work. It
 keeps AIoT focused on producing index-friendly media artifacts, not search or

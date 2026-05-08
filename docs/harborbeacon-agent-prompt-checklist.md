@@ -200,16 +200,16 @@ control, or media/control separation.
 如果变更影响共享边界，再扩大验证范围。
 ```
 
-### 7. Frontend / HarborDesk Admin Work
+### 7. Frontend / Harbor Assistant Admin Work
 
-Use when changing `frontend/harbordesk`, `harborbeacon/webui`, model admin,
+Use when changing `frontend/harbor-assistant`, `harborbeacon/webui`, model admin,
 gateway status pages, or runtime truth surfaces.
 
 ```text
 先按 AGENTS.md 工作。
 
 任务：
-修改 HarborDesk / WebUI 管理面相关逻辑。
+修改 Harbor Assistant / WebUI 管理面相关逻辑。
 
 边界：
 保持 HarborBeacon 不长期拥有 IM 平台原始凭据。
@@ -220,7 +220,7 @@ gateway status pages, or runtime truth surfaces.
 不要引入与当前页面无关的 UI 重构。
 
 验证：
-至少跑前端 build：cd frontend/harbordesk && npm run build
+至少跑前端 build：cd frontend/harbor-assistant && npm run build
 如涉及后端接口语义，再补相应测试。
 ```
 
@@ -300,7 +300,7 @@ Use the smallest relevant set first:
 - Orchestrator lane: `pytest tests/test_orchestrator -q`
 - Rust build: `cargo build --release`
 - Rust tests: `cargo test`
-- Frontend build: `cd frontend/harbordesk && npm run build`
+- Frontend build: `cd frontend/harbor-assistant && npm run build`
 - Contract tool: `target/release/validate-contract-schemas`
 - E2E tool: `target/release/run-e2e-suite`
 - Drift tool: `target/release/run-drift-matrix`

@@ -50,7 +50,7 @@ def test_e2e_dry_run_does_not_create_mutation_directories(tmp_path, monkeypatch)
     assert exit_code == 0
     assert payload["ok"] is True
     assert proof_pack_summary["live_status_summary"] == [
-        "HarborDesk live status stays separate from proof summary.",
+        "Harbor Assistant live status stays separate from proof summary.",
         "route_order=Middleware API -> MidCLI -> Browser/MCP fallback",
         "writable_root=/mnt/software/harborbeacon-agent-ci",
     ]
@@ -118,7 +118,7 @@ def test_e2e_reports_midcli_fallback_route_mode_when_shim_is_used(tmp_path, monk
 
     assert exit_code == 0
     assert proof_pack_summary["live_status_summary"] == [
-        "HarborDesk live status stays separate from proof summary.",
+        "Harbor Assistant live status stays separate from proof summary.",
         "route_order=Middleware API -> MidCLI -> Browser/MCP fallback",
         "writable_root=/mnt/software/harborbeacon-agent-ci",
     ]

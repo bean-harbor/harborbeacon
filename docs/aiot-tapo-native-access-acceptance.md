@@ -16,7 +16,7 @@ Accepted device-domain behavior:
 - native snapshot capture is preferred when the profile or binding provides a URL.
 - ffmpeg remains the fallback when no native snapshot URL is confirmed.
 - release-v1 clip capture should reuse the existing recording policy and media metadata surface; do not introduce a TP-Link-specific profile object.
-- HarborDesk should display the selected camera, storage subdirectory, clip length, and keyframe hints from the existing camera/profile and recording-policy records.
+- Harbor Assistant should display the selected camera, storage subdirectory, clip length, and keyframe hints from the existing camera/profile and recording-policy records.
 
 Context check:
 - no native snapshot URL was confirmed from the current session context

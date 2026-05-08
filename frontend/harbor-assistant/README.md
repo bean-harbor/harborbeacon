@@ -1,6 +1,6 @@
-# HarborDesk Angular Workspace
+# Harbor Assistant Angular Workspace
 
-This workspace contains the formal HarborDesk admin web UI skeleton.
+This workspace contains the formal Harbor Assistant admin web UI skeleton.
 
 ## Scripts
 
@@ -14,4 +14,4 @@ The dev server proxies same-origin admin API calls from `/api` to `http://127.0.
 
 ## Output
 
-Production builds are written to `dist/harbordesk`.
+Production builds are written to `dist/harbor-assistant`.

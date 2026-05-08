@@ -8,7 +8,7 @@
 > 协作术语统一以 `HarborBeacon-Harbor-Collaboration-Contract-v2` 与 `harbor-*` lane 命名为准。
 > 已验证 baseline：HarborBeacon `a5f6da0` + HarborGate `57ff759`
 > 已打包为 `.82` RC2
-> `20260430-rc2-beacona5f6da0-gate57ff759`，并通过 HarborDesk、HarborBot、knowledge search/preview、protected
+> `20260430-rc2-beacona5f6da0-gate57ff759`，并通过 Harbor Assistant、Search、knowledge search/preview、protected
 > `POST /api/web/turns` live smoke，`/api/turns` 仅保留为 deprecated alias。
 >
 > 本文后续早期 v1.5 task-contract 描述保留为历史上下文；当前执行、验收与回滚以
@@ -40,8 +40,8 @@
 - 模型是 HarborBeacon 的共享能力层，不是独立业务域；业务域仍按 HarborOS System Domain、Home Device Domain、IM Gateway 等边界治理。
 - 当前实现保持 local-first：本地 OpenAI-compatible endpoint 是默认路径，Candle / sidecar / Mistral 只是可替换 backend 或旁路候选，不再各自形成一套产品架构。
 - 云端只作为受控 fallback。第一版仅覆盖 `semantic.router` 与 `retrieval.answer`，不覆盖 AIoT 控制、HarborOS 命令、OCR、VLM、embedding 默认路径。
-- HarborDesk 的 `Models & Policies` 提供 `llm-cloud-siliconflow` preset，使用 OpenAI-compatible `https://api.siliconflow.cn/v1`；API key 作为 endpoint secret 保存，读回时必须 redacted，空 key 不覆盖已保存 secret。
-- 本地模型下载默认使用 Hugging Face mirror `https://hf-mirror.com`，优先级为 HarborDesk 输入 mirror -> `HF_ENDPOINT` -> 默认 mirror。
+- Harbor Assistant 的 `Models & Policies` 提供 `llm-cloud-siliconflow` preset，使用 OpenAI-compatible `https://api.siliconflow.cn/v1`；API key 作为 endpoint secret 保存，读回时必须 redacted，空 key 不覆盖已保存 secret。
+- 本地模型下载默认使用 Hugging Face mirror `https://hf-mirror.com`，优先级为 Harbor Assistant 输入 mirror -> `HF_ENDPOINT` -> 默认 mirror。
 
 ## 1. 项目目标
 
@@ -57,7 +57,7 @@
 1. 补齐 release evidence、rollback notes、daily closeout、ISO integration checklist。
 2. 在 `.82` 上跑 local model promotion gate；只有 `gate.promotable=true`
    才规划默认 backend cutover。
-3. 继续硬化 HarborDesk / HarborBot 产品面，保持真实同源 API。
+3. 继续硬化 Harbor Assistant 产品面，保持真实同源 API。
 4. 恢复 Home Agent Hub / AIoT MVP 队列，不把 Home Device Domain 折叠进
    HarborOS System Domain。
 
@@ -476,15 +476,15 @@ HarborBeacon 文件系统
    └─ 返回结果 + 多模态预览
 ```
 
-### 4.2.1 HarborBot 北向独立入口
+### 4.2.1 Search 北向独立入口
 
-HarborBot 是多模态检索的 northbound user retrieval surface，作为
-HarborNAS WebUI 原生页面 `/ui/harborbot` 存在；HarborDesk 继续承担
+Search 是多模态检索的 northbound user retrieval surface，作为
+HarborNAS WebUI 原生页面 `/ui/harbor-assistant?tab=search` 存在；Harbor Assistant 继续承担
 source roots、index、privacy/resource profile 等管理与配置入口。
 
-HarborBot 只消费 HarborBeacon 的真实同源 knowledge API：
-`POST /api/harbordesk/knowledge/search` 和
-`GET /api/harbordesk/knowledge/preview`。它不新增 shortcut、mock、聚合 API
+Search 只消费 HarborBeacon 的真实同源 knowledge API：
+`POST /api/harbor-assistant/knowledge/search` 和
+`GET /api/harbor-assistant/knowledge/preview`。它不新增 shortcut、mock、聚合 API
 或绕开运行时的演示层；documents / images / videos 在页面内合并为瀑布流，
 并展示 `content_source_kinds`、`content_indexed`、`content_match_used`、
 `filename_match_used` 等 evidence 字段，用于证明检索来自内容索引而不是文件名捷径。

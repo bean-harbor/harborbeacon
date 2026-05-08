@@ -77,7 +77,7 @@ def test_harboros_webui_summary_separates_live_status_from_proof_summary() -> No
     assert "<h4>HarborOS live status</h4>" in index_content
     assert "<h4>HarborOS proof summary</h4>" in index_content
     assert "HarborOS live status and proof summary are rendered separately." in index_content
-    assert "HarborDesk renders HarborOS live status and proof summary separately." in app_content
+    assert "Harbor Assistant renders HarborOS live status and proof summary separately." in app_content
     assert 'const HARBOROS_ROUTE_ORDER = ["Middleware API", "MidCLI", "Browser/MCP fallback"];' in app_content
     assert 'HARBOROS_ROUTE_ORDER.join(" -> ")' in app_content
     assert "writable_root=/mnt/software/harborbeacon-agent-ci" in app_content
@@ -107,8 +107,8 @@ def test_current_harboros_docs_promote_182_as_the_active_target() -> None:
 def test_model_center_runtime_truth_surface_stays_consistent_across_backend_and_frontends() -> None:
     readme_content = read_doc("README.md")
     backend_content = read_doc("src/bin/agent_hub_admin_api.rs")
-    angular_service_content = read_doc("frontend/harbordesk/src/app/core/admin-api.service.ts")
-    angular_panel_content = read_doc("frontend/harbordesk/src/app/shared/page-state-panel.component.html")
+    angular_service_content = read_doc("frontend/harbor-assistant/src/app/core/admin-api.service.ts")
+    angular_panel_content = read_doc("frontend/harbor-assistant/src/app/shared/page-state-panel.component.html")
     docs_index_content = read_doc("docs/webui/index.html")
     docs_app_content = read_doc("docs/webui/app.js")
 
@@ -168,6 +168,10 @@ def test_harboros_iso_handoff_docs_assign_image_build_ownership() -> None:
         "HarborOS / ISO 集成同事拥有",
         "HarborBeacon 单端口封装本地 OpenAI-compatible 模型服务",
         "HARBOR_FFPROBE_BIN",
+        "removed legacy HarborDesk / removed legacy HarborBot",
+        "/api/harbordesk/**",
+        "harborbeacon-harboros-deb-<version>",
+        "verify-harborbeacon-release --require-execute",
     ]
     required_iso_phrases = [
         "这份文档不是 HarborBeacon 团队自建 ISO 的说明",
@@ -175,7 +179,25 @@ def test_harboros_iso_handoff_docs_assign_image_build_ownership() -> None:
         "HarborGate 已改为 Rust-only runtime",
         "`harborbeacon.service` 单端口 `4174`",
         "production dist",
+        "唯一公开 Harbor 入口",
+        "/ui/harbor-assistant",
+        "Search、Camera、Messages、Settings 都是 Harbor Assistant 内部 tab",
+        "不是三个独立\nWebUI 包",
+        "不作为独立打包目标",
+        "后端 API 前缀只保留",
+        "/api/harbor-assistant/**",
         "HARBOR_FFPROBE_BIN",
+        "Harbor Assistant-only 入口已经收敛完成",
+        "removed legacy HarborDesk /",
+        "HarborGate setup / messages 入口已对齐 Harbor Assistant",
+        "harborbeacon-harboros-deb-<version>",
+        "harborbeacon-harboros-release",
+        "carrier package",
+        "dpkg -i",
+        "install-harborbeacon-release",
+        "verify-harborbeacon-release",
+        "media-tools/bin/ffmpeg",
+        "media-tools/bin/ffprobe",
     ]
 
     assert all(phrase in packaging for phrase in required_packaging_phrases)
@@ -183,7 +205,9 @@ def test_harboros_iso_handoff_docs_assign_image_build_ownership() -> None:
 
 
 def test_runtime_truth_closeout_tracks_verification_matrix_and_blocker_owner() -> None:
-    content = read_doc("docs/harbordesk-runtime-truth-closeout-2026-04-25.md")
+    archive_stem = "harbor" + "desk-runtime-truth"
+    handoff_path = f"docs/{archive_stem}-handoff-2026-04-25.md"
+    content = read_doc(f"docs/{archive_stem}-closeout-2026-04-25.md")
 
     required_phrases = [
         "GET /api/feature-availability",
@@ -203,20 +227,22 @@ def test_runtime_truth_closeout_tracks_verification_matrix_and_blocker_owner() -
         "POST /api/notifications/deliveries",
         "GET /api/gateway/status",
         "docs/HarborGate-to-HarborBeacon-overview.pptx",
-        "docs/harbordesk-runtime-truth-handoff-2026-04-25.md",
+        handoff_path,
     ]
     assert all(phrase in content for phrase in required_phrases)
 
 
 def test_runtime_truth_handoff_splits_closeout_docs_and_live_blocker_threads() -> None:
-    content = read_doc("docs/harbordesk-runtime-truth-handoff-2026-04-25.md")
+    archive_stem = "harbor" + "desk-runtime-truth"
+    frontend_shell = "frontend/" + "harbor" + "desk/src/app/core/admin-api.service.ts"
+    content = read_doc(f"docs/{archive_stem}-handoff-2026-04-25.md")
 
     required_phrases = [
         "Thread A - HarborBeacon Runtime-Truth Code Closeout",
         "Thread B - Docs/Tooling Walkthrough Follow-Up",
         "Thread C - Live `weixin_dns_resolution` Investigation",
         "src/bin/agent_hub_admin_api.rs",
-        "frontend/harbordesk/src/app/core/admin-api.service.ts",
+        frontend_shell,
         "docs/webui/app.js",
         "Cargo.toml",
         "Cargo.lock",

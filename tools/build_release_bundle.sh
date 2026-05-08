@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 HARBORGATE_REPO="${HARBORGATE_REPO:-$(cd "${REPO_ROOT}/../HarborGate" && pwd)}"
-HARBORDESK_DIST_SOURCE="${HARBORDESK_DIST_SOURCE:-}"
+HARBOR_ASSISTANT_DIST_SOURCE="${HARBOR_ASSISTANT_DIST_SOURCE:-}"
 HARBORGATE_RUST_BINARY="${HARBORGATE_RUST_BINARY:-}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/dist/release-bundles}"
 RUST_TARGET="${RUST_TARGET:-x86_64-unknown-linux-musl}"
@@ -13,6 +13,11 @@ ZIG_VERSION="${ZIG_VERSION:-0.15.1}"
 BOOTSTRAP_BUILDER_IF_NEEDED="${BOOTSTRAP_BUILDER_IF_NEEDED:-0}"
 INSTALL_ROOT_DEFAULT="${INSTALL_ROOT_DEFAULT:-/var/lib/harborbeacon-agent-ci}"
 WRITABLE_ROOT_DEFAULT="${WRITABLE_ROOT_DEFAULT:-/mnt/software/harborbeacon-agent-ci}"
+HARBOR_MEDIA_TOOLS_VARIANT="${HARBOR_MEDIA_TOOLS_VARIANT:-btbn-linux64-lgpl-static}"
+HARBOR_MEDIA_TOOLS_URL="${HARBOR_MEDIA_TOOLS_URL:-https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl.tar.xz}"
+HARBOR_MEDIA_TOOLS_CHECKSUMS_URL="${HARBOR_MEDIA_TOOLS_CHECKSUMS_URL:-https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/checksums.sha256}"
+HARBOR_MEDIA_TOOLS_ARCHIVE="${HARBOR_MEDIA_TOOLS_ARCHIVE:-}"
+HARBOR_MEDIA_TOOLS_SHA256="${HARBOR_MEDIA_TOOLS_SHA256:-}"
 
 git_ref_or_snapshot() {
   local repo_path="$1"
@@ -86,6 +91,126 @@ resolve_harborgate_rust_binary() {
     fi
   done
   return 1
+}
+
+verify_media_archive_sha256() {
+  local archive_path="$1"
+  local archive_name="$2"
+  local checksum_file="$3"
+  local expected_sha="${HARBOR_MEDIA_TOOLS_SHA256}"
+
+  if [[ -z "${expected_sha}" && -f "${checksum_file}" ]]; then
+    expected_sha="$(awk -v name="${archive_name}" '{ candidate=$2; sub(/^\*/, "", candidate); if (candidate == name || candidate == "./" name) { print $1; exit } }' "${checksum_file}")"
+  fi
+
+  if [[ -z "${expected_sha}" ]]; then
+    echo "missing media tools checksum for ${archive_name}; set HARBOR_MEDIA_TOOLS_SHA256 or provide checksums.sha256" >&2
+    exit 1
+  fi
+
+  printf '%s  %s\n' "${expected_sha}" "${archive_path}" | sha256sum -c -
+}
+
+media_tool_version_line() {
+  local binary_path="$1"
+  "${binary_path}" -version | head -n 1
+}
+
+prepare_media_tools() {
+  local cache_dir="${OUT_DIR}/_media-tools-cache"
+  local extract_dir="${OUT_DIR}/_media-tools-extract"
+  local archive_name archive_path checksum_file ffmpeg_source ffprobe_source
+  local ffmpeg_version ffprobe_version archive_sha
+
+  mkdir -p "${cache_dir}"
+  if [[ -n "${HARBOR_MEDIA_TOOLS_ARCHIVE}" ]]; then
+    archive_path="${HARBOR_MEDIA_TOOLS_ARCHIVE}"
+    archive_name="$(basename "${archive_path}")"
+    if [[ ! -f "${archive_path}" ]]; then
+      echo "HARBOR_MEDIA_TOOLS_ARCHIVE not found: ${archive_path}" >&2
+      exit 1
+    fi
+  else
+    require_command curl
+    archive_name="$(basename "${HARBOR_MEDIA_TOOLS_URL}")"
+    archive_path="${cache_dir}/${archive_name}"
+    checksum_file="${cache_dir}/checksums.sha256"
+    echo "Downloading BtbN FFmpeg media tools: ${HARBOR_MEDIA_TOOLS_URL}"
+    curl -fL --retry 3 --retry-delay 2 -o "${archive_path}" "${HARBOR_MEDIA_TOOLS_URL}"
+    curl -fL --retry 3 --retry-delay 2 -o "${checksum_file}" "${HARBOR_MEDIA_TOOLS_CHECKSUMS_URL}"
+  fi
+
+  checksum_file="${checksum_file:-${cache_dir}/checksums.sha256}"
+  verify_media_archive_sha256 "${archive_path}" "${archive_name}" "${checksum_file}"
+  archive_sha="$(sha256sum "${archive_path}" | awk '{print $1}')"
+
+  rm -rf "${extract_dir}" "${BUNDLE_ROOT}/media-tools"
+  mkdir -p "${extract_dir}" "${BUNDLE_ROOT}/media-tools/bin"
+  tar -C "${extract_dir}" -xf "${archive_path}"
+
+  ffmpeg_source="$(find "${extract_dir}" -type f -path "*/bin/ffmpeg" -print -quit)"
+  ffprobe_source="$(find "${extract_dir}" -type f -path "*/bin/ffprobe" -print -quit)"
+  if [[ -z "${ffmpeg_source}" || -z "${ffprobe_source}" ]]; then
+    echo "media tools archive must contain bin/ffmpeg and bin/ffprobe" >&2
+    exit 1
+  fi
+
+  cp "${ffmpeg_source}" "${BUNDLE_ROOT}/media-tools/bin/ffmpeg"
+  cp "${ffprobe_source}" "${BUNDLE_ROOT}/media-tools/bin/ffprobe"
+  chmod 0755 "${BUNDLE_ROOT}/media-tools/bin/ffmpeg" "${BUNDLE_ROOT}/media-tools/bin/ffprobe"
+
+  ffmpeg_version="$(media_tool_version_line "${BUNDLE_ROOT}/media-tools/bin/ffmpeg")"
+  ffprobe_version="$(media_tool_version_line "${BUNDLE_ROOT}/media-tools/bin/ffprobe")"
+
+  cat > "${BUNDLE_ROOT}/media-tools/NOTICE.txt" <<EOF
+HarborBeacon bundles ffmpeg and ffprobe for HarborOS camera RTSP probe,
+snapshot, MJPEG preview, and DVR flows.
+
+Source: ${HARBOR_MEDIA_TOOLS_URL}
+Variant: ${HARBOR_MEDIA_TOOLS_VARIANT}
+Archive: ${archive_name}
+Archive SHA256: ${archive_sha}
+
+The default artifact is the BtbN linux64 LGPL static build. It is selected to
+cover HarborBeacon media runtime needs while keeping the distribution license
+surface narrower than GPL builds. Upstream FFmpeg and dependency licenses remain
+authoritative for these binaries.
+EOF
+
+  python3 - \
+    "${BUNDLE_ROOT}/media-tools/provenance.json" \
+    "${HARBOR_MEDIA_TOOLS_VARIANT}" \
+    "${HARBOR_MEDIA_TOOLS_URL}" \
+    "${archive_name}" \
+    "${archive_sha}" \
+    "${ffmpeg_version}" \
+    "${ffprobe_version}" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = {
+    "variant": sys.argv[2],
+    "source_url": sys.argv[3],
+    "archive": sys.argv[4],
+    "archive_sha256": sys.argv[5],
+    "license_profile": "LGPL static",
+    "binaries": {
+        "ffmpeg": {
+            "path": "media-tools/bin/ffmpeg",
+            "version": sys.argv[6],
+        },
+        "ffprobe": {
+            "path": "media-tools/bin/ffprobe",
+            "version": sys.argv[7],
+        },
+    },
+}
+pathlib.Path(sys.argv[1]).write_text(
+    json.dumps(payload, ensure_ascii=False, indent=2),
+    encoding="utf-8",
+)
+PY
 }
 
 append_path_front() {
@@ -222,21 +347,22 @@ fi
 require_directory "${HARBORGATE_REPO}"
 require_directory "${REPO_ROOT}/tools/release_templates"
 
-if [[ -n "${HARBORDESK_DIST_SOURCE}" ]]; then
-  require_directory "${HARBORDESK_DIST_SOURCE}"
+if [[ -n "${HARBOR_ASSISTANT_DIST_SOURCE}" ]]; then
+  require_directory "${HARBOR_ASSISTANT_DIST_SOURCE}"
 else
   require_command node
   require_command npm
-  require_directory "${REPO_ROOT}/frontend/harbordesk"
+  require_directory "${REPO_ROOT}/frontend/harbor-assistant"
 fi
 
 mkdir -p "${OUT_DIR}"
 rm -rf "${BUNDLE_ROOT}"
 mkdir -p \
   "${BUNDLE_ROOT}/bin" \
-  "${BUNDLE_ROOT}/harbordesk/dist" \
+  "${BUNDLE_ROOT}/harbor-assistant/dist" \
   "${BUNDLE_ROOT}/harborgate/bin" \
   "${BUNDLE_ROOT}/install" \
+  "${BUNDLE_ROOT}/media-tools" \
   "${BUNDLE_ROOT}/templates"
 
 echo
@@ -252,19 +378,19 @@ for binary in harborbeacon-service harbor-model-api assistant-task-api agent-hub
   assert_binary_linkage "${RUST_RELEASE_DIR}/${binary}"
 done
 
-if [[ -n "${HARBORDESK_DIST_SOURCE}" ]]; then
+if [[ -n "${HARBOR_ASSISTANT_DIST_SOURCE}" ]]; then
   echo
-  echo "==> Reusing prebuilt HarborDesk Angular dist"
-  HARBORDESK_DIST_PATH="${HARBORDESK_DIST_SOURCE}"
+  echo "==> Reusing prebuilt Harbor Assistant Angular dist"
+  HARBOR_ASSISTANT_DIST_PATH="${HARBOR_ASSISTANT_DIST_SOURCE}"
 else
   echo
-  echo "==> Building HarborDesk Angular dist"
+  echo "==> Building Harbor Assistant Angular dist"
   (
-    cd "${REPO_ROOT}/frontend/harbordesk"
+    cd "${REPO_ROOT}/frontend/harbor-assistant"
     npm ci
     npm run build
   )
-  HARBORDESK_DIST_PATH="${REPO_ROOT}/frontend/harbordesk/dist/harbordesk"
+  HARBOR_ASSISTANT_DIST_PATH="${REPO_ROOT}/frontend/harbor-assistant/dist/harbor-assistant"
 fi
 
 echo
@@ -283,6 +409,10 @@ else
 fi
 
 echo
+echo "==> Preparing bundled media tools (${HARBOR_MEDIA_TOOLS_VARIANT})"
+prepare_media_tools
+
+echo
 echo "==> Assembling bundle layout"
 cp "${RUST_RELEASE_DIR}/harborbeacon-service" "${BUNDLE_ROOT}/bin/harborbeacon-service"
 cp "${RUST_RELEASE_DIR}/assistant-task-api" "${BUNDLE_ROOT}/bin/assistant-task-api"
@@ -290,10 +420,13 @@ cp "${RUST_RELEASE_DIR}/agent-hub-admin-api" "${BUNDLE_ROOT}/bin/agent-hub-admin
 cp "${RUST_RELEASE_DIR}/harbor-model-api" "${BUNDLE_ROOT}/bin/harbor-model-api"
 cp "${RUST_RELEASE_DIR}/validate-contract-schemas" "${BUNDLE_ROOT}/bin/validate-contract-schemas"
 cp "${RUST_RELEASE_DIR}/run-e2e-suite" "${BUNDLE_ROOT}/bin/run-e2e-suite"
-cp -R "${HARBORDESK_DIST_PATH}" "${BUNDLE_ROOT}/harbordesk/dist/"
+cp -R "${HARBOR_ASSISTANT_DIST_PATH}" "${BUNDLE_ROOT}/harbor-assistant/dist/"
 cp -R "${REPO_ROOT}/tools/release_templates/." "${BUNDLE_ROOT}/templates/"
 cp "${REPO_ROOT}/tools/install_harboros_release.sh" "${BUNDLE_ROOT}/install/install_harboros_release.sh"
 cp "${REPO_ROOT}/tools/rollback_harboros_release.sh" "${BUNDLE_ROOT}/install/rollback_harboros_release.sh"
+cp "${REPO_ROOT}/tools/verify_release_bundle.py" "${BUNDLE_ROOT}/install/verify_release_bundle.py"
+find "${BUNDLE_ROOT}/templates" -type d -name "__pycache__" -prune -exec rm -rf {} +
+find "${BUNDLE_ROOT}/templates" -type f -name "*.pyc" -delete
 
 python3 - "${BUNDLE_ROOT}" <<'PY'
 import pathlib
@@ -303,6 +436,7 @@ bundle_root = pathlib.Path(sys.argv[1])
 for path in [
     bundle_root / "install" / "install_harboros_release.sh",
     bundle_root / "install" / "rollback_harboros_release.sh",
+    bundle_root / "install" / "verify_release_bundle.py",
 ]:
     data = path.read_bytes()
     path.write_bytes(data.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
@@ -315,7 +449,8 @@ PY
 
 chmod 0755 \
   "${BUNDLE_ROOT}/install/install_harboros_release.sh" \
-  "${BUNDLE_ROOT}/install/rollback_harboros_release.sh"
+  "${BUNDLE_ROOT}/install/rollback_harboros_release.sh" \
+  "${BUNDLE_ROOT}/install/verify_release_bundle.py"
 
 find "${BUNDLE_ROOT}/templates/bin" -type f -exec chmod 0755 {} +
 
@@ -339,6 +474,9 @@ import pathlib
 import sys
 
 manifest_path = pathlib.Path(sys.argv[1])
+media_tools = json.loads(
+    (manifest_path.parent / "media-tools" / "provenance.json").read_text(encoding="utf-8")
+)
 payload = {
     "bundle_name": manifest_path.parent.name,
     "version": sys.argv[2],
@@ -363,9 +501,10 @@ payload = {
                 "templates/bin/harbor-vlm-sidecar",
             ],
         },
-        "harbordesk": {
-            "dist": "harbordesk/dist/harbordesk",
+        "harbor-assistant": {
+            "dist": "harbor-assistant/dist/harbor-assistant",
         },
+        "media_tools": media_tools,
         "harborgate": {
             "git_ref": sys.argv[5],
             "rust_binary": sys.argv[11],
@@ -377,6 +516,7 @@ payload = {
     "install": {
         "install_script": "install/install_harboros_release.sh",
         "rollback_script": "install/rollback_harboros_release.sh",
+        "verify_script": "install/verify_release_bundle.py",
         "install_root_default": sys.argv[9],
         "writable_root_default": sys.argv[10],
         "helper_scripts": [

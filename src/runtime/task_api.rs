@@ -2816,7 +2816,7 @@ impl TaskApiService {
                 knowledge_settings.default_resource_profile,
                 "privacy_policy_blocked",
                 format!(
-                    "请求的 privacy_level={} 超出 workspace 当前策略 {}；请先在 HarborDesk 调整云策略并保留审计记录。",
+                    "请求的 privacy_level={} 超出 workspace 当前策略 {}；请先在 Harbor Assistant 调整云策略并保留审计记录。",
                     privacy_level_as_str(privacy_level),
                     privacy_level_as_str(knowledge_settings.privacy_level)
                 ),
@@ -2979,7 +2979,7 @@ impl TaskApiService {
                 knowledge_settings.default_resource_profile,
                 "privacy_policy_blocked",
                 format!(
-                    "请求的 privacy_level={} 超出 workspace 当前策略 {}；请先在 HarborDesk 调整云策略并保留审计记录。",
+                    "请求的 privacy_level={} 超出 workspace 当前策略 {}；请先在 Harbor Assistant 调整云策略并保留审计记录。",
                     privacy_level_as_str(privacy_level),
                     privacy_level_as_str(knowledge_settings.privacy_level)
                 ),
@@ -12088,7 +12088,7 @@ mod tests {
             step_id: "step-proactive".to_string(),
             source: TaskSource {
                 channel: "admin_api".to_string(),
-                surface: "harbordesk".to_string(),
+                surface: "harbor-assistant".to_string(),
                 conversation_id: String::new(),
                 user_id: "user-weixin".to_string(),
                 session_id: "sess-proactive".to_string(),
@@ -13501,7 +13501,7 @@ mod tests {
 
         assert_eq!(response.status, TaskStatus::Failed);
         assert_eq!(response.executor_used, "knowledge_search_service");
-        assert!(response.result.message.contains("未在 HarborDesk 启用"));
+        assert!(response.result.message.contains("未在 Harbor Assistant 启用"));
         assert_eq!(response.result.data["status"], "degraded");
         assert_eq!(response.result.data["degraded"], true);
         assert_eq!(
@@ -14111,7 +14111,7 @@ mod tests {
             "帮助我抓拍一下当前摄像头画面"
         ));
         assert!(!general_message_requests_capability_summary(
-            "HarborBot 怎么工作"
+            "Harbor Assistant Search 怎么工作"
         ));
 
         assert_eq!(

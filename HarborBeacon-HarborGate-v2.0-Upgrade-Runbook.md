@@ -77,8 +77,8 @@ At the start of each session:
   artifacts.
 - Run the local model promotion benchmark on `.82` before claiming active local
   runtime execution.
-- Keep HarborDesk and HarborBot on the real same-origin
-  `/api/harbordesk/*` surfaces; do not add a demo-only turn page.
+- Keep Harbor Assistant and Search on the real same-origin
+  `/api/harbor-assistant/*` surfaces; do not add a demo-only turn page.
 
 ## Drift Guards
 
@@ -158,7 +158,7 @@ Do not report a release-ready state while any drift guard still fails.
 ## 2026-04-30 Post-RC2 Closeout
 
 - Completed: merged the Beacon, Gate, and WebUI release trains; installed RC2
-  on `.82`; verified `/ui/harbordesk`, `/ui/harborbot`, knowledge
+  on `.82`; verified `/ui/harbor-assistant`, `/ui/harbor-assistant?tab=search`, knowledge
   search/preview, and protected `POST /api/web/turns` content retrieval plus
   local-first architecture explanation.
 - Artifact: `harbor-release-20260430-rc2-beacona5f6da0-gate57ff759.tar.gz`.

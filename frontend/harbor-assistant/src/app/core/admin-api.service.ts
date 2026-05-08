@@ -77,7 +77,7 @@ import {
   StartLocalModelDownloadRequest,
   TaskApprovalSummary
 } from './admin-api.types';
-import { HarborDeskPageId } from './page-registry';
+import { HarborAssistantPageId } from './page-registry';
 import { uiText } from './ui-locale';
 
 interface EndpointProjection<T> {
@@ -90,12 +90,12 @@ interface EndpointProjection<T> {
 @Injectable({
   providedIn: 'root'
 })
-export class HarborDeskAdminApiService {
+export class HarborAssistantAdminApiService {
   private readonly http = inject(HttpClient);
-  private readonly outputDirectory = 'frontend/harbordesk/dist/harbordesk';
+  private readonly outputDirectory = 'frontend/harbor-assistant/dist/harbor-assistant';
   private readonly apiBase = this.resolveApiBase();
 
-  observePage(pageId: HarborDeskPageId): Observable<PageState<DeskPageModel>> {
+  observePage(pageId: HarborAssistantPageId): Observable<PageState<DeskPageModel>> {
     return concat(
       of<PageState<DeskPageModel>>(this.loadingState(pageId)),
       this.pageRequest(pageId).pipe(catchError((error) => of(this.blockerState(pageId, this.errorMessage(error)))))
@@ -311,7 +311,7 @@ export class HarborDeskAdminApiService {
     );
   }
 
-  private pageRequest(pageId: HarborDeskPageId): Observable<PageState<DeskPageModel>> {
+  private pageRequest(pageId: HarborAssistantPageId): Observable<PageState<DeskPageModel>> {
     switch (pageId) {
       case 'overview':
         return forkJoin({
@@ -406,7 +406,7 @@ export class HarborDeskAdminApiService {
           availability: this.getFeatureAvailability()
         }).pipe(map(({ state, gateway, availability }) => this.buildSystemSettingsState(state, gateway, availability)));
       default:
-        return throwError(() => new Error(`Unknown HarborDesk page: ${pageId}`));
+        return throwError(() => new Error(`Unknown Harbor Assistant page: ${pageId}`));
     }
   }
 
@@ -452,7 +452,7 @@ export class HarborDeskAdminApiService {
 
   private resolveApiBase(): string {
     const pathname = globalThis.location?.pathname ?? '';
-    return pathname.startsWith('/ui/') || pathname === '/ui' ? '/api/harbordesk' : '/api';
+    return pathname.startsWith('/ui/') || pathname === '/ui' ? '/api/harbor-assistant' : '/api';
   }
 
   private getDeviceEvidenceProjections(
@@ -486,7 +486,7 @@ export class HarborDeskAdminApiService {
     );
   }
 
-  private loadingState(pageId: HarborDeskPageId): PageState<DeskPageModel> {
+  private loadingState(pageId: HarborAssistantPageId): PageState<DeskPageModel> {
     return {
       kind: 'loading',
       detail: this.text('Hydrating same-origin admin API projection.', '正在加载同源后台 API 投影。'),
@@ -494,7 +494,7 @@ export class HarborDeskAdminApiService {
     };
   }
 
-  private blockerState(pageId: HarborDeskPageId, detail: string): PageState<DeskPageModel> {
+  private blockerState(pageId: HarborAssistantPageId, detail: string): PageState<DeskPageModel> {
     return {
       kind: 'blocker',
       detail,
@@ -511,15 +511,15 @@ export class HarborDeskAdminApiService {
         ],
         blockers: [detail],
         nextStep: this.text(
-          'Restore the admin-plane response for this page before using HarborDesk for operations.',
-          '先恢复这个页面需要的后台 API 响应，再使用 HarborDesk 做配置。'
+          'Restore the admin-plane response for this page before using Harbor Assistant for operations.',
+          '先恢复这个页面需要的后台 API 响应，再使用 Harbor Assistant 做配置。'
         )
       }
     };
   }
 
-  private baseModel(pageId: HarborDeskPageId): DeskPageModel {
-    const titleMap: Record<HarborDeskPageId, string> = {
+  private baseModel(pageId: HarborAssistantPageId): DeskPageModel {
+    const titleMap: Record<HarborAssistantPageId, string> = {
       overview: this.text('Overview', '总览'),
       'im-gateway': this.text('IM Gateway', 'IM 网关'),
       'account-management': this.text('Account Management', '账号与通知'),
@@ -532,7 +532,7 @@ export class HarborDeskAdminApiService {
     return {
       pageId,
       title: titleMap[pageId],
-      eyebrow: 'HarborDesk',
+      eyebrow: 'Harbor Assistant',
       summary: this.text('Loading same-origin HarborBeacon admin-plane data.', '正在加载 HarborBeacon 同源后台数据。'),
       endpoint: '/api/state',
       outputDirectory: this.outputDirectory,
@@ -609,7 +609,7 @@ export class HarborDeskAdminApiService {
                 ? 'ready'
                 : 'blocked',
               state.account_management?.workspace?.current_principal_user_id
-                ? this.text('HarborDesk inherits the HarborOS login principal as the admin principal.', 'HarborDesk 复用 HarborOS 登录用户作为后台管理主体。')
+                ? this.text('Harbor Assistant inherits the HarborOS login principal as the admin principal.', 'Harbor Assistant 复用 HarborOS 登录用户作为后台管理主体。')
                 : this.text('HarborOS identity is not projected yet.', 'HarborOS 登录身份尚未投影到后台。'),
               state.account_management?.workspace?.current_principal_user_id
                 ? this.text(
@@ -620,7 +620,7 @@ export class HarborDeskAdminApiService {
               state.account_management?.workspace?.current_principal_user_id
                 ? [
                   this.text('Use the HarborOS login user as the admin owner baseline.', '使用 HarborOS 登录用户作为后台 owner 基线。'),
-                  this.text('No separate HarborDesk login is introduced.', '不引入第二套 HarborDesk 登录。')
+                  this.text('No separate Harbor Assistant login is introduced.', '不引入第二套 Harbor Assistant 登录。')
                 ]
                 : [this.text('Blocker: current HarborOS principal is not yet surfaced by the backend.', '阻塞：后端尚未投影当前 HarborOS 用户。')]
             ),
@@ -757,7 +757,7 @@ export class HarborDeskAdminApiService {
           this.metric(this.text('Weixin readiness', '微信 readiness'), weixinReady ? this.text('Ready', '已就绪') : this.text('Pending', '待配置'), this.text('Parity track readiness from HarborGate.', 'HarborGate 投影的微信通道状态。'), weixinReady ? 'good' : 'warn')
         ],
         highlights: [
-          this.text('HarborDesk is the Angular admin shell, normally opened at :4174; HarborOS WebUI remains /ui/ on ports 80/443.', 'HarborDesk 是 Angular 后台 shell，通常打开在 :4174；HarborOS WebUI 仍在 80/443 的 /ui/。'),
+          this.text('Harbor Assistant is the Angular admin shell, normally opened at :4174; HarborOS WebUI remains /ui/ on ports 80/443.', 'Harbor Assistant 是 Angular 后台 shell，通常打开在 :4174；HarborOS WebUI 仍在 80/443 的 /ui/。'),
           this.text(`Workspace: ${state.account_management.workspace.display_name}`, `工作区：${state.account_management.workspace.display_name}`),
           this.text(`Current principal: ${state.account_management.workspace.current_principal_display_name || state.current_principal_display_name || state.account_management.workspace.owner_user_id}.`, `当前用户：${state.account_management.workspace.current_principal_display_name || state.current_principal_display_name || state.account_management.workspace.owner_user_id}。`),
           this.text(`Weixin setup entry: ${gateway.weixin?.configured ? 'configured' : gateway.manage_url || state.account_management?.gateway?.manage_url || 'HarborGate manage URL pending'}.`, `微信配置入口：${gateway.weixin?.configured ? '已配置' : gateway.manage_url || state.account_management?.gateway?.manage_url || 'HarborGate manage URL 待投影'}。`),
@@ -914,7 +914,7 @@ export class HarborDeskAdminApiService {
         'HarborOS',
         this.projectionValue(harborOsStatus),
         this.projectionReadiness(harborOsStatus),
-        this.projectionDetail(harborOsStatus, this.text('HarborOS status is read from the HarborOS status API, not inferred from HarborDesk.', 'HarborOS 状态来自 HarborOS status API，不由 HarborDesk 推断。')),
+        this.projectionDetail(harborOsStatus, this.text('HarborOS status is read from the HarborOS status API, not inferred from Harbor Assistant.', 'HarborOS 状态来自 HarborOS status API，不由 Harbor Assistant 推断。')),
         harborOsStatus.endpoint,
         '/harboros'
       ),
@@ -944,10 +944,10 @@ export class HarborDeskAdminApiService {
         ':4174 != /ui/',
         'ready',
         this.text(
-          'HarborDesk is the Angular admin shell commonly opened at :4174. HarborOS WebUI remains /ui/ on ports 80/443.',
-          'HarborDesk 是通常打开在 :4174 的 Angular 后台 shell。HarborOS WebUI 仍在 80/443 的 /ui/。'
+          'Harbor Assistant is the Angular admin shell commonly opened at :4174. HarborOS WebUI remains /ui/ on ports 80/443.',
+          'Harbor Assistant 是通常打开在 :4174 的 Angular 后台 shell。HarborOS WebUI 仍在 80/443 的 /ui/。'
         ),
-        'HarborDesk :4174; HarborOS WebUI /ui/ or 80/443',
+        'Harbor Assistant :4174; HarborOS WebUI /ui/ or 80/443',
         '/ui/'
       )
     ];
@@ -1066,7 +1066,7 @@ export class HarborDeskAdminApiService {
         '/devices-aiot',
         hardware.data?.checked_at,
         hardware.endpoint,
-        this.text('Hardware status is distinct from HarborDesk shell availability.', '硬件状态不等同于 HarborDesk shell 可用性。'),
+        this.text('Hardware status is distinct from Harbor Assistant shell availability.', '硬件状态不等同于 Harbor Assistant shell 可用性。'),
         hardware.data?.devices?.map((device) => `${device.label ?? device.device_id}: ${device.status}`) ?? []
       ),
       this.releaseDomainCard(
@@ -1074,18 +1074,18 @@ export class HarborDeskAdminApiService {
         'HarborOS',
         this.projectionReadiness(harborOsStatus),
         this.text(
-          `HarborOS status: ${harborOsStatus.data?.status ?? harborOsStatus.state}. WebUI: ${harborOsStatus.data?.webui_url ?? '/ui/ or 80/443'}. HarborDesk: :4174.`,
-          `HarborOS 状态：${harborOsStatus.data?.status ?? harborOsStatus.state}。WebUI：${harborOsStatus.data?.webui_url ?? '/ui/ 或 80/443'}。HarborDesk：:4174。`
+          `HarborOS status: ${harborOsStatus.data?.status ?? harborOsStatus.state}. WebUI: ${harborOsStatus.data?.webui_url ?? '/ui/ or 80/443'}. Harbor Assistant: :4174.`,
+          `HarborOS 状态：${harborOsStatus.data?.status ?? harborOsStatus.state}。WebUI：${harborOsStatus.data?.webui_url ?? '/ui/ 或 80/443'}。Harbor Assistant：:4174。`
         ),
         this.projectionReadiness(harborOsStatus) === 'ready'
-          ? this.text('Use HarborDesk for config/admin; use HarborOS WebUI only for system UI.', '配置管理用 HarborDesk；系统 UI 仍走 HarborOS WebUI。')
+          ? this.text('Use Harbor Assistant for config/admin; use HarborOS WebUI only for system UI.', '配置管理用 Harbor Assistant；系统 UI 仍走 HarborOS WebUI。')
           : this.text('Open the HarborOS page and confirm System Domain projection.', '进入 HarborOS 页面确认 System Domain 投影。'),
         '/harboros',
         harborOsStatus.data?.checked_at,
         harborOsStatus.endpoint,
         this.text('HarborOS remains System Domain only.', 'HarborOS 只保留 System Domain。'),
         [
-          this.text('HarborDesk route: :4174.', 'HarborDesk 路由：:4174。'),
+          this.text('Harbor Assistant route: :4174.', 'Harbor Assistant 路由：:4174。'),
           this.text('HarborOS WebUI: /ui/ or 80/443.', 'HarborOS WebUI：/ui/ 或 80/443。')
         ]
       ),
@@ -1106,7 +1106,7 @@ export class HarborDeskAdminApiService {
           hardware.data?.checked_at
         ]),
         'GET /api/devices/{device_id}/evidence + POST /api/devices/{device_id}/validation/run',
-        this.text('AIoT management lives in HarborDesk plus the AIoT lane, not HarborOS or HarborGate.', 'AIoT 管理在 HarborDesk 与 AIoT lane，不进入 HarborOS 或 HarborGate。'),
+        this.text('AIoT management lives in Harbor Assistant plus the AIoT lane, not HarborOS or HarborGate.', 'AIoT 管理在 Harbor Assistant 与 AIoT lane，不进入 HarborOS 或 HarborGate。'),
         [
           this.text('Evidence renders redacted credential status only.', '证据只显示 redacted 凭据状态。'),
           this.text('RTSP URLs and passwords are not rendered.', '不渲染 RTSP URL 与密码。')
@@ -1194,7 +1194,7 @@ export class HarborDeskAdminApiService {
         'harboros-status-api',
         this.text('Confirm HarborOS status', '确认 HarborOS 状态'),
         this.projectionReadiness(harborOsStatus),
-        this.projectionDetail(harborOsStatus, this.text('Read HarborOS status without mixing it with HarborDesk shell availability.', '读取 HarborOS 状态，不与 HarborDesk shell 可用性混淆。')),
+        this.projectionDetail(harborOsStatus, this.text('Read HarborOS status without mixing it with Harbor Assistant shell availability.', '读取 HarborOS 状态，不与 Harbor Assistant shell 可用性混淆。')),
         harborOsStatus.endpoint,
         '/harboros'
       ),
@@ -1215,11 +1215,11 @@ export class HarborDeskAdminApiService {
         '/models-policies'
       ),
       this.releaseChecklistItem(
-        'harbordesk-harboros-ui-boundary',
-        this.text('Keep HarborDesk and HarborOS WebUI distinct', '区分 HarborDesk 与 HarborOS WebUI'),
+        'harbor-assistant-harboros-ui-boundary',
+        this.text('Keep Harbor Assistant and HarborOS WebUI distinct', '区分 Harbor Assistant 与 HarborOS WebUI'),
         'ready',
-        this.text('HarborDesk :4174 is not HarborOS WebUI /ui/ on 80/443.', 'HarborDesk :4174 不是 80/443 上的 HarborOS WebUI /ui/。'),
-        'HarborDesk :4174; HarborOS WebUI /ui/ or 80/443',
+        this.text('Harbor Assistant :4174 is not HarborOS WebUI /ui/ on 80/443.', 'Harbor Assistant :4174 不是 80/443 上的 HarborOS WebUI /ui/。'),
+        'Harbor Assistant :4174; HarborOS WebUI /ui/ or 80/443',
         '/ui/'
       )
     ];
@@ -1228,10 +1228,10 @@ export class HarborDeskAdminApiService {
   private releaseDeepLinks(extras: ReleaseReadinessDeepLink[]): ReleaseReadinessDeepLink[] {
     const links: ReleaseReadinessDeepLink[] = [
       {
-        label: this.text('HarborDesk Overview (:4174)', 'HarborDesk 总览 (:4174)'),
+        label: this.text('Harbor Assistant Overview (:4174)', 'Harbor Assistant 总览 (:4174)'),
         href: '/overview',
         detail: this.text('Angular admin shell route for release readiness.', '发布 readiness 所在的 Angular 后台 shell 路由。'),
-        endpoint: 'HarborDesk :4174'
+        endpoint: 'Harbor Assistant :4174'
       },
       {
         label: this.text('Devices & AIoT', '设备与 AIoT'),
@@ -1248,13 +1248,13 @@ export class HarborDeskAdminApiService {
       {
         label: 'HarborOS',
         href: '/harboros',
-        detail: this.text('Read HarborOS status inside HarborDesk without treating it as the HarborOS WebUI.', '在 HarborDesk 内读取 HarborOS 状态，但不把它当作 HarborOS WebUI。'),
+        detail: this.text('Read HarborOS status inside Harbor Assistant without treating it as the HarborOS WebUI.', '在 Harbor Assistant 内读取 HarborOS 状态，但不把它当作 HarborOS WebUI。'),
         endpoint: 'GET /api/harboros/status'
       },
       {
         label: 'HarborOS WebUI (/ui/)',
         href: '/ui/',
-        detail: this.text('HarborOS WebUI is served by HarborOS on /ui/ or ports 80/443, separate from HarborDesk :4174.', 'HarborOS WebUI 由 HarborOS 在 /ui/ 或 80/443 提供，和 HarborDesk :4174 分开。'),
+        detail: this.text('HarborOS WebUI is served by HarborOS on /ui/ or ports 80/443, separate from Harbor Assistant :4174.', 'HarborOS WebUI 由 HarborOS 在 /ui/ 或 80/443 提供，和 Harbor Assistant :4174 分开。'),
         endpoint: 'HarborOS WebUI /ui/ or 80/443'
       }
     ];
@@ -1384,16 +1384,16 @@ export class HarborDeskAdminApiService {
         endpoint: 'GET /api/account-management',
         setupFlow: this.setupFlow(
           'Notification target governance',
-          'HarborDesk reuses the HarborOS login principal, but proactive routing now depends on named HarborGate targets instead of IM identity bindings.',
+          'Harbor Assistant reuses the HarborOS login principal, but proactive routing now depends on named HarborGate targets instead of IM identity bindings.',
           [
             this.setupStep(
               'HarborOS principal reuse',
               ownerUserId ? 'ready' : 'blocked',
-              ownerUserId ? 'The HarborOS owner baseline is available to HarborDesk.' : 'Owner principal is not projected yet.',
+              ownerUserId ? 'The HarborOS owner baseline is available to Harbor Assistant.' : 'Owner principal is not projected yet.',
               ownerUserId
                 ? `Workspace owner_user_id: ${ownerUserId}. The same-origin admin principal is expected to align with this identity.`
                 : 'The backend must surface the current HarborOS user before the UI can treat this as release-v1 ready.',
-              ['HarborDesk does not introduce a second local login.', 'This lane intentionally stays inside the OS account model.']
+              ['Harbor Assistant does not introduce a second local login.', 'This lane intentionally stays inside the OS account model.']
             ),
             this.setupStep(
               'Default notification target',
@@ -1652,7 +1652,7 @@ export class HarborDeskAdminApiService {
           )
         ],
         highlights: [
-          this.text('AIoT device management is in HarborDesk Devices & AIoT.', 'AIoT 设备管理入口在 HarborDesk “设备与 AIoT”。'),
+          this.text('AIoT device management is in Harbor Assistant Devices & AIoT.', 'AIoT 设备管理入口在 Harbor Assistant “设备与 AIoT”。'),
           this.text('HarborOS remains System Domain only.', 'HarborOS 页面只保留 System Domain。'),
           this.text('Device credentials render only as redacted configured status.', '设备凭据只显示 redacted/configured 状态。'),
           this.text('DVR video sidecars reuse the existing multimodal RAG/VLM indexing path.', 'DVR 视频 sidecar 复用现有多模态 RAG/VLM 索引路径。')
@@ -1865,10 +1865,10 @@ export class HarborDeskAdminApiService {
             this.setupStep(
               'Same-origin admin principal',
               state.account_management?.workspace?.current_principal_user_id ? 'ready' : 'blocked',
-              state.account_management?.workspace?.current_principal_user_id ? 'HarborDesk follows the HarborOS account model.' : 'The owner principal is not projected yet.',
+              state.account_management?.workspace?.current_principal_user_id ? 'Harbor Assistant follows the HarborOS account model.' : 'The owner principal is not projected yet.',
               state.account_management?.workspace?.current_principal_user_id
                 ? `Current principal: ${state.account_management.workspace.current_principal_display_name || state.account_management.workspace.current_principal_user_id}. Owner baseline: ${state.account_management.workspace.owner_user_id}.`
-                : 'Without the owner projection, HarborDesk cannot claim to be fully OS-native yet.',
+                : 'Without the owner projection, Harbor Assistant cannot claim to be fully OS-native yet.',
               ['The admin UI should feel like part of HarborOS, not a separate SaaS.', 'No second login surface is introduced.']
             )
           ]
@@ -1921,11 +1921,11 @@ export class HarborDeskAdminApiService {
       data: {
         ...this.baseModel('models-policies'),
         eyebrow: 'Model center and retrieval operations',
-        summary: 'Runtime alignment, multimodal readiness, knowledge roots, endpoint state, and route-policy control now share the same HarborDesk page.',
+        summary: 'Runtime alignment, multimodal readiness, knowledge roots, endpoint state, and route-policy control now share the same Harbor Assistant page.',
         endpoint: 'GET /api/models/endpoints + /api/models/policies + /api/feature-availability + /api/models/local-catalog + /api/models/local-downloads + /api/knowledge/settings + /api/rag/readiness',
         setupFlow: this.setupFlow(
           'Knowledge & multimodal setup flow',
-          'The setup flow exposes OCR, VLM, embedding, source roots, and local index storage using persisted HarborDesk settings.',
+          'The setup flow exposes OCR, VLM, embedding, source roots, and local index storage using persisted Harbor Assistant settings.',
           [
             this.setupStep(
               'Runtime alignment',
@@ -1935,7 +1935,7 @@ export class HarborDeskAdminApiService {
                 : runtimeAlignment
                   ? 'The page is surfacing a projection mismatch instead of hiding it.'
                   : 'Local endpoint inventory is not projected yet.',
-              runtimeAlignment?.detail ?? 'Register endpoints before HarborDesk can compare runtime truth against the stored endpoint projection.',
+              runtimeAlignment?.detail ?? 'Register endpoints before Harbor Assistant can compare runtime truth against the stored endpoint projection.',
               runtimeAlignment
                 ? ['Use Runtime alignment as the first stop before editing endpoint metadata.', 'Projection mismatch means runtime truth is overruling stale admin state.']
                 : ['No local endpoint projection is available yet.']
@@ -2646,6 +2646,6 @@ export class HarborDeskAdminApiService {
     if (typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string') {
       return error.message;
     }
-    return 'The request failed before HarborDesk could render a live projection.';
+    return 'The request failed before Harbor Assistant could render a live projection.';
   }
 }
