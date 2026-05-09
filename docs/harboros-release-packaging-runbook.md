@@ -66,7 +66,7 @@ release-v1 的默认形态固定为：
 
 当前 handoff 增量 baseline：
 
-- Harbor Assistant-only cleanup: removed legacy HarborDesk / removed legacy HarborBot / removed legacy HarborCam active routes and removed legacy `/api/harbordesk/**`; HarborOS 集成面只保留 `/ui/harbor-assistant` 与 `/api/harbor-assistant/**`。
+- Harbor Assistant-only cleanup: removed legacy HarborDesk / removed legacy HarborBot / removed legacy HarborCam active routes and removed legacy `/api/harbordesk/**`; HarborOS 集成面只保留 `/ui/harbor-assistant` 与 `/api/beacon/**`。
 - Media tools packaging: release bundle 必须带
   `media-tools/bin/ffmpeg` 与 `media-tools/bin/ffprobe`，installer 会安装到
   `/var/lib/harborbeacon-agent-ci/runtime/media-tools/bin/` 并写入
@@ -426,7 +426,7 @@ artifact，而不是在当前 release 里改 env 开关。
 - `harbor-agent-hub-helper health` 必须显示 `media_tools.ffmpeg.ok=true`
   与 `media_tools.ffprobe.ok=true`
 - camera live acceptance 必须确认
-  `/api/harbor-assistant/cameras/<device-id>/snapshot.jpg` 返回 `200 image/jpeg`
+  `/api/beacon/cameras/<device-id>/snapshot.jpg` 返回 `200 image/jpeg`
 - `verify-harborbeacon-release --require-execute` 必须能验证 `.deb` 内置 bundle
 - removed legacy HarborDesk / removed legacy HarborBot / removed legacy HarborCam route 不应继续作为 active UI 入口存在
 - removed legacy `/api/harbordesk/**` 不应继续作为 active HarborBeacon Admin API 前缀存在

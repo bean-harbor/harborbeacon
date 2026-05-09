@@ -16,6 +16,52 @@ def test_required_contract_documents_exist() -> None:
     assert not missing
 
 
+def test_harborgate_v3_northbound_contract_is_wired_to_code_and_docs() -> None:
+    gate_root = ROOT.parent / "HarborGate"
+    contract = (gate_root / "HarborBeacon-HarborGate-Agent-Contract-v3.0.md").read_text(
+        encoding="utf-8"
+    )
+    server = (
+        gate_root / "rust" / "harborgate" / "src" / "server.rs"
+    ).read_text(encoding="utf-8")
+    gateway = (
+        gate_root / "rust" / "harborgate" / "src" / "gateway.rs"
+    ).read_text(encoding="utf-8")
+    collaboration = read_doc("HarborBeacon-Harbor-Collaboration-Contract-v2.md")
+    assistant = read_doc("frontend/harbor-assistant/src/app/core/admin-api.service.ts")
+
+    for phrase in [
+        "POST /api/gateway/turns",
+        "/api/beacon/*",
+        "conversation.handle",
+        "transport.route_key",
+        "HarborGate must not own Home Device",
+    ]:
+        assert phrase in contract
+
+    assert '.route("/api/gateway/turns", post(gateway_turn))' in server
+    assert '.route("/api/beacon/{*path}", any(beacon_proxy))' in server
+    assert "handle_gateway_turn" in gateway
+    assert "POST /api/gateway/turns" in collaboration
+    assert "/api/beacon/*" in collaboration
+    assert "'/api/beacon' : '/api'" in assistant
+    assert "'/api/harbor-assistant' : '/api'" not in assistant
+
+
+def test_active_docs_use_beacon_api_prefix_not_harbor_assistant_api_prefix() -> None:
+    active_docs = [
+        "HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md",
+        "docs/harborbeacon-new-collaborator-brief.md",
+        "docs/harboros-release-packaging-runbook.md",
+        "docs/harbornas-iso-packaging-dependencies.md",
+    ]
+
+    for doc in active_docs:
+        content = read_doc(doc)
+        assert "/api/beacon" in content, doc
+        assert "/api/harbor-assistant" not in content, doc
+
+
 def test_v2_roadmap_preserves_executor_order() -> None:
     content = read_doc("HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md")
     expected = [
@@ -185,7 +231,7 @@ def test_harboros_iso_handoff_docs_assign_image_build_ownership() -> None:
         "不是三个独立\nWebUI 包",
         "不作为独立打包目标",
         "后端 API 前缀只保留",
-        "/api/harbor-assistant/**",
+        "/api/beacon/**",
         "HARBOR_FFPROBE_BIN",
         "Harbor Assistant-only 入口已经收敛完成",
         "removed legacy HarborDesk /",

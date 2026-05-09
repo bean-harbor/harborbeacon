@@ -4566,6 +4566,12 @@ fn normalize_unified_admin_url(raw_url: &str) -> String {
 }
 
 fn normalize_unified_admin_path(path: &str) -> String {
+    if path == "/api/beacon" {
+        return "/api/state".to_string();
+    }
+    if let Some(tail) = path.strip_prefix("/api/beacon/") {
+        return format!("/api/{tail}");
+    }
     if path == "/api/harbor-assistant" {
         return "/api/state".to_string();
     }
@@ -13288,7 +13294,24 @@ mod tests {
     }
 
     #[test]
-    fn harbor_assistant_api_prefix_normalizes_to_admin_api_routes() {
+    fn beacon_api_prefix_normalizes_to_admin_api_routes() {
+        assert_eq!(
+            normalize_unified_admin_path("/api/beacon/cameras/recording-settings"),
+            "/api/cameras/recording-settings"
+        );
+        assert_eq!(
+            normalize_unified_admin_path("/api/beacon/cameras/camera-1/snapshot.jpg"),
+            "/api/cameras/camera-1/snapshot.jpg"
+        );
+        assert_eq!(
+            normalize_unified_admin_path("/api/beacon/models/capabilities"),
+            "/api/models/capabilities"
+        );
+        assert_eq!(normalize_unified_admin_path("/api/beacon"), "/api/state");
+    }
+
+    #[test]
+    fn harbor_assistant_api_prefix_remains_deprecated_alias() {
         assert_eq!(
             normalize_unified_admin_path("/api/harbor-assistant/cameras/recording-settings"),
             "/api/cameras/recording-settings"

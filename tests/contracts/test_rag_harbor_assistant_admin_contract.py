@@ -113,7 +113,8 @@ def test_harbor_assistant_admin_service_uses_same_origin_beacon_api_only() -> No
     assert "this.http.get<" in service
     assert "private apiUrl(path: string): string" in service
     assert "private resolveApiBase(): string" in service
-    assert "'/api/harbor-assistant' : '/api'" in service
+    assert "'/api/beacon' : '/api'" in service
+    assert "'/api/harbor-assistant' : '/api'" not in service
     assert "http://" not in service
     assert "https://" not in service
 

@@ -78,7 +78,7 @@ At the start of each session:
 - Run the local model promotion benchmark on `.82` before claiming active local
   runtime execution.
 - Keep Harbor Assistant and Search on the real same-origin
-  `/api/harbor-assistant/*` surfaces; do not add a demo-only turn page.
+  `/api/beacon/*` surfaces; do not add a demo-only turn page.
 
 ## Drift Guards
 

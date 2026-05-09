@@ -452,7 +452,7 @@ export class HarborAssistantAdminApiService {
 
   private resolveApiBase(): string {
     const pathname = globalThis.location?.pathname ?? '';
-    return pathname.startsWith('/ui/') || pathname === '/ui' ? '/api/harbor-assistant' : '/api';
+    return pathname.startsWith('/ui/') || pathname === '/ui' ? '/api/beacon' : '/api';
   }
 
   private getDeviceEvidenceProjections(

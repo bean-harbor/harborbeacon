@@ -252,7 +252,7 @@ P0:
 
 P1:
 
-1. Harden Harbor Assistant and Search as product surfaces while keeping them on real `/api/harbor-assistant/*` APIs.
+1. Harden Harbor Assistant and Search as product surfaces while keeping them on real `/api/beacon/*` APIs through the HarborGate northbound edge.
 2. Extend release packaging toward HarborNAS ISO integration without changing the v2.0 public contract.
 3. Add local-first observability: fallback ratio, local/backend readiness, policy decision evidence, and failed-promotion reasons.
 

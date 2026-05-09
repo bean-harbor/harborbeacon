@@ -21,6 +21,10 @@ The authoritative cross-repo IM boundary remains:
 
 - `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
 
+The northbound channel-edge upgrade is:
+
+- `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-Agent-Contract-v3.0.md`
+
 The previous v1.5 contract is historical reference only during the v2.0
 upgrade.
 
@@ -197,6 +201,9 @@ Meaning:
 - HarborBeacon MUST NOT directly deliver IM platform messages after cutover.
 - HarborBeacon MUST NOT become the long-term owner of IM platform credentials.
 - HarborGate MUST NOT absorb HarborBeacon business semantics.
+- HarborGate MAY act as the northbound channel edge for Android/Web chat and
+  Beacon admin/config proxying, but MUST NOT own Beacon device, knowledge,
+  model, approval, artifact, audit, or workflow truth.
 - HarborOS control MUST NOT silently absorb Home Device Domain ownership.
 - AIoT work MUST NOT silently collapse device-native control into HarborOS
   system control.
@@ -219,6 +226,13 @@ without explicit multi-lane sign-off:
 - outbound notification request and response semantics
 - `X-Contract-Version`
 - shared HTTP auth and non-200 error-envelope rules
+
+The following northbound edge interfaces are added by the v3.0 channel-edge
+contract and must preserve the same ownership split:
+
+- `POST /api/gateway/turns`
+- `/api/beacon/*` as the external proxy prefix for Beacon-owned admin/config APIs
+- `/api/harbor-assistant/*` only as a deprecated migration alias
 
 ## Default Ownership Rules
 
@@ -422,6 +436,8 @@ A cross-lane release is allowed only when:
 - rollback shape is documented for boundary-moving changes
 - no repo import or runtime-state sharing violation was introduced
 - IM credential ownership did not leak into HarborBeacon
+- Beacon-owned device credentials, model secrets, camera config, knowledge roots,
+  approvals, artifacts, and audit did not leak into HarborGate
 - device-native ownership did not collapse into HarborOS system control
 
 ## Working Principle
