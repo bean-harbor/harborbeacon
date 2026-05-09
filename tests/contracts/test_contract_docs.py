@@ -1,6 +1,19 @@
 from conftest import ROOT, read_doc
 
 
+def harborgate_root():
+    candidates = [
+        ROOT.parent / "HarborGate",
+        ROOT / "HarborGate",
+    ]
+    for candidate in candidates:
+        if (candidate / "HarborBeacon-HarborGate-Agent-Contract-v3.0.md").exists():
+            return candidate
+    raise AssertionError(
+        "HarborGate checkout with HarborBeacon-HarborGate-Agent-Contract-v3.0.md is required"
+    )
+
+
 def test_required_contract_documents_exist() -> None:
     required = [
         "HarborBeacon-Middleware-Endpoint-Contract-v1.md",
@@ -17,7 +30,7 @@ def test_required_contract_documents_exist() -> None:
 
 
 def test_harborgate_v3_northbound_contract_is_wired_to_code_and_docs() -> None:
-    gate_root = ROOT.parent / "HarborGate"
+    gate_root = harborgate_root()
     contract = (gate_root / "HarborBeacon-HarborGate-Agent-Contract-v3.0.md").read_text(
         encoding="utf-8"
     )

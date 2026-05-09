@@ -34,6 +34,12 @@ jobs:
     needs: schema_check
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout HarborGate
+        uses: actions/checkout@v4
+        with:
+          repository: Bean-Harbor/HarborGate
+          path: HarborGate
+          token: ${{ secrets.BEAN_HARBOR_GITHUB_TOKEN || github.token }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
