@@ -119,6 +119,46 @@ def test_harbor_assistant_admin_service_uses_same_origin_beacon_api_only() -> No
     assert "https://" not in service
 
 
+def test_home_assistant_admin_page_is_beacon_owned_and_separate_from_devices_aiot() -> None:
+    backend = read_doc("src/bin/agent_hub_admin_api.rs")
+    service = read_doc("frontend/harbor-assistant/src/app/core/admin-api.service.ts")
+    registry = read_doc("frontend/harbor-assistant/src/app/core/page-registry.ts")
+    panel = read_doc("frontend/harbor-assistant/src/app/shared/page-state-panel.component.html")
+    gate = read_doc("../HarborGate/rust/harborgate/src/server.rs")
+
+    for route in [
+        "/api/home-assistant/status",
+        "/api/home-assistant/config",
+        "/api/home-assistant/test",
+        "/api/home-assistant/sync",
+        "/api/home-assistant/entities",
+        "/api/home-assistant/services",
+        "/api/harboros/apps/home-assistant/status",
+        "/api/harboros/apps/home-assistant/install-plan",
+        "/api/harboros/apps/home-assistant/install",
+    ]:
+        assert route in backend
+
+    for path in [
+        "/home-assistant/status",
+        "/home-assistant/config",
+        "/home-assistant/test",
+        "/home-assistant/sync",
+        "/home-assistant/entities",
+        "/home-assistant/services",
+        "/harboros/apps/home-assistant/status",
+    ]:
+        assert path in service
+
+    assert "id: 'home-assistant'" in registry
+    assert registry.index("id: 'devices-aiot'") < registry.index("id: 'home-assistant'")
+    assert "state.data.pageId === 'home-assistant'" in panel
+    assert "state.data.pageId === 'devices-aiot'" in panel
+    assert "beacon_proxy_target_path(\"home-assistant/status\"" in gate
+    for forbidden in ["access_token", "entity_count", "HomeAssistantClient", "provider_kind=bridge"]:
+        assert forbidden not in gate
+
+
 def test_harbor_assistant_index_run_copy_preserves_async_job_boundary() -> None:
     component = read_doc("frontend/harbor-assistant/src/app/pages/desk-page.component.ts")
     panel = read_doc("frontend/harbor-assistant/src/app/shared/page-state-panel.component.html")

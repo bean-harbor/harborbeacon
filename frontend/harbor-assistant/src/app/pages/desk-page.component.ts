@@ -10,6 +10,7 @@ import {
   DiscoveryScanPayload,
   DvrRecordingSettings,
   FilesBrowseResponse,
+  HomeAssistantConfigPayload,
   KnowledgeIndexRunResponse,
   KnowledgeSearchRequestPayload,
   KnowledgeSearchResponse,
@@ -84,6 +85,11 @@ import { PageStatePanelComponent } from '../shared/page-state-panel.component';
       (filesBrowseRequested)="browseFiles($event)"
       (knowledgeSearchRequested)="runKnowledgeSearch($event)"
       (knowledgePreviewRequested)="loadKnowledgePreview($event)"
+      (homeAssistantConfigSave)="saveHomeAssistantConfig($event)"
+      (homeAssistantTest)="testHomeAssistant()"
+      (homeAssistantSync)="syncHomeAssistant()"
+      (homeAssistantInstallPlan)="requestHomeAssistantInstallPlan()"
+      (homeAssistantInstall)="requestHomeAssistantInstall()"
     ></hd-page-state-panel>
   `
 })
@@ -387,6 +393,46 @@ export class DeskPageComponent implements OnDestroy {
 
   protected revokeShareLink(shareLinkId: string): void {
     this.runDeviceAction(`${shareLinkId}:revoke`, this.text('Share link revoked.', '分享链接已撤销。'), () => this.api.revokeShareLink(shareLinkId));
+  }
+
+  protected saveHomeAssistantConfig(payload: HomeAssistantConfigPayload): void {
+    this.runDeviceAction(
+      'home-assistant:config',
+      this.text('Home Assistant connector config saved.', 'Home Assistant 连接配置已保存。'),
+      () => this.api.saveHomeAssistantConfig(payload)
+    );
+  }
+
+  protected testHomeAssistant(): void {
+    this.runDeviceAction(
+      'home-assistant:test',
+      this.text('Home Assistant token test finished.', 'Home Assistant token 测试已完成。'),
+      () => this.api.testHomeAssistant()
+    );
+  }
+
+  protected syncHomeAssistant(): void {
+    this.runDeviceAction(
+      'home-assistant:sync',
+      this.text('Home Assistant entities synced.', 'Home Assistant 实体已同步。'),
+      () => this.api.syncHomeAssistant()
+    );
+  }
+
+  protected requestHomeAssistantInstallPlan(): void {
+    this.runDeviceAction(
+      'home-assistant:install-plan',
+      this.text('Home Assistant managed install plan returned.', 'Home Assistant 托管安装计划已返回。'),
+      () => this.api.getHomeAssistantInstallPlan()
+    );
+  }
+
+  protected requestHomeAssistantInstall(): void {
+    this.runDeviceAction(
+      'home-assistant:install',
+      this.text('Home Assistant managed install request returned a plan.', 'Home Assistant 托管安装请求已返回计划。'),
+      () => this.api.installHomeAssistant(false)
+    );
   }
 
   protected runReleaseReadiness(): void {

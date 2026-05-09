@@ -1585,6 +1585,154 @@
         </article>
       }
 
+      @if (state.data.pageId === 'home-assistant' && hydrateHomeAssistantForm()) {
+        <article class="content-card expanded-card">
+          <div class="section-head">
+            <div>
+              <p class="content-label">Home Assistant</p>
+              <p class="table-copy">{{ text('Connect an existing HA instance, test the token, sync exposed entities, or request the managed container plan.', '连接已有 HA、测试 token、同步 exposed entities，或请求托管容器安装计划。') }}</p>
+            </div>
+            <span class="setup-step-state" [ngClass]="readinessToneClass(state.data.homeAssistant?.status?.status)">
+              {{ state.data.homeAssistant?.status?.status || 'not_configured' }}
+            </span>
+          </div>
+
+          <form class="form-grid compact-form" (submit)="$event.preventDefault(); requestHomeAssistantConfigSave()">
+            <label class="wide-field">
+              <span>Base URL</span>
+              <input name="ha-base-url" [(ngModel)]="homeAssistantForm.base_url" placeholder="scheme://host:8123" />
+            </label>
+            <label>
+              <span>{{ text('Long-lived token', 'Long-lived token') }}</span>
+              <input
+                name="ha-token"
+                type="password"
+                autocomplete="off"
+                [(ngModel)]="homeAssistantForm.access_token"
+                [placeholder]="state.data.homeAssistant?.status?.token_configured ? text('Configured; leave blank to keep', '已配置，留空保留') : text('Required', '必填')"
+              />
+            </label>
+            <label class="wide-field">
+              <span>{{ text('Exposed domains', '暴露 domains') }}</span>
+              <input name="ha-domains" [(ngModel)]="homeAssistantForm.exposed_domains_text" placeholder="light, switch, sensor, binary_sensor, camera" />
+            </label>
+            <label class="toggle-row">
+              <input name="ha-enabled" type="checkbox" [(ngModel)]="homeAssistantForm.enabled" />
+              <span>{{ text('Enable connector', '启用连接器') }}</span>
+            </label>
+            <button type="submit" class="action-button" [disabled]="deviceActionBusyKey === 'home-assistant:config'">
+              {{ deviceActionBusyKey === 'home-assistant:config' ? text('Saving...', '保存中...') : text('Save config', '保存配置') }}
+            </button>
+            <button type="button" class="action-button" [disabled]="deviceActionBusyKey === 'home-assistant:test'" (click)="requestHomeAssistantTest()">
+              {{ deviceActionBusyKey === 'home-assistant:test' ? text('Testing...', '测试中...') : text('Test token', '测试 token') }}
+            </button>
+            <button type="button" class="action-button" [disabled]="deviceActionBusyKey === 'home-assistant:sync'" (click)="requestHomeAssistantSync()">
+              {{ deviceActionBusyKey === 'home-assistant:sync' ? text('Syncing...', '同步中...') : text('Sync entities', '同步实体') }}
+            </button>
+          </form>
+
+          <div class="device-admin-grid">
+            <section class="device-admin-block">
+              <p class="content-label">{{ text('Connection state', '连接状态') }}</p>
+              <ul class="detail-meta">
+                <li>configured: {{ state.data.homeAssistant?.status?.configured ? 'yes' : 'no' }}</li>
+                <li>enabled: {{ state.data.homeAssistant?.status?.enabled ? 'yes' : 'no' }}</li>
+                <li>token: {{ state.data.homeAssistant?.status?.token_configured ? text('configured / redacted', '已配置 / redacted') : text('missing', '缺失') }}</li>
+                @if (state.data.homeAssistant?.status?.location_name) {
+                  <li>{{ text('Location', '位置') }}: {{ state.data.homeAssistant?.status?.location_name }}</li>
+                }
+                @if (state.data.homeAssistant?.status?.version) {
+                  <li>{{ text('Version', '版本') }}: {{ state.data.homeAssistant?.status?.version }}</li>
+                }
+                @if (state.data.homeAssistant?.status?.last_sync_at) {
+                  <li>{{ text('Last sync', '最近同步') }}: {{ state.data.homeAssistant?.status?.last_sync_at }}</li>
+                }
+              </ul>
+              @if (state.data.homeAssistant?.status?.last_error) {
+                <p class="table-copy tone-danger">{{ state.data.homeAssistant?.status?.last_error }}</p>
+              }
+            </section>
+
+            <section class="device-admin-block">
+              <div class="section-head compact-section-head">
+                <div>
+                  <p class="content-label">{{ text('Managed install', '托管安装') }}</p>
+                  <p class="table-copy">{{ state.data.homeAssistant?.installStatus?.message }}</p>
+                </div>
+              </div>
+              <ul class="detail-meta">
+                <li>runtime: {{ state.data.homeAssistant?.installStatus?.runtime }}</li>
+                <li>container: {{ state.data.homeAssistant?.installStatus?.container_name || 'pending' }}</li>
+                @if (state.data.homeAssistant?.installStatus?.onboarding_url) {
+                  <li>onboarding: <a [href]="state.data.homeAssistant?.installStatus?.onboarding_url" target="_blank" rel="noopener">{{ state.data.homeAssistant?.installStatus?.onboarding_url }}</a></li>
+                }
+              </ul>
+              <div class="inline-action">
+                <button type="button" class="action-button" [disabled]="deviceActionBusyKey === 'home-assistant:install-plan'" (click)="requestHomeAssistantInstallPlan()">
+                  {{ deviceActionBusyKey === 'home-assistant:install-plan' ? text('Preparing...', '准备中...') : text('Install plan', '安装计划') }}
+                </button>
+                <button type="button" class="action-button" [disabled]="deviceActionBusyKey === 'home-assistant:install'" (click)="requestHomeAssistantInstall()">
+                  {{ deviceActionBusyKey === 'home-assistant:install' ? text('Requesting...', '请求中...') : text('Request install', '请求安装') }}
+                </button>
+              </div>
+            </section>
+          </div>
+
+          @if (state.data.homeAssistant?.entities?.length) {
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>{{ text('Entity', '实体') }}</th>
+                    <th>Domain</th>
+                    <th>{{ text('State', '状态') }}</th>
+                    <th>{{ text('Projection', '投影') }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  @for (entity of (state.data.homeAssistant?.entities ?? []).slice(0, 80); track entity.entity_id) {
+                    <tr>
+                      <td>
+                        <strong>{{ entity.display_name }}</strong>
+                        <span class="cell-note">{{ entity.entity_id }}</span>
+                      </td>
+                      <td>{{ entity.domain }}</td>
+                      <td>{{ entity.state }}</td>
+                      <td>
+                        <span class="cell-note">provider_key=home_assistant</span>
+                        <span class="cell-note">provider_kind=bridge</span>
+                        <span class="cell-note">{{ entity.domain === 'camera' ? text('camera discovery/status/fallback only', 'camera 仅发现/状态/fallback') : text('read-only state sync', '只读状态同步') }}</span>
+                      </td>
+                    </tr>
+                  }
+                </tbody>
+              </table>
+            </div>
+          }
+
+          @if (state.data.homeAssistant?.services?.length) {
+            <section class="device-admin-block">
+              <p class="content-label">{{ text('Service domains', '服务 domains') }}</p>
+              <div class="detail-grid">
+                @for (domain of (state.data.homeAssistant?.services ?? []).slice(0, 12); track domain.domain) {
+                  <section class="detail-row">
+                    <div class="detail-row-head">
+                      <strong>{{ domain.domain }}</strong>
+                      <span>{{ domain.services.length }}</span>
+                    </div>
+                    <ul class="detail-meta">
+                      @for (service of domain.services.slice(0, 8); track service.service) {
+                        <li>{{ service.service }}</li>
+                      }
+                    </ul>
+                  </section>
+                }
+              </div>
+            </section>
+          }
+        </article>
+      }
+
       @if (state.data.pageId === 'models-policies') {
         <article class="content-card expanded-card">
           <div class="section-head">

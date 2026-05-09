@@ -303,6 +303,24 @@ pub struct DeviceRegistrySnapshot {
     pub stream_profiles: Vec<StreamProfile>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HomeAssistantRegistryEntity {
+    pub entity_id: String,
+    pub domain: String,
+    pub display_name: String,
+    pub state: String,
+    #[serde(default)]
+    pub area_id: Option<String>,
+    #[serde(default)]
+    pub device_class: Option<String>,
+    #[serde(default)]
+    pub last_changed: Option<String>,
+    #[serde(default)]
+    pub last_updated: Option<String>,
+    #[serde(default)]
+    pub attributes: Value,
+}
+
 impl DeviceRegistrySnapshot {
     pub fn from_camera_devices(devices: &[CameraDevice]) -> Self {
         let mut snapshot = Self::default();
@@ -454,6 +472,20 @@ impl DeviceRegistrySnapshot {
         self.prune_missing_camera_devices(&keep_device_ids);
     }
 
+    pub fn upsert_home_assistant_entities(
+        &mut self,
+        entities: &[HomeAssistantRegistryEntity],
+        sync_at: &str,
+    ) {
+        let mut managed_device_ids = Vec::with_capacity(entities.len());
+        for entity in entities {
+            let device_id = home_assistant_device_id(&entity.entity_id);
+            managed_device_ids.push(device_id.clone());
+            self.upsert_home_assistant_device(&device_id, entity, sync_at);
+        }
+        self.prune_missing_home_assistant_entities(&managed_device_ids);
+    }
+
     pub fn to_camera_devices(&self) -> Vec<CameraDevice> {
         self.camera_targets().into_iter().map(Into::into).collect()
     }
@@ -583,6 +615,162 @@ impl DeviceRegistrySnapshot {
         self.upsert_camera_profile(camera);
         self.replace_managed_camera_capabilities(camera);
         self.replace_managed_provider_bindings(camera);
+    }
+
+    fn upsert_home_assistant_device(
+        &mut self,
+        device_id: &str,
+        entity: &HomeAssistantRegistryEntity,
+        sync_at: &str,
+    ) {
+        self.upsert_home_assistant_record(device_id, entity);
+        self.upsert_home_assistant_twin(device_id, entity);
+        self.replace_home_assistant_binding(device_id, entity, sync_at);
+        self.replace_home_assistant_capabilities(device_id, entity);
+    }
+
+    fn upsert_home_assistant_record(
+        &mut self,
+        device_id: &str,
+        entity: &HomeAssistantRegistryEntity,
+    ) {
+        let metadata = json!({
+            "provider_key": "home_assistant",
+            "provider_kind": "bridge",
+            "remote_device_id": entity.entity_id,
+            "domain": entity.domain,
+            "device_class": entity.device_class,
+            "read_only_mvp": true,
+            "camera_role": if entity.domain == "camera" {
+                "discovery_status_fallback"
+            } else {
+                "state_projection"
+            },
+        });
+        if let Some(existing) = self
+            .devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id)
+        {
+            existing.kind = home_assistant_device_kind(&entity.domain);
+            existing.display_name = entity.display_name.clone();
+            existing.primary_room_id = entity.area_id.clone();
+            existing.lifecycle_state = DeviceLifecycleState::Registered;
+            existing.source = "home_assistant".to_string();
+            existing.metadata = metadata;
+        } else {
+            self.devices.push(ControlDeviceRecord {
+                device_id: device_id.to_string(),
+                workspace_id: String::new(),
+                kind: home_assistant_device_kind(&entity.domain),
+                subtype: Some(entity.domain.clone()),
+                display_name: entity.display_name.clone(),
+                aliases: Vec::new(),
+                vendor: Some("Home Assistant".to_string()),
+                model: entity.device_class.clone(),
+                serial_number: None,
+                mac_address: None,
+                primary_room_id: entity.area_id.clone(),
+                lifecycle_state: DeviceLifecycleState::Registered,
+                source: "home_assistant".to_string(),
+                metadata,
+            });
+        }
+    }
+
+    fn upsert_home_assistant_twin(
+        &mut self,
+        device_id: &str,
+        entity: &HomeAssistantRegistryEntity,
+    ) {
+        let connectivity_state = home_assistant_connectivity_state(&entity.state);
+        let reported_state = json!({
+            "state": entity.state,
+            "attributes": entity.attributes,
+            "domain": entity.domain,
+            "entity_id": entity.entity_id,
+        });
+        let last_seen_at = entity
+            .last_updated
+            .clone()
+            .or_else(|| entity.last_changed.clone());
+        if let Some(existing) = self
+            .device_twins
+            .iter_mut()
+            .find(|twin| twin.device_id == device_id)
+        {
+            existing.connectivity_state = connectivity_state;
+            existing.reported_state = reported_state;
+            existing.last_seen_at = last_seen_at;
+        } else {
+            self.device_twins.push(DeviceTwin {
+                device_id: device_id.to_string(),
+                connectivity_state,
+                reported_state,
+                desired_state: json!({}),
+                health_state: json!({}),
+                last_event_id: None,
+                last_seen_at,
+            });
+        }
+    }
+
+    fn replace_home_assistant_binding(
+        &mut self,
+        device_id: &str,
+        entity: &HomeAssistantRegistryEntity,
+        sync_at: &str,
+    ) {
+        self.provider_bindings.retain(|binding| {
+            !(binding.device_id == device_id && binding.provider_key == "home_assistant")
+        });
+        self.provider_bindings.push(ProviderBinding {
+            binding_id: home_assistant_binding_id(device_id),
+            device_id: device_id.to_string(),
+            provider_account_id: None,
+            provider_key: "home_assistant".to_string(),
+            provider_kind: ProviderKind::Bridge,
+            remote_device_id: Some(entity.entity_id.clone()),
+            credential_ref: None,
+            binding_status: ProviderBindingStatus::Active,
+            support_mode: DeviceSupportMode::Bridge,
+            metadata: json!({
+                "domain": entity.domain,
+                "device_class": entity.device_class,
+                "read_only_mvp": true,
+                "service_calls_exposed": false,
+            }),
+            last_sync_at: Some(sync_at.to_string()),
+        });
+    }
+
+    fn replace_home_assistant_capabilities(
+        &mut self,
+        device_id: &str,
+        entity: &HomeAssistantRegistryEntity,
+    ) {
+        self.capabilities.retain(|capability| {
+            !(capability.device_id == device_id
+                && capability
+                    .source_binding_id
+                    .as_deref()
+                    .is_some_and(|binding_id| binding_id == home_assistant_binding_id(device_id)))
+        });
+        self.capabilities.push(CapabilityRecord {
+            capability_id: format!("{device_id}::capability::ha_state"),
+            device_id: device_id.to_string(),
+            capability_code: format!("ha.{}.state", entity.domain),
+            category: CapabilityCategory::State,
+            access_mode: CapabilityAccessMode::Read,
+            support_mode: DeviceSupportMode::Bridge,
+            availability: home_assistant_capability_availability(&entity.state),
+            source_binding_id: Some(home_assistant_binding_id(device_id)),
+            metadata: json!({
+                "entity_id": entity.entity_id,
+                "domain": entity.domain,
+                "read_only_mvp": true,
+            }),
+        });
     }
 
     fn upsert_camera_record(&mut self, camera: &CameraDevice) {
@@ -789,6 +977,38 @@ impl DeviceRegistrySnapshot {
         self.stream_profiles
             .retain(|profile| !remove_device_ids.iter().any(|id| id == &profile.device_id));
     }
+
+    fn prune_missing_home_assistant_entities(&mut self, keep_device_ids: &[String]) {
+        let remove_device_ids: Vec<String> = self
+            .devices
+            .iter()
+            .filter(|device| {
+                device.source == "home_assistant"
+                    && !keep_device_ids.iter().any(|id| id == &device.device_id)
+            })
+            .map(|device| device.device_id.clone())
+            .collect();
+        if remove_device_ids.is_empty() {
+            return;
+        }
+        self.devices
+            .retain(|device| !remove_device_ids.iter().any(|id| id == &device.device_id));
+        self.device_endpoints
+            .retain(|endpoint| !remove_device_ids.iter().any(|id| id == &endpoint.device_id));
+        self.provider_bindings
+            .retain(|binding| !remove_device_ids.iter().any(|id| id == &binding.device_id));
+        self.capabilities.retain(|capability| {
+            !remove_device_ids
+                .iter()
+                .any(|id| id == &capability.device_id)
+        });
+        self.device_twins
+            .retain(|twin| !remove_device_ids.iter().any(|id| id == &twin.device_id));
+        self.camera_profiles
+            .retain(|profile| !remove_device_ids.iter().any(|id| id == &profile.device_id));
+        self.stream_profiles
+            .retain(|profile| !remove_device_ids.iter().any(|id| id == &profile.device_id));
+    }
 }
 
 impl Default for DeviceRegistrySnapshot {
@@ -803,6 +1023,55 @@ impl Default for DeviceRegistrySnapshot {
             camera_profiles: Vec::new(),
             stream_profiles: Vec::new(),
         }
+    }
+}
+
+fn home_assistant_device_id(entity_id: &str) -> String {
+    let mut slug = String::with_capacity(entity_id.len());
+    for ch in entity_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "ha-entity".to_string()
+    } else {
+        format!("ha-{slug}")
+    }
+}
+
+fn home_assistant_binding_id(device_id: &str) -> String {
+    format!("{device_id}::binding::home_assistant")
+}
+
+fn home_assistant_device_kind(domain: &str) -> crate::control_plane::devices::DeviceKind {
+    match domain {
+        "camera" => crate::control_plane::devices::DeviceKind::Camera,
+        "light" => crate::control_plane::devices::DeviceKind::Light,
+        "sensor" | "binary_sensor" => crate::control_plane::devices::DeviceKind::Sensor,
+        "lock" => crate::control_plane::devices::DeviceKind::Lock,
+        "media_player" | "scene" | "script" | "automation" | "climate" | "cover" | "fan"
+        | "switch" => crate::control_plane::devices::DeviceKind::Service,
+        _ => crate::control_plane::devices::DeviceKind::Unknown,
+    }
+}
+
+fn home_assistant_connectivity_state(state: &str) -> ConnectivityState {
+    match state {
+        "unavailable" => ConnectivityState::Offline,
+        "unknown" => ConnectivityState::Unknown,
+        _ => ConnectivityState::Online,
+    }
+}
+
+fn home_assistant_capability_availability(state: &str) -> CapabilityAvailability {
+    match state {
+        "unavailable" => CapabilityAvailability::Unavailable,
+        "unknown" => CapabilityAvailability::Degraded,
+        _ => CapabilityAvailability::Available,
     }
 }
 
@@ -1299,7 +1568,7 @@ mod tests {
 
     use super::{
         CameraDevice, DeviceKind, DeviceRegistrySnapshot, DeviceRegistryStore,
-        ResolvedCameraTarget, StreamTransport,
+        HomeAssistantRegistryEntity, ResolvedCameraTarget, StreamTransport,
     };
 
     #[test]
@@ -1350,6 +1619,65 @@ mod tests {
         let round_tripped = snapshot.to_camera_devices();
 
         assert_eq!(round_tripped, vec![device]);
+    }
+
+    #[test]
+    fn upsert_home_assistant_entities_projects_bridge_provider_records() {
+        let mut snapshot = DeviceRegistrySnapshot::default();
+        snapshot.upsert_home_assistant_entities(
+            &[
+                HomeAssistantRegistryEntity {
+                    entity_id: "light.kitchen".to_string(),
+                    domain: "light".to_string(),
+                    display_name: "Kitchen".to_string(),
+                    state: "on".to_string(),
+                    area_id: Some("kitchen".to_string()),
+                    device_class: Some("light".to_string()),
+                    last_changed: Some("2026-05-09T01:00:00Z".to_string()),
+                    last_updated: Some("2026-05-09T01:00:01Z".to_string()),
+                    attributes: json!({"brightness": 128}),
+                },
+                HomeAssistantRegistryEntity {
+                    entity_id: "camera.porch".to_string(),
+                    domain: "camera".to_string(),
+                    display_name: "Porch".to_string(),
+                    state: "idle".to_string(),
+                    area_id: None,
+                    device_class: None,
+                    last_changed: None,
+                    last_updated: None,
+                    attributes: json!({}),
+                },
+            ],
+            "123",
+        );
+
+        let binding = snapshot
+            .provider_bindings
+            .iter()
+            .find(|binding| binding.remote_device_id.as_deref() == Some("light.kitchen"))
+            .expect("ha binding");
+        assert_eq!(binding.provider_key, "home_assistant");
+        assert_eq!(binding.provider_kind, ProviderKind::Bridge);
+        assert_eq!(binding.support_mode, DeviceSupportMode::Bridge);
+
+        let capability = snapshot
+            .capabilities
+            .iter()
+            .find(|capability| capability.device_id == "ha-light-kitchen")
+            .expect("ha capability");
+        assert_eq!(capability.access_mode, CapabilityAccessMode::Read);
+        assert_eq!(capability.support_mode, DeviceSupportMode::Bridge);
+
+        let camera = snapshot
+            .devices
+            .iter()
+            .find(|device| device.device_id == "ha-camera-porch")
+            .expect("ha camera");
+        assert_eq!(
+            camera.metadata["camera_role"],
+            json!("discovery_status_fallback")
+        );
     }
 
     #[test]

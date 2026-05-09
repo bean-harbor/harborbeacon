@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -23,6 +23,9 @@ use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCo
 use uuid::Uuid;
 
 use harborbeacon_local_agent::adapters::rtsp::{CommandRtspAdapter, RtspProbeAdapter};
+use harborbeacon_local_agent::connectors::home_assistant::{
+    HomeAssistantClient, HomeAssistantClientConfig, HomeAssistantEntity, HomeAssistantServiceDomain,
+};
 use harborbeacon_local_agent::connectors::im_gateway::GatewayPlatformStatus;
 use harborbeacon_local_agent::connectors::storage::StorageTarget;
 use harborbeacon_local_agent::control_plane::media::{
@@ -44,8 +47,9 @@ use harborbeacon_local_agent::runtime::admin_console::{
     user_default_delivery_surface, user_recent_interactive_surface, validate_knowledge_settings,
     AccountManagementSnapshot, AdminConsoleState, AdminConsoleStore, AdminDefaults,
     AdminModelCenterState, BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord,
-    GatewayStatusSummary, KnowledgeIndexJobRecord, KnowledgeSettings, KnowledgeSourceRoot,
-    ModelDownloadJobRecord, RagResourceProfile,
+    GatewayStatusSummary, HomeAssistantAdminState, HomeAssistantConfigUpdate,
+    KnowledgeIndexJobRecord, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
+    RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::discovery::RtspProbeRequest;
 use harborbeacon_local_agent::runtime::dvr::{
@@ -69,7 +73,7 @@ use harborbeacon_local_agent::runtime::model_center::{
     redact_model_endpoint, test_model_endpoint, ModelEndpointTestResult, ADMIN_STATE_PATH_ENV,
 };
 use harborbeacon_local_agent::runtime::registry::{
-    CameraCapabilities, CameraDevice, DeviceRegistryStore,
+    CameraCapabilities, CameraDevice, DeviceRegistryStore, HomeAssistantRegistryEntity,
 };
 use harborbeacon_local_agent::runtime::remote_view;
 use harborbeacon_local_agent::runtime::task_api::{
@@ -321,6 +325,102 @@ struct DeviceMetadataPatchRequest {
 
 #[derive(Debug, Deserialize)]
 struct BridgeConfigRequest {}
+
+#[derive(Debug, Deserialize, Default)]
+struct HomeAssistantConfigRequest {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    exposed_domains: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HomeAssistantStatusResponse {
+    configured: bool,
+    enabled: bool,
+    base_url: String,
+    token_configured: bool,
+    token_redacted: bool,
+    exposed_domains: Vec<String>,
+    status: String,
+    #[serde(default)]
+    last_error: Option<String>,
+    #[serde(default)]
+    last_test_at: Option<String>,
+    #[serde(default)]
+    last_sync_at: Option<String>,
+    entity_count: usize,
+    service_count: usize,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    location_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HomeAssistantConfigResponse {
+    status: HomeAssistantStatusResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct HomeAssistantEntitiesResponse {
+    entities: Vec<HomeAssistantEntity>,
+}
+
+#[derive(Debug, Serialize)]
+struct HomeAssistantServicesResponse {
+    services: Vec<HomeAssistantServiceDomain>,
+}
+
+#[derive(Debug, Serialize)]
+struct HomeAssistantSyncResponse {
+    status: HomeAssistantStatusResponse,
+    entities: Vec<HomeAssistantEntity>,
+    service_domains: Vec<HomeAssistantServiceDomain>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct HomeAssistantInstallRequest {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HomeAssistantInstallStatusResponse {
+    app_id: String,
+    status: String,
+    managed: bool,
+    runtime: String,
+    #[serde(default)]
+    container_name: Option<String>,
+    #[serde(default)]
+    onboarding_url: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HomeAssistantInstallPlanResponse {
+    app_id: String,
+    target: String,
+    runtime: String,
+    image: String,
+    container_name: String,
+    ports: Vec<String>,
+    volumes: Vec<String>,
+    next_step: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HomeAssistantInstallResponse {
+    status: String,
+    dry_run: bool,
+    plan: HomeAssistantInstallPlanResponse,
+    message: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct NotificationTargetUpsertRequest {
@@ -1234,6 +1334,33 @@ impl AdminApi {
             Method::Get if path == "/api/harboros/im-capability-map" => self
                 .handle_harboros_im_capability_map(&identity_hints)
                 .boxed(),
+            Method::Get if path == "/api/home-assistant/status" => {
+                self.handle_home_assistant_status(&identity_hints).boxed()
+            }
+            Method::Put if path == "/api/home-assistant/config" => self
+                .handle_save_home_assistant_config(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post if path == "/api/home-assistant/test" => {
+                self.handle_test_home_assistant(&identity_hints).boxed()
+            }
+            Method::Post if path == "/api/home-assistant/sync" => {
+                self.handle_sync_home_assistant(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/home-assistant/entities" => {
+                self.handle_home_assistant_entities(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/home-assistant/services" => {
+                self.handle_home_assistant_services(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/harboros/apps/home-assistant/status" => self
+                .handle_home_assistant_install_status(&identity_hints)
+                .boxed(),
+            Method::Post if path == "/api/harboros/apps/home-assistant/install-plan" => self
+                .handle_home_assistant_install_plan(&identity_hints)
+                .boxed(),
+            Method::Post if path == "/api/harboros/apps/home-assistant/install" => self
+                .handle_home_assistant_install(&mut request, &identity_hints)
+                .boxed(),
             Method::Get if path == "/api/models/endpoints" => {
                 self.handle_model_endpoints(&identity_hints).boxed()
             }
@@ -2135,6 +2262,235 @@ impl AdminApi {
         ok_json(&build_harboros_im_capability_map())
     }
 
+    fn handle_home_assistant_status(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.home_assistant_state() {
+            Ok(state) => ok_json(&build_home_assistant_status_response(&state)),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_save_home_assistant_config(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let body: HomeAssistantConfigRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let update = HomeAssistantConfigUpdate {
+            enabled: body.enabled,
+            base_url: body.base_url,
+            access_token: body.access_token,
+            exposed_domains: body.exposed_domains,
+        };
+        match self.admin_store.save_home_assistant_config(update) {
+            Ok(state) => ok_json(&HomeAssistantConfigResponse {
+                status: build_home_assistant_status_response(
+                    &harborbeacon_local_agent::runtime::admin_console::redact_home_assistant_state(
+                        state.home_assistant,
+                    ),
+                ),
+            }),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_test_home_assistant(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let state = match self.admin_store.home_assistant_secret_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let client = match home_assistant_client_from_state(&state) {
+            Ok(client) => client,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let test = client.test_connection();
+        let persisted = self.admin_store.record_home_assistant_test(
+            test.ok,
+            test.version.clone(),
+            test.location_name.clone(),
+            test.error.clone(),
+        );
+        match persisted {
+            Ok(state) => ok_json(&json!({
+                "test": test,
+                "status": build_home_assistant_status_response(
+                    &harborbeacon_local_agent::runtime::admin_console::redact_home_assistant_state(
+                        state.home_assistant,
+                    ),
+                ),
+            })),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_sync_home_assistant(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let state = match self.admin_store.home_assistant_secret_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let client = match home_assistant_client_from_state(&state) {
+            Ok(client) => client,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let entities = match client.fetch_entities() {
+            Ok(entities) => filter_home_assistant_entities(entities, &state.exposed_domains),
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let services = match client.fetch_services() {
+            Ok(services) => services,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let sync_at = now_unix_string();
+        let mut snapshot = match self.admin_store.registry_store().load_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let registry_entities = entities
+            .iter()
+            .cloned()
+            .map(home_assistant_registry_entity)
+            .collect::<Vec<_>>();
+        snapshot.upsert_home_assistant_entities(&registry_entities, &sync_at);
+        if let Err(error) = self.admin_store.registry_store().save_snapshot(&snapshot) {
+            return error_json(StatusCode(500), &error);
+        }
+        let service_count = services.iter().map(|domain| domain.services.len()).sum();
+        match self
+            .admin_store
+            .record_home_assistant_sync(entities.len(), service_count)
+        {
+            Ok(state) => ok_json(&HomeAssistantSyncResponse {
+                status: build_home_assistant_status_response(
+                    &harborbeacon_local_agent::runtime::admin_console::redact_home_assistant_state(
+                        state.home_assistant,
+                    ),
+                ),
+                entities,
+                service_domains: services,
+            }),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_home_assistant_entities(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let state = match self.admin_store.home_assistant_secret_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let client = match home_assistant_client_from_state(&state) {
+            Ok(client) => client,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        match client.fetch_entities() {
+            Ok(entities) => ok_json(&HomeAssistantEntitiesResponse {
+                entities: filter_home_assistant_entities(entities, &state.exposed_domains),
+            }),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_home_assistant_services(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let state = match self.admin_store.home_assistant_secret_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let client = match home_assistant_client_from_state(&state) {
+            Ok(client) => client,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        match client.fetch_services() {
+            Ok(services) => ok_json(&HomeAssistantServicesResponse { services }),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_home_assistant_install_status(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        ok_json(&build_home_assistant_install_status_response())
+    }
+
+    fn handle_home_assistant_install_plan(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        ok_json(&build_home_assistant_install_plan_response())
+    }
+
+    fn handle_home_assistant_install(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let body: HomeAssistantInstallRequest = match read_json_body_or_default(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let plan = build_home_assistant_install_plan_response();
+        if body.dry_run {
+            return ok_json(&HomeAssistantInstallResponse {
+                status: "dry_run".to_string(),
+                dry_run: true,
+                plan,
+                message: "Dry run only; no Docker command was executed.".to_string(),
+            });
+        }
+        match install_home_assistant_container() {
+            Ok(status) => ok_json(&HomeAssistantInstallResponse {
+                status: status.status,
+                dry_run: false,
+                plan,
+                message: status.message,
+            }),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
     fn handle_model_endpoints(
         &self,
         hints: &AccessIdentityHints,
@@ -2579,7 +2935,10 @@ impl AdminApi {
             .find(|model| model.model_id == model_id)
             .ok_or_else(|| format!("未找到模型 {model_id}"))?;
         if !model.installed {
-            return Err(format!("模型 {} 尚未下载完成，不能启动", model.display_name));
+            return Err(format!(
+                "模型 {} 尚未下载完成，不能启动",
+                model.display_name
+            ));
         }
         if !catalog_model_matches_kind_or_capability(model, model_kind, capability_id) {
             return Err(format!(
@@ -5764,6 +6123,15 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/cameras/recordings/timeline"
         || path == "/api/harboros/status"
         || path == "/api/harboros/im-capability-map"
+        || path == "/api/home-assistant/status"
+        || path == "/api/home-assistant/config"
+        || path == "/api/home-assistant/test"
+        || path == "/api/home-assistant/sync"
+        || path == "/api/home-assistant/entities"
+        || path == "/api/home-assistant/services"
+        || path == "/api/harboros/apps/home-assistant/status"
+        || path == "/api/harboros/apps/home-assistant/install-plan"
+        || path == "/api/harboros/apps/home-assistant/install"
         || path == "/api/models/endpoints"
         || path == "/api/models/capabilities"
         || path == "/api/models/store"
@@ -5813,6 +6181,7 @@ fn is_harbor_assistant_client_route(path: &str) -> bool {
             | "/account-management"
             | "/tasks-approvals"
             | "/devices-aiot"
+            | "/home-assistant"
             | "/harboros"
             | "/models-policies"
             | "/system-settings"
@@ -8146,6 +8515,192 @@ fn command_available(command: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn build_home_assistant_status_response(
+    state: &HomeAssistantAdminState,
+) -> HomeAssistantStatusResponse {
+    let token_configured = !state.access_token.trim().is_empty();
+    HomeAssistantStatusResponse {
+        configured: !state.base_url.trim().is_empty() && token_configured,
+        enabled: state.enabled,
+        base_url: state.base_url.clone(),
+        token_configured,
+        token_redacted: token_configured,
+        exposed_domains: state.exposed_domains.clone(),
+        status: state.last_status.clone(),
+        last_error: state.last_error.clone(),
+        last_test_at: state.last_test_at.clone(),
+        last_sync_at: state.last_sync_at.clone(),
+        entity_count: state.entity_count,
+        service_count: state.service_count,
+        version: state.version.clone(),
+        location_name: state.location_name.clone(),
+    }
+}
+
+fn home_assistant_client_from_state(
+    state: &HomeAssistantAdminState,
+) -> Result<HomeAssistantClient, String> {
+    if !state.enabled {
+        return Err("Home Assistant integration is disabled".to_string());
+    }
+    let config = HomeAssistantClientConfig::new(&state.base_url, &state.access_token);
+    if !config.configured() {
+        return Err("Home Assistant base URL and access token are required".to_string());
+    }
+    HomeAssistantClient::new(config)
+}
+
+fn filter_home_assistant_entities(
+    entities: Vec<HomeAssistantEntity>,
+    exposed_domains: &[String],
+) -> Vec<HomeAssistantEntity> {
+    if exposed_domains.is_empty() {
+        return entities;
+    }
+    let allowed = exposed_domains
+        .iter()
+        .map(|domain| domain.as_str())
+        .collect::<HashSet<_>>();
+    entities
+        .into_iter()
+        .filter(|entity| allowed.contains(entity.domain.as_str()))
+        .collect()
+}
+
+fn home_assistant_registry_entity(entity: HomeAssistantEntity) -> HomeAssistantRegistryEntity {
+    HomeAssistantRegistryEntity {
+        entity_id: entity.entity_id,
+        domain: entity.domain,
+        display_name: entity.display_name,
+        state: entity.state,
+        area_id: entity.area_id,
+        device_class: entity.device_class,
+        last_changed: entity.last_changed,
+        last_updated: entity.last_updated,
+        attributes: entity.attributes,
+    }
+}
+
+fn build_home_assistant_install_status_response() -> HomeAssistantInstallStatusResponse {
+    if !command_available("docker") {
+        return HomeAssistantInstallStatusResponse {
+            app_id: "home-assistant".to_string(),
+            status: "blocked".to_string(),
+            managed: true,
+            runtime: "docker_container".to_string(),
+            container_name: Some(HOME_ASSISTANT_CONTAINER_NAME.to_string()),
+            onboarding_url: None,
+            message:
+                "Docker is not available on this HarborOS host; managed install cannot run here."
+                    .to_string(),
+        };
+    }
+    if let Some(status) = docker_container_status(HOME_ASSISTANT_CONTAINER_NAME) {
+        let running = status == "running";
+        return HomeAssistantInstallStatusResponse {
+            app_id: "home-assistant".to_string(),
+            status: if running { "running" } else { status.as_str() }.to_string(),
+            managed: true,
+            runtime: "docker_container".to_string(),
+            container_name: Some(HOME_ASSISTANT_CONTAINER_NAME.to_string()),
+            onboarding_url: running.then(|| HOME_ASSISTANT_ONBOARDING_URL.to_string()),
+            message: if running {
+                "Home Assistant container is running; finish onboarding, then connect HarborBeacon with a long-lived token."
+                    .to_string()
+            } else {
+                format!("Home Assistant container exists but Docker reports status={status}.")
+            },
+        };
+    }
+    HomeAssistantInstallStatusResponse {
+        app_id: "home-assistant".to_string(),
+        status: "not_installed".to_string(),
+        managed: true,
+        runtime: "docker_container".to_string(),
+        container_name: Some(HOME_ASSISTANT_CONTAINER_NAME.to_string()),
+        onboarding_url: None,
+        message:
+            "Home Assistant Container is not installed yet; request install to create it with Docker."
+                .to_string(),
+    }
+}
+
+fn build_home_assistant_install_plan_response() -> HomeAssistantInstallPlanResponse {
+    HomeAssistantInstallPlanResponse {
+        app_id: "home-assistant".to_string(),
+        target: "Home Assistant Container".to_string(),
+        runtime: "docker".to_string(),
+        image: HOME_ASSISTANT_IMAGE.to_string(),
+        container_name: HOME_ASSISTANT_CONTAINER_NAME.to_string(),
+        ports: vec!["8123:8123/tcp".to_string()],
+        volumes: vec![format!("{HOME_ASSISTANT_VOLUME_NAME}:/config")],
+        next_step: "Create the container through the HarborOS app executor, finish HA onboarding, then connect HarborBeacon with a long-lived access token.".to_string(),
+    }
+}
+
+const HOME_ASSISTANT_CONTAINER_NAME: &str = "harbor-home-assistant";
+const HOME_ASSISTANT_VOLUME_NAME: &str = "harbor-home-assistant-config";
+const HOME_ASSISTANT_IMAGE: &str = "ghcr.io/home-assistant/home-assistant:stable";
+const HOME_ASSISTANT_ONBOARDING_URL: &str = "http://127.0.0.1:8123";
+
+fn install_home_assistant_container() -> Result<HomeAssistantInstallStatusResponse, String> {
+    if !command_available("docker") {
+        return Err("Docker is not available on this HarborOS host".to_string());
+    }
+    if docker_container_exists(HOME_ASSISTANT_CONTAINER_NAME) {
+        docker_command(["start", HOME_ASSISTANT_CONTAINER_NAME])?;
+        return Ok(build_home_assistant_install_status_response());
+    }
+    docker_command(["volume", "create", HOME_ASSISTANT_VOLUME_NAME])?;
+    docker_command([
+        "run",
+        "-d",
+        "--name",
+        HOME_ASSISTANT_CONTAINER_NAME,
+        "--restart",
+        "unless-stopped",
+        "-p",
+        "8123:8123",
+        "-v",
+        &format!("{HOME_ASSISTANT_VOLUME_NAME}:/config"),
+        HOME_ASSISTANT_IMAGE,
+    ])?;
+    Ok(build_home_assistant_install_status_response())
+}
+
+fn docker_container_exists(name: &str) -> bool {
+    docker_container_status(name).is_some()
+}
+
+fn docker_container_status(name: &str) -> Option<String> {
+    let output = Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Status}}", name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    non_empty_string(&status)
+}
+
+fn docker_command<const N: usize>(args: [&str; N]) -> Result<String, String> {
+    let output = Command::new("docker")
+        .args(args)
+        .output()
+        .map_err(|error| format!("failed to execute Docker: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+    Err(if stderr.is_empty() {
+        format!("Docker command failed with status {}", output.status)
+    } else {
+        stderr
+    })
+}
+
 fn build_harboros_status_response(public_origin: &str) -> HarborOsStatusResponse {
     let webui_url = harboros_webui_url(public_origin);
     let writable_root = env::var("HARBOR_HARBOROS_WRITABLE_ROOT")
@@ -8554,21 +9109,25 @@ fn build_model_capability_status(
         .collect::<Vec<_>>();
     let capability_jobs = latest_model_download_jobs(
         &download_jobs
-        .iter()
-        .filter(|job| {
-            job.metadata
-                .get("capability_id")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value == capability_id)
-                || catalog_models
-                    .iter()
-                    .find(|model| model.model_id == job.model_id)
-                    .is_some_and(|model| {
-                        catalog_model_matches_kind_or_capability(model, model_kind, capability_id)
-                    })
-        })
-        .cloned()
-        .collect::<Vec<_>>(),
+            .iter()
+            .filter(|job| {
+                job.metadata
+                    .get("capability_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == capability_id)
+                    || catalog_models
+                        .iter()
+                        .find(|model| model.model_id == job.model_id)
+                        .is_some_and(|model| {
+                            catalog_model_matches_kind_or_capability(
+                                model,
+                                model_kind,
+                                capability_id,
+                            )
+                        })
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
     );
     let active_download = capability_jobs.iter().any(model_download_job_is_active);
     let installed_model = catalog_models
@@ -8998,7 +9557,10 @@ fn model_hardware_recommendation(
 
     if model_id.contains("35b") {
         return if class == "multi_gpu_or_remote" {
-            recommended("multi-GPU or remote class hardware detected.", "high_end_experimental")
+            recommended(
+                "multi-GPU or remote class hardware detected.",
+                "high_end_experimental",
+            )
         } else {
             not_recommended("35B class models need multi-GPU or remote inference.")
         };
@@ -9036,7 +9598,10 @@ fn model_hardware_recommendation(
         );
     }
 
-    compatible("No strict hardware rule matched this model.", "current_recommended")
+    compatible(
+        "No strict hardware rule matched this model.",
+        "current_recommended",
+    )
 }
 
 fn catalog_model_matches_kind(model: &LocalModelCatalogItem, kind: ModelKind) -> bool {
@@ -12570,21 +13135,21 @@ mod tests {
         build_release_readiness_response, build_rtsp_url_from_patch,
         camera_stream_url_with_credentials, default_model_download_target_path,
         default_model_endpoints, ensure_local_admin_access, ensure_local_camera_access,
-        harbor_assistant_build_missing_response, has_forwarding_headers,
-        hardware_class_for_probe,
+        harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
-        is_harbor_assistant_surface_path, knowledge_preview_mime_supported, latest_model_download_jobs,
-        live_bridge_provider_from_setup_status, local_model_catalog_item,
-        local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
-        model_download_huggingface_endpoints, model_download_jobs_status,
-        model_hardware_recommendation, model_snapshot_file_allowed, normalize_unified_admin_path,
-        overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
-        parse_camera_analyze_path, parse_camera_live_page_path, parse_camera_live_stream_path,
-        parse_camera_recording_start_path, parse_camera_recording_stop_path,
-        parse_camera_share_link_path, parse_camera_snapshot_path, parse_camera_task_snapshot_path,
-        parse_device_credential_status_path, parse_device_credentials_path,
-        parse_device_evidence_path, parse_device_metadata_patch_path, parse_device_rtsp_check_path,
+        is_harbor_assistant_surface_path, knowledge_preview_mime_supported,
+        latest_model_download_jobs, live_bridge_provider_from_setup_status,
+        local_model_catalog_item, local_model_catalog_specs, mime_type_for_path,
+        model_download_huggingface_endpoint, model_download_huggingface_endpoints,
+        model_download_jobs_status, model_hardware_recommendation, model_snapshot_file_allowed,
+        normalize_unified_admin_path, overlay_model_endpoints_with_runtime_truth,
+        parse_approval_decision_path, parse_camera_analyze_path, parse_camera_live_page_path,
+        parse_camera_live_stream_path, parse_camera_recording_start_path,
+        parse_camera_recording_stop_path, parse_camera_share_link_path, parse_camera_snapshot_path,
+        parse_camera_task_snapshot_path, parse_device_credential_status_path,
+        parse_device_credentials_path, parse_device_evidence_path,
+        parse_device_metadata_patch_path, parse_device_rtsp_check_path,
         parse_device_validation_run_path, parse_knowledge_index_job_cancel_path,
         parse_member_default_delivery_surface_update_path, parse_member_role_update_path,
         parse_model_download_cancel_path, parse_model_download_job_path, parse_model_endpoint_path,
@@ -12595,10 +13160,11 @@ mod tests {
         redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
         redact_value_stream_credentials, release_item, request_identity_hints,
-        resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path, run_knowledge_index_jobs,
-        run_model_download_job, run_model_download_transfer, scan_request_task_args,
-        url_encode_path_segment, AdminApi, KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
-        ModelRuntimeActivationRequest, ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
+        resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
+        run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
+        scan_request_task_args, url_encode_path_segment, AdminApi, KnowledgeSearchApiRequest,
+        LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
+        ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
     };
     use harborbeacon_local_agent::control_plane::media::{
         MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
@@ -13290,6 +13856,11 @@ mod tests {
         assert!(is_admin_surface_path("/api/cameras/camera-1/snapshot.jpg"));
         assert!(is_admin_surface_path("/api/cameras/camera-1/live.mjpeg"));
         assert!(is_admin_surface_path("/api/cameras/camera-1/analyze"));
+        assert!(is_admin_surface_path("/api/home-assistant/status"));
+        assert!(is_admin_surface_path("/api/home-assistant/config"));
+        assert!(is_admin_surface_path(
+            "/api/harboros/apps/home-assistant/install"
+        ));
         assert!(is_admin_surface_path("/api/models/capabilities"));
     }
 
@@ -13306,6 +13877,14 @@ mod tests {
         assert_eq!(
             normalize_unified_admin_path("/api/beacon/models/capabilities"),
             "/api/models/capabilities"
+        );
+        assert_eq!(
+            normalize_unified_admin_path("/api/beacon/home-assistant/status"),
+            "/api/home-assistant/status"
+        );
+        assert_eq!(
+            normalize_unified_admin_path("/api/beacon/harboros/apps/home-assistant/install"),
+            "/api/harboros/apps/home-assistant/install"
         );
         assert_eq!(normalize_unified_admin_path("/api/beacon"), "/api/state");
     }
@@ -13358,8 +13937,14 @@ mod tests {
             resolve_harbor_assistant_asset_path(&root, "/assets/main.js"),
             Some(root.join("assets").join("main.js"))
         );
-        assert_eq!(resolve_harbor_assistant_asset_path(&root, "/../secret.txt"), None);
-        assert_eq!(resolve_harbor_assistant_asset_path(&root, "/overview"), None);
+        assert_eq!(
+            resolve_harbor_assistant_asset_path(&root, "/../secret.txt"),
+            None
+        );
+        assert_eq!(
+            resolve_harbor_assistant_asset_path(&root, "/overview"),
+            None
+        );
     }
 
     #[test]
@@ -13408,8 +13993,9 @@ mod tests {
 
     #[test]
     fn harbor_assistant_build_missing_response_mentions_dist_path() {
-        let response =
-            harbor_assistant_build_missing_response(Path::new("frontend/harbor-assistant/dist/harbor-assistant"));
+        let response = harbor_assistant_build_missing_response(Path::new(
+            "frontend/harbor-assistant/dist/harbor-assistant",
+        ));
         assert_eq!(response.status_code(), StatusCode(503));
     }
 
@@ -13982,7 +14568,10 @@ mod tests {
 
     #[test]
     fn hardware_profile_keeps_4b_models_out_of_tiny_cpu_recommendations() {
-        assert_eq!(hardware_class_for_probe(4, Some(12_000), false, None), "tiny_cpu");
+        assert_eq!(
+            hardware_class_for_probe(4, Some(12_000), false, None),
+            "tiny_cpu"
+        );
         assert_eq!(
             hardware_class_for_probe(8, Some(32_000), true, Some(12_288)),
             "low_vram_gpu"
@@ -14759,7 +15348,8 @@ mod tests {
         fs::create_dir_all(&source_root).expect("create source root");
         fs::create_dir_all(&index_root).expect("create index root");
         let indexed_path = source_root.join("indexed.md");
-        fs::write(&indexed_path, "Harbor Assistant Search indexed preview").expect("write indexed file");
+        fs::write(&indexed_path, "Harbor Assistant Search indexed preview")
+            .expect("write indexed file");
         let service = KnowledgeIndexService::from_config(
             KnowledgeIndexConfig::new(index_root.clone()).unwrap(),
         )
@@ -15312,7 +15902,10 @@ mod tests {
         assert_eq!(endpoint.model_name, "Qwen/Qwen3.5-4B");
         assert_eq!(endpoint.metadata["runtime_auto_activation"], json!(true));
         assert_eq!(endpoint.metadata["activation_status"], json!("activated"));
-        assert_eq!(endpoint.metadata["catalog_model_id"], json!("Qwen/Qwen3.5-4B"));
+        assert_eq!(
+            endpoint.metadata["catalog_model_id"],
+            json!("Qwen/Qwen3.5-4B")
+        );
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);

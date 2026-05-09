@@ -32,6 +32,12 @@ import {
   GatewayPlatformStatus,
   GatewayStatusResponse,
   HardwareReadinessResponse,
+  HomeAssistantConfigPayload,
+  HomeAssistantEntity,
+  HomeAssistantInstallPlanResponse,
+  HomeAssistantInstallStatusResponse,
+  HomeAssistantServiceDomain,
+  HomeAssistantStatusResponse,
   HarborOsImCapabilityMapResponse,
   HarborOsStatusResponse,
   FilesBrowseResponse,
@@ -242,6 +248,53 @@ export class HarborAssistantAdminApiService {
     return this.http.get<HarborOsImCapabilityMapResponse>(this.apiUrl('/harboros/im-capability-map'));
   }
 
+  getHomeAssistantStatus(): Observable<HomeAssistantStatusResponse> {
+    return this.http.get<HomeAssistantStatusResponse>(this.apiUrl('/home-assistant/status'));
+  }
+
+  saveHomeAssistantConfig(payload: HomeAssistantConfigPayload): Observable<{ status: HomeAssistantStatusResponse }> {
+    return this.http.put<{ status: HomeAssistantStatusResponse }>(this.apiUrl('/home-assistant/config'), payload);
+  }
+
+  testHomeAssistant(): Observable<{ test: { ok: boolean; status: string; error?: string | null }; status: HomeAssistantStatusResponse }> {
+    return this.http.post<{ test: { ok: boolean; status: string; error?: string | null }; status: HomeAssistantStatusResponse }>(
+      this.apiUrl('/home-assistant/test'),
+      {}
+    );
+  }
+
+  syncHomeAssistant(): Observable<{
+    status: HomeAssistantStatusResponse;
+    entities: HomeAssistantEntity[];
+    service_domains: HomeAssistantServiceDomain[];
+  }> {
+    return this.http.post<{
+      status: HomeAssistantStatusResponse;
+      entities: HomeAssistantEntity[];
+      service_domains: HomeAssistantServiceDomain[];
+    }>(this.apiUrl('/home-assistant/sync'), {});
+  }
+
+  getHomeAssistantEntities(): Observable<{ entities: HomeAssistantEntity[] }> {
+    return this.http.get<{ entities: HomeAssistantEntity[] }>(this.apiUrl('/home-assistant/entities'));
+  }
+
+  getHomeAssistantServices(): Observable<{ services: HomeAssistantServiceDomain[] }> {
+    return this.http.get<{ services: HomeAssistantServiceDomain[] }>(this.apiUrl('/home-assistant/services'));
+  }
+
+  getHomeAssistantInstallStatus(): Observable<HomeAssistantInstallStatusResponse> {
+    return this.http.get<HomeAssistantInstallStatusResponse>(this.apiUrl('/harboros/apps/home-assistant/status'));
+  }
+
+  getHomeAssistantInstallPlan(): Observable<HomeAssistantInstallPlanResponse> {
+    return this.http.post<HomeAssistantInstallPlanResponse>(this.apiUrl('/harboros/apps/home-assistant/install-plan'), {});
+  }
+
+  installHomeAssistant(dryRun = false): Observable<unknown> {
+    return this.http.post<unknown>(this.apiUrl('/harboros/apps/home-assistant/install'), { dry_run: dryRun });
+  }
+
   getLocalModelCatalog(): Observable<LocalModelCatalogResponse> {
     return this.http.get<LocalModelCatalogResponse>(this.apiUrl('/models/local-catalog'));
   }
@@ -375,6 +428,18 @@ export class HarborAssistantAdminApiService {
             dvrTimeline
           ))))
         );
+      case 'home-assistant':
+        return forkJoin({
+          status: this.getHomeAssistantStatus(),
+          entities: this.readProjection('GET /api/home-assistant/entities', this.getHomeAssistantEntities()),
+          services: this.readProjection('GET /api/home-assistant/services', this.getHomeAssistantServices()),
+          installStatus: this.getHomeAssistantInstallStatus()
+        }).pipe(map(({ status, entities, services, installStatus }) => this.buildHomeAssistantState(
+          status,
+          entities,
+          services,
+          installStatus
+        )));
       case 'harboros':
         return this.getState().pipe(map((state) => this.buildHarborOsState(state)));
       case 'models-policies':
@@ -525,6 +590,7 @@ export class HarborAssistantAdminApiService {
       'account-management': this.text('Account Management', '账号与通知'),
       'tasks-approvals': this.text('Tasks & Approvals', '任务与审批'),
       'devices-aiot': this.text('Devices & AIoT', '设备与 AIoT'),
+      'home-assistant': 'Home Assistant',
       harboros: 'HarborOS',
       'models-policies': this.text('Models & Policies', '模型与策略'),
       'system-settings': this.text('System Settings', '系统设置')
@@ -1685,6 +1751,166 @@ export class HarborAssistantAdminApiService {
           'Run discovery or manually add a camera, then set the default and run RTSP/snapshot checks.',
           '先执行发现扫描或手动添加摄像头，然后设置默认摄像头并运行 RTSP/快照检查。'
         )
+      }
+    };
+  }
+
+  private buildHomeAssistantState(
+    status: HomeAssistantStatusResponse,
+    entitiesProjection: EndpointProjection<{ entities: HomeAssistantEntity[] }>,
+    servicesProjection: EndpointProjection<{ services: HomeAssistantServiceDomain[] }>,
+    installStatus: HomeAssistantInstallStatusResponse
+  ): PageState<DeskPageModel> {
+    const entities = entitiesProjection.data?.entities ?? [];
+    const services = servicesProjection.data?.services ?? [];
+    const domains = Array.from(new Set(entities.map((entity) => entity.domain))).sort();
+    const exposedDomains = status.exposed_domains ?? [];
+    const connected = ['connected', 'synced'].includes(String(status.status).toLowerCase());
+    const configured = status.configured && status.enabled;
+    const entityState = entitiesProjection.state === 'error' && configured ? 'needs-config' : entities.length > 0 ? 'ready' : configured ? 'needs-config' : 'blocked';
+    return {
+      kind: configured ? 'success' : 'empty',
+      detail: this.text(
+        'Home Assistant is integrated as a Beacon-owned bridge behind the HarborGate /api/beacon proxy.',
+        'Home Assistant 作为 Beacon 拥有的 bridge 接入，并位于 HarborGate /api/beacon 代理后方。'
+      ),
+      data: {
+        ...this.baseModel('home-assistant'),
+        eyebrow: this.text('Home Assistant bridge', 'Home Assistant bridge'),
+        summary: configured
+          ? this.text(
+            'Connect an existing Home Assistant instance, test the long-lived token, and sync read-only entities into the Home Device provider model.',
+            '连接已有 Home Assistant，测试 long-lived token，并以只读方式把实体同步到 Home Device provider model。'
+          )
+          : this.text(
+            'Start with an existing HA instance or request the managed container plan; HarborBeacon stores the connector config, not HarborGate.',
+            '可以从已有 HA 实例开始，也可以请求托管容器安装计划；连接配置由 HarborBeacon 保存，不进入 HarborGate。'
+          ),
+        endpoint: 'GET /api/home-assistant/status + /api/home-assistant/entities',
+        setupFlow: this.setupFlow(
+          this.text('Home Assistant setup flow', 'Home Assistant 配置流程'),
+          this.text(
+            'V1 is read-only connection and sync. Service calls and automation control stay closed until Harbor policy and approval are wired.',
+            'V1 只做只读连接与同步；服务调用和自动化控制等 Harbor policy 与 approval 接好后再开放。'
+          ),
+          [
+            this.setupStep(
+              this.text('Connector config', '连接配置'),
+              status.configured ? 'ready' : 'needs-config',
+              status.configured
+                ? this.text('Base URL and token are configured with token redaction.', 'Base URL 与 token 已配置，token 已脱敏。')
+                : this.text('Base URL and long-lived token are not configured yet.', '尚未配置 Base URL 与 long-lived token。'),
+              status.base_url || this.text('Use the form below to connect an existing HA instance.', '使用下方表单连接已有 HA 实例。'),
+              [
+                this.text('The UI calls apiUrl("/home-assistant/...") and inherits /api/beacon under HarborGate.', 'UI 调用 apiUrl("/home-assistant/...")，在 HarborGate 下继承 /api/beacon。'),
+                this.text('HarborGate does not store HA URL, token, or entity state.', 'HarborGate 不保存 HA URL、token 或 entity state。')
+              ]
+            ),
+            this.setupStep(
+              this.text('Token test', 'Token 测试'),
+              connected ? 'ready' : status.configured ? 'needs-config' : 'blocked',
+              connected
+                ? this.text('The connector has a recent connected or synced state.', '连接器最近处于 connected/synced 状态。')
+                : this.text('Run token test after saving the connector.', '保存连接配置后运行 token 测试。'),
+              status.last_error || status.location_name || status.version || this.text('No test result yet.', '尚无测试结果。'),
+              [
+                this.text('The test uses HA REST /api/config through Beacon reqwest.', '测试通过 Beacon reqwest 调用 HA REST /api/config。'),
+                this.text('WebSocket subscriptions are deferred.', 'WebSocket 事件订阅后续再接。')
+              ]
+            ),
+            this.setupStep(
+              this.text('Read-only entity sync', '只读实体同步'),
+              entityState,
+              entities.length > 0
+                ? this.text(`${entities.length} exposed entities are loaded.`, `已加载 ${entities.length} 个 exposed entities。`)
+                : this.text('No exposed entities have been loaded yet.', '尚未加载 exposed entities。'),
+              entitiesProjection.error || this.text(
+                `Exposed domains: ${exposedDomains.join(', ') || 'default'}.`,
+                `暴露 domain：${exposedDomains.join(', ') || 'default'}。`
+              ),
+              [
+                this.text('Synced devices use provider_key=home_assistant and provider_kind=bridge.', '同步设备使用 provider_key=home_assistant 与 provider_kind=bridge。'),
+                this.text('HA camera entities are discovery/status/fallback only in V1.', 'HA camera entity 在 V1 只用于发现、状态与 fallback。')
+              ]
+            ),
+            this.setupStep(
+              this.text('Managed install path', '托管安装路径'),
+              installStatus.managed ? 'read-only' : 'needs-config',
+              this.text('V1 target is Home Assistant Container; HAOS VM remains a later advanced option.', 'V1 目标是 Home Assistant Container；HAOS VM 是后续高级选项。'),
+              installStatus.message,
+              [
+                this.text('Docker/container lifecycle belongs to HarborOS System Domain.', 'Docker/container 生命周期属于 HarborOS System Domain。'),
+                this.text('After onboarding, connect HarborBeacon with an HA long-lived token.', '完成 HA onboarding 后，再用 long-lived token 连接 HarborBeacon。')
+              ]
+            )
+          ]
+        ),
+        metrics: [
+          this.metric(
+            this.text('Connector', '连接器'),
+            configured ? this.text('Configured', '已配置') : this.text('Not configured', '未配置'),
+            status.base_url || this.text('Waiting for Home Assistant base URL and token.', '等待 Home Assistant Base URL 与 token。'),
+            configured ? 'good' : 'warn'
+          ),
+          this.metric(
+            this.text('Connection', '连接状态'),
+            status.status || 'unknown',
+            status.last_error || status.location_name || status.version || this.text('No live test has run yet.', '尚未运行 live test。'),
+            connected ? 'good' : status.last_error ? 'danger' : configured ? 'warn' : 'neutral'
+          ),
+          this.metric(
+            this.text('Entities', '实体'),
+            `${entities.length || status.entity_count}`,
+            entitiesProjection.error || this.text('Read-only HA entities visible to Beacon.', 'Beacon 可见的只读 HA 实体。'),
+            entities.length > 0 || status.entity_count > 0 ? 'good' : configured ? 'warn' : 'neutral'
+          ),
+          this.metric(
+            this.text('Domains', 'Domains'),
+            `${domains.length || exposedDomains.length}`,
+            domains.length ? domains.join(', ') : exposedDomains.join(', '),
+            domains.length > 0 ? 'good' : 'neutral'
+          ),
+          this.metric(
+            this.text('Managed install', '托管安装'),
+            installStatus.status,
+            installStatus.message,
+            installStatus.status === 'running' ? 'good' : 'warn'
+          )
+        ],
+        highlights: [
+          this.text('HA is not bundled like ffmpeg; it runs as an external container or HAOS VM.', 'HA 不像 ffmpeg 一样打包；它以外部容器或 HAOS VM 运行。'),
+          this.text('Advanced dashboards stay in HA UI; Harbor Assistant exposes connection, sync, and governed Harbor actions.', '高级 dashboard 留在 HA UI；Harbor Assistant 负责连接、同步与 Harbor 治理动作。'),
+          this.text('Devices & AIoT remains Harbor-native camera governance and LAN/device operations.', 'Devices & AIoT 继续承载 Harbor 原生摄像头治理与 LAN/device 操作。')
+        ],
+        blockers: status.last_error ? [status.last_error] : [],
+        detailRows: [
+          ...domains.map((domain) => ({
+            title: domain,
+            subtitle: this.text(`${entities.filter((entity) => entity.domain === domain).length} entities`, `${entities.filter((entity) => entity.domain === domain).length} 个实体`),
+            meta: entities
+              .filter((entity) => entity.domain === domain)
+              .slice(0, 5)
+              .map((entity) => `${entity.entity_id}: ${entity.state}`),
+            tone: 'neutral' as MetricTone
+          })),
+          ...services.slice(0, 6).map((domain) => ({
+            title: `${domain.domain} services`,
+            subtitle: `${domain.services.length}`,
+            meta: domain.services.slice(0, 6).map((service) => service.service),
+            tone: 'neutral' as MetricTone
+          }))
+        ],
+        homeAssistant: {
+          status,
+          entities,
+          services,
+          installStatus,
+          installPlan: null
+        },
+        emptyNote: this.text('Home Assistant is not configured yet.', '尚未配置 Home Assistant。'),
+        nextStep: status.configured
+          ? this.text('Run token test, then sync exposed entities.', '先运行 token 测试，再同步 exposed entities。')
+          : this.text('Connect an existing HA instance or request the managed install plan.', '连接已有 HA 实例，或请求托管安装计划。')
       }
     };
   }

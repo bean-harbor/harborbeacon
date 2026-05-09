@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::connectors::home_assistant::{
+    redact_home_assistant_token, token_is_redacted, HOME_ASSISTANT_TOKEN_REDACTION,
+};
 use crate::control_plane::access::{PermissionBinding, PermissionEffect, ScopeKind};
 use crate::control_plane::auth::{AuthSource, IdentityBinding};
 use crate::control_plane::credentials::{
@@ -449,6 +452,67 @@ pub struct AdminConsoleState {
     pub knowledge: KnowledgeSettings,
     #[serde(default)]
     pub knowledge_index_jobs: Vec<KnowledgeIndexJobRecord>,
+    #[serde(default)]
+    pub home_assistant: HomeAssistantAdminState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HomeAssistantAdminState {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub access_token: String,
+    #[serde(default)]
+    pub exposed_domains: Vec<String>,
+    #[serde(default)]
+    pub last_status: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_test_at: Option<String>,
+    #[serde(default)]
+    pub last_sync_at: Option<String>,
+    #[serde(default)]
+    pub entity_count: usize,
+    #[serde(default)]
+    pub service_count: usize,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub location_name: Option<String>,
+}
+
+impl Default for HomeAssistantAdminState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            access_token: String::new(),
+            exposed_domains: default_home_assistant_exposed_domains(),
+            last_status: "not_configured".to_string(),
+            last_error: None,
+            last_test_at: None,
+            last_sync_at: None,
+            entity_count: 0,
+            service_count: 0,
+            version: None,
+            location_name: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HomeAssistantConfigUpdate {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub exposed_domains: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -675,6 +739,74 @@ impl AdminConsoleStore {
         let state = self.load_state()?;
         self.save_state(&state)?;
         Ok(state)
+    }
+
+    pub fn home_assistant_state(&self) -> Result<HomeAssistantAdminState, String> {
+        Ok(redact_home_assistant_state(
+            self.load_or_create_state()?.home_assistant,
+        ))
+    }
+
+    pub fn home_assistant_secret_state(&self) -> Result<HomeAssistantAdminState, String> {
+        Ok(self.load_or_create_state()?.home_assistant)
+    }
+
+    pub fn save_home_assistant_config(
+        &self,
+        update: HomeAssistantConfigUpdate,
+    ) -> Result<AdminConsoleState, String> {
+        let mut state = self.load_or_create_state()?;
+        let mut next = state.home_assistant.clone();
+        next.enabled = update.enabled;
+        next.base_url = update.base_url;
+        next.exposed_domains = update.exposed_domains;
+        if let Some(access_token) = update.access_token {
+            if !token_is_redacted(&access_token) {
+                next.access_token = access_token;
+            }
+        }
+        next.last_error = None;
+        if !next.enabled {
+            next.last_status = "disabled".to_string();
+        } else if next.base_url.trim().is_empty() || next.access_token.trim().is_empty() {
+            next.last_status = "not_configured".to_string();
+        } else {
+            next.last_status = "configured".to_string();
+        }
+        state.home_assistant = sanitize_home_assistant_state(next);
+        self.save_projected_state(state)
+    }
+
+    pub fn record_home_assistant_test(
+        &self,
+        ok: bool,
+        version: Option<String>,
+        location_name: Option<String>,
+        error: Option<String>,
+    ) -> Result<AdminConsoleState, String> {
+        let mut state = self.load_or_create_state()?;
+        state.home_assistant.last_test_at = Some(model_test_timestamp());
+        state.home_assistant.last_status = if ok { "connected" } else { "error" }.to_string();
+        state.home_assistant.last_error = error;
+        state.home_assistant.version = version;
+        state.home_assistant.location_name = location_name;
+        state.home_assistant = sanitize_home_assistant_state(state.home_assistant);
+        self.save_projected_state(state)
+    }
+
+    pub fn record_home_assistant_sync(
+        &self,
+        entity_count: usize,
+        service_count: usize,
+    ) -> Result<AdminConsoleState, String> {
+        let mut state = self.load_or_create_state()?;
+        state.home_assistant.last_status = "synced".to_string();
+        state.home_assistant.last_error = None;
+        state.home_assistant.last_sync_at = Some(model_test_timestamp());
+        state.home_assistant.entity_count = entity_count;
+        state.home_assistant.service_count = service_count;
+        state.home_assistant = sanitize_home_assistant_state(state.home_assistant);
+        self.save_projected_state(state)
     }
 
     pub fn refresh_binding_qr(&self) -> Result<AdminConsoleState, String> {
@@ -2879,6 +3011,92 @@ fn sanitize_legacy_admin_fields(state: &mut AdminConsoleState) {
     state.models = sanitize_model_center_state(state.models.clone());
     state.knowledge = sanitize_knowledge_settings(state.knowledge.clone());
     state.knowledge_index_jobs = sanitize_knowledge_index_jobs(state.knowledge_index_jobs.clone());
+    state.home_assistant = sanitize_home_assistant_state(state.home_assistant.clone());
+}
+
+pub fn default_home_assistant_exposed_domains() -> Vec<String> {
+    [
+        "light",
+        "switch",
+        "sensor",
+        "binary_sensor",
+        "climate",
+        "cover",
+        "lock",
+        "camera",
+        "media_player",
+        "scene",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn redact_home_assistant_state(mut state: HomeAssistantAdminState) -> HomeAssistantAdminState {
+    state.access_token = redact_home_assistant_token(&state.access_token);
+    state
+}
+
+fn sanitize_home_assistant_state(state: HomeAssistantAdminState) -> HomeAssistantAdminState {
+    let exposed_domains = sanitize_home_assistant_domains(state.exposed_domains);
+    let base_url = state.base_url.trim().trim_end_matches('/').to_string();
+    let access_token = state.access_token.trim().to_string();
+    let mut last_status = state.last_status.trim().to_ascii_lowercase();
+    if last_status.is_empty() {
+        last_status = if base_url.is_empty() || access_token.is_empty() {
+            "not_configured".to_string()
+        } else {
+            "configured".to_string()
+        };
+    }
+    HomeAssistantAdminState {
+        enabled: state.enabled,
+        base_url,
+        access_token,
+        exposed_domains,
+        last_status,
+        last_error: state
+            .last_error
+            .and_then(|value| non_empty_opt(value.trim())),
+        last_test_at: state
+            .last_test_at
+            .and_then(|value| non_empty_opt(value.trim())),
+        last_sync_at: state
+            .last_sync_at
+            .and_then(|value| non_empty_opt(value.trim())),
+        entity_count: state.entity_count,
+        service_count: state.service_count,
+        version: state.version.and_then(|value| non_empty_opt(value.trim())),
+        location_name: state
+            .location_name
+            .and_then(|value| non_empty_opt(value.trim())),
+    }
+}
+
+fn sanitize_home_assistant_domains(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut domains = Vec::new();
+    for value in values {
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        if normalized
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+            && seen.insert(normalized.clone())
+        {
+            domains.push(normalized);
+        }
+    }
+    if domains.is_empty() {
+        return default_home_assistant_exposed_domains();
+    }
+    domains
+}
+
+pub fn home_assistant_token_redaction_marker() -> &'static str {
+    HOME_ASSISTANT_TOKEN_REDACTION
 }
 
 fn hydrate_legacy_views_from_platform(state: &mut AdminConsoleState) {
@@ -4700,13 +4918,13 @@ mod tests {
         default_rtsp_paths, derive_rtsp_hints, device_rtsp_credential_id, normalize_binding_code,
         normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path,
         resolved_identity_binding_records, resolved_remote_view_config,
-        sanitize_bridge_provider_config, sanitize_model_center_state,
-        sanitize_defaults,
+        sanitize_bridge_provider_config, sanitize_defaults, sanitize_model_center_state,
         user_default_delivery_surface, user_recent_interactive_surface, AdminConsoleStore,
         AdminDefaults, AdminModelCenterState, BridgeProviderCapabilities, BridgeProviderConfig,
-        DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings, IdentityBindingRecord,
-        KnowledgeSettings, KnowledgeSourceRoot, RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID,
-        LOCAL_RTSP_CREDENTIAL_ID, LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
+        DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings,
+        HomeAssistantConfigUpdate, IdentityBindingRecord, KnowledgeSettings, KnowledgeSourceRoot,
+        RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID,
+        LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -4747,6 +4965,56 @@ mod tests {
         let paths = default_rtsp_paths();
         assert!(paths.contains(&"/stream1".to_string()));
         assert!(paths.contains(&"/stream2".to_string()));
+    }
+
+    #[test]
+    fn save_home_assistant_config_redacts_and_preserves_secret() {
+        let registry_path = temp_path("registry-ha-config");
+        let admin_path = temp_path("admin-ha-config");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        store
+            .save_home_assistant_config(HomeAssistantConfigUpdate {
+                enabled: true,
+                base_url: " http://ha.local:8123/ ".to_string(),
+                access_token: Some("ha-token".to_string()),
+                exposed_domains: vec![
+                    "Light".to_string(),
+                    "sensor".to_string(),
+                    "bad-domain".to_string(),
+                ],
+            })
+            .expect("save ha config");
+
+        let secret = store
+            .home_assistant_secret_state()
+            .expect("load secret ha state");
+        assert_eq!(secret.base_url, "http://ha.local:8123");
+        assert_eq!(secret.access_token, "ha-token");
+        assert_eq!(secret.exposed_domains, vec!["light", "sensor"]);
+
+        let redacted = store
+            .home_assistant_state()
+            .expect("load redacted ha state");
+        assert_eq!(
+            redacted.access_token,
+            super::home_assistant_token_redaction_marker()
+        );
+
+        store
+            .save_home_assistant_config(HomeAssistantConfigUpdate {
+                enabled: true,
+                base_url: "http://ha-new.local:8123".to_string(),
+                access_token: Some(String::new()),
+                exposed_domains: vec!["camera".to_string()],
+            })
+            .expect("save redacted ha config");
+        let preserved = store
+            .home_assistant_secret_state()
+            .expect("reload secret ha state");
+        assert_eq!(preserved.base_url, "http://ha-new.local:8123");
+        assert_eq!(preserved.access_token, "ha-token");
     }
 
     #[test]
@@ -5128,10 +5396,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(user_roots.len(), 1);
         assert_eq!(user_roots[0].label, "Family Docs");
-        assert_eq!(
-            user_roots[0].root_id,
-            "knowledge-familydocs"
-        );
+        assert_eq!(user_roots[0].root_id, "knowledge-familydocs");
         assert_eq!(user_roots[0].include, vec!["**/*.md"]);
         assert_eq!(user_roots[0].exclude, vec!["tmp/**"]);
         assert_eq!(user_roots[0].last_indexed_at, None);

@@ -15,6 +15,7 @@ import {
   KnowledgeSearchRequestPayload,
   KnowledgeSearchResponse,
   FeatureAvailabilityStatus,
+  HomeAssistantConfigPayload,
   KnowledgeSettings,
   KnowledgeSourceRoot,
   LocalModelCatalogItem,
@@ -106,6 +107,11 @@ export class PageStatePanelComponent {
   @Output() readonly filesBrowseRequested = new EventEmitter<string | null>();
   @Output() readonly knowledgeSearchRequested = new EventEmitter<KnowledgeSearchRequestPayload>();
   @Output() readonly knowledgePreviewRequested = new EventEmitter<string>();
+  @Output() readonly homeAssistantConfigSave = new EventEmitter<HomeAssistantConfigPayload>();
+  @Output() readonly homeAssistantTest = new EventEmitter<void>();
+  @Output() readonly homeAssistantSync = new EventEmitter<void>();
+  @Output() readonly homeAssistantInstallPlan = new EventEmitter<void>();
+  @Output() readonly homeAssistantInstall = new EventEmitter<void>();
 
   protected scanForm: Required<DiscoveryScanPayload> = {
     cidr: '',
@@ -128,6 +134,13 @@ export class PageStatePanelComponent {
   protected knowledgeSourceRootEnabled: Record<string, boolean> = {};
   protected knowledgePrivacyLevel: RagPrivacyLevel = 'strict_local';
   protected knowledgeResourceProfile: RagResourceProfile = 'cpu_only';
+  protected homeAssistantForm: HomeAssistantConfigPayload & { exposed_domains_text: string } = {
+    enabled: true,
+    base_url: '',
+    access_token: '',
+    exposed_domains: [],
+    exposed_domains_text: ''
+  };
   protected knowledgeSearchDraft = '搜索已有内容：根据当前知识库，总结 Harbor 82 的演示环境。';
   protected readonly knowledgePrivacyOptions: Array<{ value: RagPrivacyLevel; label: string; detail: string }> = [
     {
@@ -170,6 +183,7 @@ export class PageStatePanelComponent {
   ];
   private knowledgeFormKey = '';
   private dvrFormKey = '';
+  private homeAssistantFormKey = '';
 
   protected toneClass(tone: MetricTone): string {
     return `tone-${tone}`;
@@ -539,6 +553,50 @@ export class PageStatePanelComponent {
       return;
     }
     this.knowledgePreviewRequested.emit(path);
+  }
+
+  protected hydrateHomeAssistantForm(): boolean {
+    const status = this.state?.data.homeAssistant?.status;
+    if (!status) {
+      return false;
+    }
+    const key = JSON.stringify(status);
+    if (key !== this.homeAssistantFormKey) {
+      this.homeAssistantFormKey = key;
+      this.homeAssistantForm = {
+        enabled: status.enabled || !status.configured,
+        base_url: status.base_url ?? '',
+        access_token: '',
+        exposed_domains: status.exposed_domains ?? [],
+        exposed_domains_text: (status.exposed_domains ?? []).join(', ')
+      };
+    }
+    return true;
+  }
+
+  protected requestHomeAssistantConfigSave(): void {
+    this.homeAssistantConfigSave.emit({
+      enabled: this.homeAssistantForm.enabled,
+      base_url: this.homeAssistantForm.base_url.trim(),
+      access_token: this.homeAssistantForm.access_token?.trim() || null,
+      exposed_domains: this.pathList(this.homeAssistantForm.exposed_domains_text)
+    });
+  }
+
+  protected requestHomeAssistantTest(): void {
+    this.homeAssistantTest.emit();
+  }
+
+  protected requestHomeAssistantSync(): void {
+    this.homeAssistantSync.emit();
+  }
+
+  protected requestHomeAssistantInstallPlan(): void {
+    this.homeAssistantInstallPlan.emit();
+  }
+
+  protected requestHomeAssistantInstall(): void {
+    this.homeAssistantInstall.emit();
   }
 
   protected knowledgeResultMeta(path: string | undefined | null, score: number | undefined, modality: string | undefined): string[] {

@@ -1088,6 +1088,83 @@ export interface RuntimeAlignmentSummary {
   rows: DeskRow[];
 }
 
+export interface HomeAssistantStatusResponse {
+  configured: boolean;
+  enabled: boolean;
+  base_url: string;
+  token_configured: boolean;
+  token_redacted: boolean;
+  exposed_domains: string[];
+  status: string;
+  last_error?: string | null;
+  last_test_at?: string | null;
+  last_sync_at?: string | null;
+  entity_count: number;
+  service_count: number;
+  version?: string | null;
+  location_name?: string | null;
+}
+
+export interface HomeAssistantConfigPayload {
+  enabled: boolean;
+  base_url: string;
+  access_token?: string | null;
+  exposed_domains: string[];
+}
+
+export interface HomeAssistantEntity {
+  entity_id: string;
+  domain: string;
+  state: string;
+  display_name: string;
+  area_id?: string | null;
+  device_class?: string | null;
+  last_changed?: string | null;
+  last_updated?: string | null;
+  attributes?: Record<string, unknown>;
+}
+
+export interface HomeAssistantService {
+  service: string;
+  name?: string | null;
+  description?: string | null;
+  fields?: Record<string, unknown>;
+}
+
+export interface HomeAssistantServiceDomain {
+  domain: string;
+  services: HomeAssistantService[];
+}
+
+export interface HomeAssistantInstallStatusResponse {
+  app_id: string;
+  status: string;
+  managed: boolean;
+  runtime: string;
+  container_name?: string | null;
+  onboarding_url?: string | null;
+  message: string;
+}
+
+export interface HomeAssistantInstallPlanResponse {
+  app_id: string;
+  target: string;
+  runtime: string;
+  image: string;
+  container_name: string;
+  ports: string[];
+  volumes: string[];
+  next_step: string;
+}
+
+export interface HomeAssistantPanelModel {
+  status: HomeAssistantStatusResponse;
+  entities: HomeAssistantEntity[];
+  services: HomeAssistantServiceDomain[];
+  installStatus: HomeAssistantInstallStatusResponse;
+  installPlan?: HomeAssistantInstallPlanResponse | null;
+}
+
 export interface DeskPageModel {
   pageId: HarborAssistantPageId;
   title: string;
@@ -1123,6 +1200,7 @@ export interface DeskPageModel {
   featureGroups?: FeatureAvailabilityGroup[];
   runtimeAlignment?: RuntimeAlignmentSummary;
   releaseReadiness?: ReleaseReadinessPanel;
+  homeAssistant?: HomeAssistantPanelModel;
 }
 
 export interface PageState<T> {

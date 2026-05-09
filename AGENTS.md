@@ -89,6 +89,7 @@ Use these operating patterns on every non-trivial task:
 - After required target-registry confirmation has been satisfied for the day, execute requested HarborBeacon validation/deploy/live-test steps directly instead of re-confirming each substep.
 - When a live target, credential, deployment, or external service problem blocks the requested path, stop and ask the user for direction instead of trying multiple unrelated recovery attempts.
 - Keep normal local compile/test/debug loops autonomous when the issue is clearly inside the current code change and does not require new target, credential, or operational decisions.
+- When the user says "WebUI" or "Webui" in HarborOS validation or product review context, default to the real HarborOS `.82` WebUI rather than a local `127.0.0.1:4174` Harbor Assistant/admin debug page.
 
 ## Verification
 
