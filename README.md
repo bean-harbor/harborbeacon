@@ -27,15 +27,15 @@ The project now includes a Rust runtime that compiles into a standalone binary f
 
 Build and run:
 
-- `cargo build --release`
-- `./target/release/harborbeacon-agent --plan examples/plan_service_status.json`
+- `just build`
+- `just run-agent --plan examples/plan_service_status.json`
 
 Additional migrated script binaries:
 
-- `./target/release/validate-contract-schemas --skip-live --report validate-contract-report.rust.json`
-- `./target/release/run-e2e-suite --env env-a --report e2e-report.rust.json`
-- `./target/release/run-drift-matrix --harbor-ref develop --upstream-ref master --report drift-matrix-report.rust.json`
-- `./target/release/evaluate-release-gate drift-matrix-report.rust.json --output release-gate-summary.rust.json`
+- `just validate-schemas --skip-live --report validate-contract-report.rust.json`
+- `just run-e2e --env env-a --report e2e-report.rust.json`
+- `just run-drift --harbor-ref develop --upstream-ref master --report drift-matrix-report.rust.json`
+- `just evaluate-gate drift-matrix-report.rust.json --output release-gate-summary.rust.json`
 
 Useful flags:
 
@@ -161,10 +161,10 @@ Runtime-truth rule:
 - `.github/workflows/contract-pr-check.yml`: PR and branch validation for contract schema checks plus contract, fallback, and policy test suites.
 - `.github/workflows/contract-nightly-e2e.yml`: nightly/manual E2E matrix scaffold for `env-a` and `env-b`.
 - `.github/workflows/contract-release-drift.yml`: release-branch drift matrix and release gate workflow.
-- `target/release/validate-contract-schemas`: validates that required contract documents and route-priority rules stay aligned.
-- `target/release/run-e2e-suite`: emits scaffolded E2E, latency, and audit reports for workflow wiring.
-- `target/release/run-drift-matrix`: emits the initial drift-matrix artifact for release gating.
-- `target/release/evaluate-release-gate`: converts drift output into a blocking/non-blocking release decision.
+- `just validate-schemas`: validates that required contract documents and route-priority rules stay aligned.
+- `just run-e2e`: emits scaffolded E2E, latency, and audit reports for workflow wiring.
+- `just run-drift`: emits the initial drift-matrix artifact for release gating.
+- `just evaluate-gate`: converts drift output into a blocking/non-blocking release decision.
 - `tests/contracts`, `tests/fallback`, `tests/policy`: minimal pytest suites that keep the documented routing, fallback, and governance rules from regressing.
 
 Current scope note: the default CI path runs Rust binaries in documentation-only mode, and the same binaries can switch into live HarborBeacon integration mode when `midclt` and/or `cli` are available.
@@ -205,14 +205,14 @@ HarborOS `.182` resident stack checks:
 
 Typical usage:
 
-- `./target/release/validate-contract-schemas --require-live`
-- `./target/release/run-e2e-suite --env env-a --require-live`
-- `./target/release/run-drift-matrix --harbor-ref develop --upstream-ref master`
-- `./target/release/evaluate-release-gate drift-matrix-report.json --require-live`
+- `just validate-schemas --require-live`
+- `just run-e2e --env env-a --require-live`
+- `just run-drift --harbor-ref develop --upstream-ref master`
+- `just evaluate-gate drift-matrix-report.json --require-live`
 
 Controlled mutation example:
 
-- `HARBOR_ALLOW_MUTATIONS=1 HARBOR_APPROVAL_TOKEN=approved HARBOR_REQUIRED_APPROVAL_TOKEN=approved HARBOR_MUTATION_ROOT=/mnt/software/harborbeacon-agent-ci ./target/release/run-e2e-suite --env env-a --require-live`
+- `HARBOR_ALLOW_MUTATIONS=1 HARBOR_APPROVAL_TOKEN=approved HARBOR_REQUIRED_APPROVAL_TOKEN=approved HARBOR_MUTATION_ROOT=/mnt/software/harborbeacon-agent-ci just run-e2e --env env-a --require-live`
 
 ### Windows Remote MidCLI Shim
 
@@ -234,7 +234,7 @@ Example (PowerShell):
 - `$env:HARBOR_MIDCLI_URL = 'ws://<harbor-host>/websocket'`
 - `$env:HARBOR_MIDCLI_USER = '<username>'`
 - `$env:HARBOR_MIDCLI_PASSWORD = '<password>'`
-- `./target/release/run-e2e-suite.exe --env env-a --require-live --report rust-live-e2e-report.json`
+- `just run-e2e --env env-a --require-live --report rust-live-e2e-report.json`
 
 For reviewable smoke runs, the repo now ships both verifier entrypoints:
 
