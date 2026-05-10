@@ -1,10 +1,9 @@
-Package: harboros-featured-photos
+Package: harboros-beacon
 Version: VERSION_PLACEHOLDER
 Section: utils
 Priority: optional
 Architecture: amd64
 Depends: libc6
 Maintainer: Harborinno Ltd.
-Description: HarborNAS Featured Photos Service
-  Background service that scans a media library and serves a curated
-  feed of photos and videos over HTTP on port 8686.
+Description: HarborNAS Beacon Service
+  Background service for the HarborNAS Beacon feature.

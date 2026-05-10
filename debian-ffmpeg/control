@@ -1,0 +1,9 @@
+Package: harboros-ffmpeg
+Version: VERSION_PLACEHOLDER
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: libc6
+Maintainer: Harborinno Ltd.
+Description: FFmpeg builds for HarborOS
+  Provides pre-compiled ffmpeg, ffplay, and ffprobe binaries.
