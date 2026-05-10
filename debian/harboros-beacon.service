@@ -5,6 +5,8 @@ After=network.target
 [Service]
 Type=simple
 Environment=FEATURED_PHOTOS_PORT=8686
+Environment=HARBOR_FFMPEG_BIN=/usr/bin/ffmpeg
+Environment=HARBOR_FFPROBE_BIN=/usr/bin/ffprobe
 ExecStart=/usr/bin/harboros-featured-photos
 Restart=always
 RestartSec=5s
