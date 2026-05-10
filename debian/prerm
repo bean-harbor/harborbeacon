@@ -1,0 +1,7 @@
+#!/bin/bash
+set -e
+
+systemctl stop harboros-featured-photos.service || true
+systemctl disable harboros-featured-photos.service || true
+
+exit 0

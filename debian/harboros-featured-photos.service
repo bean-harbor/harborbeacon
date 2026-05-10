@@ -1,0 +1,14 @@
+[Unit]
+Description=HarborOS Featured Photos Service
+After=network.target
+
+[Service]
+Type=simple
+Environment=FEATURED_PHOTOS_PORT=8686
+ExecStart=/usr/bin/harboros-featured-photos
+Restart=always
+RestartSec=5s
+StateDirectory=harboros-featured-photos
+
+[Install]
+WantedBy=multi-user.target

@@ -5,7 +5,7 @@ edition = "2021"
 autobins = false
 
 [[bin]]
-name = "harborbeacon-agent"
+name = "harboros-beacon"
 path = "src/main.rs"
 
 [[bin]]

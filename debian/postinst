@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+systemctl daemon-reload
+systemctl enable harboros-featured-photos.service
+systemctl restart harboros-featured-photos.service
+
+exit 0
