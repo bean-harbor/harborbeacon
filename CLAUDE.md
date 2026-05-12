@@ -164,7 +164,7 @@ Run the smallest relevant verification set, then widen if the change touches sha
 - Rust build: `cargo build --release`
 - Rust tests: `cargo test`
 - Python tests: `pytest`
-- Frontend build: `cd frontend/harbordesk && npm run build`
+- Harbor Assistant WebUI build: run `corepack yarn build:prod` in the synced `HarborNAS-webui` repo when the integrated WebUI changes
 
 Use the contract and release tools when relevant:
 
