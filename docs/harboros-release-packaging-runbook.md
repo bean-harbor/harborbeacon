@@ -66,7 +66,7 @@ release-v1 的默认形态固定为：
 
 当前 handoff 增量 baseline：
 
-- Harbor Assistant-only cleanup: removed legacy HarborDesk / removed legacy HarborBot / removed legacy HarborCam active routes and removed legacy `/api/harbordesk/**`; HarborOS 集成面只保留 `/ui/harbor-assistant` 与 `/api/beacon/**`。
+- Harbor Assistant-only cleanup: HarborOS 集成面只保留 `/ui/harbor-assistant` 与 `/api/beacon/**`。
 - Media tools packaging: release bundle 必须带
   `media-tools/bin/ffmpeg` 与 `media-tools/bin/ffprobe`，installer 会安装到
   `/var/lib/harborbeacon-agent-ci/runtime/media-tools/bin/` 并写入
@@ -354,13 +354,13 @@ sudo bash ./install_harboros_release.sh \
 固定安装的 2 个服务单元：
 
 - `harborbeacon.service`
-- `harborgate.service`
+- `harboros-im-gate.service`
 
 clean install 的健康预期：
 
 - 默认活跃服务是 `harborbeacon.service`
-- 默认活跃服务是 `harborgate.service`
-- Weixin/Feishu runtime 是 `harborgate.service` 内部 task，不新增平台级 systemd 服务
+- 默认活跃服务是 `harboros-im-gate.service`
+- Weixin/Feishu runtime 是 `harboros-im-gate.service` 内部 task，不新增平台级 systemd 服务
 
 ## 5.1 `.182` 常驻测试状态助手
 
@@ -372,7 +372,7 @@ clean install 的健康预期：
 
 约定：
 
-- `status` 输出 `harborbeacon.service` 与 `harborgate.service` 的 `is-enabled / is-active / MainPID` 风格摘要 JSON
+- `status` 输出 `harborbeacon.service` 与 `harboros-im-gate.service` 的 `is-enabled / is-active / MainPID` 风格摘要 JSON
 - `health` 顺序检查 `127.0.0.1:4174`、`127.0.0.1:4174/api/inference/healthz`、`127.0.0.1:8787` 的 loopback health
 - `health` 还会带 service auth + `X-Contract-Version: 2.0` 调 `GET /api/gateway/status`
 - Weixin 摘要优先读 gateway redacted truth；如果 gateway 暂时不可读，再回退到 `WEIXIN_STATE_DIR/accounts/<account>.runtime.json`
@@ -428,8 +428,8 @@ artifact，而不是在当前 release 里改 env 开关。
 - camera live acceptance 必须确认
   `/api/beacon/cameras/<device-id>/snapshot.jpg` 返回 `200 image/jpeg`
 - `verify-harborbeacon-release --require-execute` 必须能验证 `.deb` 内置 bundle
-- removed legacy HarborDesk / removed legacy HarborBot / removed legacy HarborCam route 不应继续作为 active UI 入口存在
-- removed legacy `/api/harbordesk/**` 不应继续作为 active HarborBeacon Admin API 前缀存在
+- 旧 Harbor UI route 不应继续作为 active UI 入口存在
+- 旧同源 API prefix 不应继续作为 active HarborBeacon Admin API 前缀存在
 
 Windows host：
 
@@ -479,7 +479,7 @@ bash ./tools/run_harboros_vm_smoke.sh \
    - Rust Linux target 不是预期的 `x86_64-unknown-linux-musl`
    - builder 没产出 static linkage，导致目标机 libc 不匹配
 3. IM runtime configuration absence
-   - clean install 没有 Weixin 凭据，因此 `harborgate.service` 内部 Weixin runtime 应被视为 skipped，而不是 bundle 损坏
+   - clean install 没有 Weixin 凭据，因此 `harboros-im-gate.service` 内部 Weixin runtime 应被视为 skipped，而不是 bundle 损坏
 4. bundle incompleteness
    - 缺 HarborGate Rust binary `harborgate/bin/harborgate`
    - 缺 HarborNAS WebUI production dist / Harbor Assistant 页面

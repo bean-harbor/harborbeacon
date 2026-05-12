@@ -15,12 +15,12 @@ WebUI 产品面、配置模板、验证门禁和边界约束。
 - HarborGate 已改为 Rust-only runtime；当前 ISO 不再 vendor Python runtime。
 - HarborBeacon 对 Harbor Assistant / inference / turn API 收敛为
   `harborbeacon.service` 单端口 `4174`。
-- HarborGate 作为独立 `harborgate.service`，默认只监听 `127.0.0.1:8787`。
+- HarborGate 作为独立 `harboros-im-gate.service`，默认只监听 `127.0.0.1:8787`。
 - Harbor Assistant 的最终 UI 来源是 `HarborNAS-webui` production dist；HarborBeacon
   仓内 `frontend/harbor-assistant` 仅作为 API 验证 shell。
-- Harbor Assistant-only 入口已经收敛完成：removed legacy HarborDesk / removed legacy HarborBot / removed legacy HarborCam 公开入口和 removed legacy `/api/harbordesk/**` 同源前缀；active UI 只保留 `/ui/harbor-assistant`，active WebUI proxy 只保留 `/api/beacon/**`。
+- Harbor Assistant-only 入口已经收敛完成：active UI 只保留 `/ui/harbor-assistant`，active WebUI proxy 只保留 `/api/beacon/**`。
 - HarborGate setup / messages 入口已对齐 Harbor Assistant 的消息连接 tab；
-  不新增 removed legacy HarborDesk / removed legacy HarborCam / removed legacy HarborBot 兼容入口。
+  不新增旧 Harbor UI 兼容入口或旧同源 API 前缀。
 - `ffmpeg` 和 `ffprobe` 已提升为 HarborBeacon release bundle 必需 artifact；
   默认使用 BtbN `ffmpeg-master-latest-linux64-lgpl.tar.xz`，安装到
   `<install-root>/runtime/media-tools/bin/` 后写入 `HARBOR_FFMPEG_BIN` /
@@ -72,7 +72,7 @@ HarborNAS WebUI 中的 Harbor Assistant 产品面合并进 HarborOS 镜像或首
 - Harbor Assistant 是 HarborNAS WebUI 内的唯一公开 Harbor 入口；当前 live 路径为 `/ui/harbor-assistant`。
 - Search、Camera、Messages、Settings 都是 Harbor Assistant 内部 tab，不是独立公开入口或独立打包目标。
 - `HarborBeacon/frontend/harbor-assistant` 只是 API 校验壳，不应作为最终 Harbor Assistant 产品 UI 交付。
-- removed legacy HarborDesk / removed legacy HarborBot / removed legacy HarborCam 入口不再作为 active route、redirect 或打包目标；removed legacy `/api/harbordesk/**` 也不再作为 active API prefix。
+- 旧 Harbor UI 入口不再作为 active route、redirect 或打包目标；旧同源 API prefix 也不再作为 active API prefix。
 - HarborBeacon 与 HarborGate 当前 active contract 是 v2.0。服务间 active 请求必须使用：
 
 ```text
@@ -115,7 +115,7 @@ v2.0 禁止回退项：
 | 服务 | 默认监听 | 必需性 | 说明 |
 |---|---:|---|---|
 | `harborbeacon.service` | `0.0.0.0:4174` | 必需 | Harbor Assistant / `/api/web/turns` / `/api/inference/*` 单端口 API |
-| `harborgate.service` | `127.0.0.1:8787` | 必需 | HarborGate IM Gateway 与进程内 adapter runtime |
+| `harboros-im-gate.service` | `127.0.0.1:8787` | 必需 | HarborGate IM Gateway 与进程内 adapter runtime |
 
 建议启动顺序：
 
@@ -719,7 +719,7 @@ WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com
 open http://<harborgate-host>:8787/setup/weixin
 ```
 
-扫码、状态写入、poll runtime 都由 Rust `harborgate.service` 处理；release
+扫码、状态写入、poll runtime 都由 Rust `harboros-im-gate.service` 处理；release
 bundle 不再提供单独的 Python login / runner helper。
 
 ## 14. Release bundle 建议内容
@@ -742,7 +742,7 @@ templates/
     run-harborbeacon-service
   systemd/
     harborbeacon.service.template
-    harborgate.service.template
+    harboros-im-gate.service.template
   harborbeacon-agent-hub.env.template
 
 install/
@@ -818,13 +818,13 @@ sudo install-harborbeacon-release \
 - 默认启动 core services。
 - disable/remove legacy units：`agent-hub-admin-api.service`、`assistant-task-api.service`、
   `harbor-model-api.service`、`harbor-vlm-sidecar.service`、`harborgate-weixin-runner.service`。
-- Weixin / Feishu 等 adapter runtime 由 `harborgate.service` 按配置在进程内启动。
+- Weixin / Feishu 等 adapter runtime 由 `harboros-im-gate.service` 按配置在进程内启动。
 
 Core services：
 
 ```text
 harborbeacon.service
-harborgate.service
+harboros-im-gate.service
 ```
 
 ## 16. 安装后验证命令
@@ -833,7 +833,7 @@ harborgate.service
 
 ```bash
 systemctl status harborbeacon.service
-systemctl status harborgate.service
+systemctl status harboros-im-gate.service
 ```
 
 如果安装了 helper：
@@ -893,10 +893,8 @@ Harbor Assistant route smoke：
 
 ```text
 GET /ui/harbor-assistant -> Harbor Assistant
-GET /ui/harbordesk -> not found / removed legacy path
-GET /ui/harborbot -> not found / removed legacy path
-GET /ui/harborcam -> not found / removed legacy path
-GET /api/harbordesk/state -> not found / removed legacy API prefix
+确认 WebUI active route 清单只包含 Harbor Assistant 这一组 Harbor UI 入口
+确认 WebUI active proxy 清单只包含 /api/beacon/** 这一组 HarborBeacon API 前缀
 ```
 
 Media tools smoke：
