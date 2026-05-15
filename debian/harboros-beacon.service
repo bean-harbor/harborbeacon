@@ -1,16 +1,15 @@
 [Unit]
-Description=HarborOS Featured Photos Service
+Description=HarborOS beacon Service
 After=network.target
 
 [Service]
 Type=simple
-Environment=FEATURED_PHOTOS_PORT=8686
 Environment=HARBOR_FFMPEG_BIN=/usr/bin/ffmpeg
 Environment=HARBOR_FFPROBE_BIN=/usr/bin/ffprobe
-ExecStart=/usr/bin/harboros-featured-photos
+ExecStart=/usr/bin/harboros-beacon
 Restart=always
 RestartSec=5s
-StateDirectory=harboros-featured-photos
+StateDirectory=harboros-beacon
 
 [Install]
 WantedBy=multi-user.target
