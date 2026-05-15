@@ -1,12 +1,14 @@
 [Unit]
-Description=HarborOS beacon Service
+Description=HarborOS Beacon API Service
 After=network.target
 
 [Service]
 Type=simple
 Environment=HARBOR_FFMPEG_BIN=/usr/bin/ffmpeg
 Environment=HARBOR_FFPROBE_BIN=/usr/bin/ffprobe
-ExecStart=/usr/bin/harboros-beacon
+EnvironmentFile=-/etc/default/harboros-beacon-gate
+EnvironmentFile=-/etc/default/harboros-beacon
+ExecStart=/usr/bin/harboros-beacon --bind 127.0.0.1:4174 --admin-state /var/lib/harboros-beacon/admin-console.json --device-registry /var/lib/harboros-beacon/device-registry.json --conversations /var/lib/harboros-beacon/task-api-conversations.json --harbor-assistant-dist /usr/share/truenas/webui --public-origin http://127.0.0.1:4174
 Restart=always
 RestartSec=5s
 StateDirectory=harboros-beacon
