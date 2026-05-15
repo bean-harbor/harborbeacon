@@ -2,7 +2,7 @@
 set -e
 
 systemctl daemon-reload
-systemctl enable harboros-featured-photos.service
-systemctl restart harboros-featured-photos.service
+systemctl enable harboros-beacon.service
+systemctl restart harboros-beacon.service
 
 exit 0
