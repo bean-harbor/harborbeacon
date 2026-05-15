@@ -6,6 +6,10 @@ autobins = false
 
 [[bin]]
 name = "harboros-beacon"
+path = "src/bin/harborbeacon_service.rs"
+
+[[bin]]
+name = "harboros-beacon-agent"
 path = "src/main.rs"
 
 [[bin]]
