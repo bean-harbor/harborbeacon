@@ -4931,6 +4931,12 @@ fn normalize_unified_admin_path(path: &str) -> String {
     if let Some(tail) = path.strip_prefix("/api/beacon/") {
         return format!("/api/{tail}");
     }
+    if path == "/api/harbor-beacon" {
+        return "/api/state".to_string();
+    }
+    if let Some(tail) = path.strip_prefix("/api/harbor-beacon/") {
+        return format!("/api/{tail}");
+    }
     if path == "/api/harbor-assistant" {
         return "/api/state".to_string();
     }
@@ -13887,6 +13893,26 @@ mod tests {
             "/api/harboros/apps/home-assistant/install"
         );
         assert_eq!(normalize_unified_admin_path("/api/beacon"), "/api/state");
+    }
+
+    #[test]
+    fn harbor_beacon_api_prefix_maps_to_beacon_internal_admin_api() {
+        assert_eq!(
+            super::normalize_unified_admin_url("/api/harbor-beacon?refresh=1"),
+            "/api/state?refresh=1"
+        );
+        assert_eq!(
+            normalize_unified_admin_path("/api/harbor-beacon/state"),
+            "/api/state"
+        );
+        assert_eq!(
+            normalize_unified_admin_path("/api/harbor-beacon/home-assistant/status"),
+            "/api/home-assistant/status"
+        );
+        assert_eq!(
+            super::normalize_unified_admin_url("/api/harbor-beacon/knowledge/search?limit=10"),
+            "/api/knowledge/search?limit=10"
+        );
     }
 
     #[test]
