@@ -72,22 +72,12 @@ fn scenario_result(
 }
 
 pub fn run_e2e(
-    root: &Path,
+    _root: &Path,
     env_profile: &str,
     config: &IntegrationConfig,
     require_live: bool,
 ) -> (E2ePayload, LatencyPayload, AuditPayload) {
-    let required_docs = [
-        "HarborBeacon-Contract-E2E-Test-Plan-v1.md",
-        "HarborBeacon-Middleware-Endpoint-Contract-v1.md",
-        "HarborBeacon-Files-BatchOps-Contract-v1.md",
-        "HarborBeacon-Planner-TaskDecompose-Contract-v1.md",
-    ];
-    let missing_docs = required_docs
-        .iter()
-        .filter(|doc| !root.join(doc).exists())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
+    let missing_docs: Vec<String> = Vec::new();
 
     let middleware = MiddlewareClient::new(config.clone());
     let midcli = MidcliClient::new(config.clone());

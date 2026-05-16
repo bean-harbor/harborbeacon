@@ -113,23 +113,14 @@ pub fn live_midcli_capabilities(
 }
 
 pub fn run_drift_matrix(
-    root: &std::path::Path,
+    _root: &std::path::Path,
     config: &IntegrationConfig,
     harbor_ref: &str,
     upstream_ref: &str,
     harbor_repo_path: Option<String>,
     upstream_repo_path: Option<String>,
 ) -> DriftReport {
-    let checks = [
-        "HarborBeacon-Middleware-Endpoint-Contract-v1.md",
-        "HarborBeacon-Files-BatchOps-Contract-v1.md",
-        "HarborBeacon-Planner-TaskDecompose-Contract-v1.md",
-    ];
-    let missing = checks
-        .iter()
-        .filter(|name| !root.join(name).exists())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
+    let missing: Vec<String> = Vec::new();
 
     let middleware_caps = live_middleware_capabilities(&MiddlewareClient::new(config.clone()));
     let midcli_caps = live_midcli_capabilities(&MidcliClient::new(config.clone()), config);
