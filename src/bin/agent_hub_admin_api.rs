@@ -6370,40 +6370,44 @@ fn ensure_local_admin_access(
     remote_addr: Option<SocketAddr>,
     headers: &[Header],
 ) -> Result<(), String> {
-    if has_forwarding_headers(headers) {
+    if remote_addr.is_some_and(|addr| !is_local_socket_addr(addr)) {
+        return Err("当前管理后台接口只允许本机或局域网内访问。".to_string());
+    }
+
+    if !forwarded_client_chain_is_local(headers) {
         return Err(
             "当前管理后台接口只允许在本机或局域网内直连访问，不能通过公网反向代理转发。"
                 .to_string(),
         );
     }
 
-    if remote_addr.is_none() || remote_addr.is_some_and(is_local_socket_addr) {
-        return Ok(());
-    }
-
-    Err("当前管理后台接口只允许本机或局域网内访问。".to_string())
+    Ok(())
 }
 
 fn ensure_local_camera_access(
     remote_addr: Option<SocketAddr>,
     headers: &[Header],
 ) -> Result<(), String> {
-    if has_forwarding_headers(headers) {
+    if remote_addr.is_some_and(|addr| !is_local_socket_addr(addr)) {
+        return Err(
+            "当前摄像头直连预览只允许本机或局域网访问；如果要给外网用户观看，请使用带签名的共享链接。"
+                .to_string(),
+        );
+    }
+
+    if !forwarded_client_chain_is_local(headers) {
         return Err("当前摄像头直连预览只允许本机或局域网直连访问；如果要给外网用户观看，请使用带签名的共享链接。".to_string());
     }
 
-    if remote_addr.is_none() || remote_addr.is_some_and(is_local_socket_addr) {
-        return Ok(());
-    }
-
-    Err(
-        "当前摄像头直连预览只允许本机或局域网访问；如果要给外网用户观看，请使用带签名的共享链接。"
-            .to_string(),
-    )
+    Ok(())
 }
 
 fn is_local_socket_addr(addr: SocketAddr) -> bool {
-    match addr.ip() {
+    is_local_ip(addr.ip())
+}
+
+fn is_local_ip(ip: IpAddr) -> bool {
+    match ip {
         IpAddr::V4(ip) => ip.is_loopback() || is_private_ipv4(ip),
         IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
     }
@@ -6424,6 +6428,64 @@ fn has_forwarding_headers(headers: &[Header]) -> bool {
             || header.field.equiv("X-Forwarded-Proto")
             || header.field.equiv("X-Real-Ip")
     })
+}
+
+fn forwarded_client_chain_is_local(headers: &[Header]) -> bool {
+    for header in headers {
+        if header.field.equiv("X-Forwarded-For") {
+            for value in header.value.as_str().split(',') {
+                let Some(ip) = parse_forwarded_client_ip(value) else {
+                    return false;
+                };
+                if !is_local_ip(ip) {
+                    return false;
+                }
+            }
+        } else if header.field.equiv("X-Real-Ip") {
+            let Some(ip) = parse_forwarded_client_ip(header.value.as_str()) else {
+                return false;
+            };
+            if !is_local_ip(ip) {
+                return false;
+            }
+        } else if header.field.equiv("Forwarded") {
+            for element in header.value.as_str().split(',') {
+                for part in element.split(';') {
+                    let Some((name, value)) = part.split_once('=') else {
+                        continue;
+                    };
+                    if name.trim().eq_ignore_ascii_case("for") {
+                        let Some(ip) = parse_forwarded_client_ip(value) else {
+                            return false;
+                        };
+                        if !is_local_ip(ip) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn parse_forwarded_client_ip(value: &str) -> Option<IpAddr> {
+    let value = value.trim().trim_matches('"').trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("unknown") || value.starts_with('_') {
+        return None;
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let (host, _) = rest.split_once(']')?;
+        return host.parse::<IpAddr>().ok();
+    }
+    if value.matches(':').count() == 1 {
+        let (host, _) = value.rsplit_once(':')?;
+        return host.parse::<IpAddr>().ok();
+    }
+    None
 }
 
 fn build_release_readiness_response(
@@ -13698,16 +13760,46 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_headers_block_local_only_routes() {
-        let forwarded =
-            vec![
-                Header::from_bytes(b"X-Forwarded-For".as_slice(), b"198.51.100.10".as_slice())
-                    .expect("header"),
-            ];
+    fn lan_forwarded_headers_allow_harboros_nginx_routes() {
+        let forwarded = vec![
+            Header::from_bytes(
+                b"X-Forwarded-For".as_slice(),
+                b"192.168.3.82, 127.0.0.1".as_slice(),
+            )
+            .expect("header"),
+            Header::from_bytes(b"X-Forwarded-Host".as_slice(), b"192.168.3.82".as_slice())
+                .expect("header"),
+            Header::from_bytes(b"X-Forwarded-Proto".as_slice(), b"http".as_slice())
+                .expect("header"),
+        ];
         let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4567));
         assert!(has_forwarding_headers(&forwarded));
+        assert!(ensure_local_admin_access(Some(local), &forwarded).is_ok());
+        assert!(ensure_local_camera_access(Some(local), &forwarded).is_ok());
+    }
+
+    #[test]
+    fn forwarded_public_client_still_blocks_local_only_routes() {
+        let forwarded = vec![Header::from_bytes(
+            b"X-Forwarded-For".as_slice(),
+            b"192.168.3.82, 198.51.100.10".as_slice(),
+        )
+        .expect("header")];
+        let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4567));
         assert!(ensure_local_admin_access(Some(local), &forwarded).is_err());
         assert!(ensure_local_camera_access(Some(local), &forwarded).is_err());
+    }
+
+    #[test]
+    fn forwarded_for_header_accepts_private_rfc_syntax() {
+        let forwarded = vec![Header::from_bytes(
+            b"Forwarded".as_slice(),
+            b"for=\"192.168.3.82\";proto=http;host=harboros".as_slice(),
+        )
+        .expect("header")];
+        let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4567));
+        assert!(ensure_local_admin_access(Some(local), &forwarded).is_ok());
+        assert!(ensure_local_camera_access(Some(local), &forwarded).is_ok());
     }
 
     #[test]
