@@ -45,7 +45,9 @@
 - `IM Gateway` 的 Feishu / Weixin / queue / failure 信号必须来自后端投影；没有数据就显示空态或 blocker
 - `Account Management` 里的 proactive delivery default 以成员粒度展示，binding availability 只能反映后端提供的可绑定状态
 - `Tasks & Approvals` 里的回复与投递失败是不同信号源，前端不能把它们合并成单一“通知结果”
-- `Models & Policies` 必须把 endpoint status/test result/kind/provider/route policy/fallback order、SiliconFlow API key 输入、HF mirror URL 输入放在同一页的清晰操作位里，而不是散落成静态说明
+- `Models & Policies` 必须把 Runtime Manager、capability readiness、model download/install status、endpoint status/test result/kind/provider/route policy/fallback order、SiliconFlow API key 输入、HF mirror URL 输入放在同一页的清晰操作位里，而不是散落成静态说明
+- Harbor Assistant 默认展示 Harbor-managed Candle-first local runtime；约 0.5B bootstrap LLM 只标注为自然语言入口 / 意图分类 / 参数抽取能力，不展示成完整问答或 RAG 模型
+- OpenAI-compatible endpoint 是 Advanced Settings；UI 不自动扫描或接管用户 `127.0.0.1:11434`
 - Harbor Assistant 不把 cloud fallback 展示成默认架构；UI 文案必须保持 local-first，并明确云端只进入 `semantic.router` / `retrieval.answer` 的受控 fallback。
 
 ## 6. 共享能力

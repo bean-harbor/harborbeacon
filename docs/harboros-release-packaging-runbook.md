@@ -25,8 +25,9 @@ release-v1 的默认形态固定为：
 - HarborOS 目标机或 HarborOS ISO 集成流程只负责部署与运行，不在机上执行 `cargo`、`rustc`、`node`、`npm` 或 `pip`
 - HarborBeacon Rust Linux 默认目标为 `x86_64-unknown-linux-musl`
 - 当目标为 musl 时，builder 使用 `cargo zigbuild --release --target <target>`，并要求 builder 上已有 `cargo-zigbuild` 与 `zig`
-- HarborBeacon 单端口封装本地 OpenAI-compatible 模型服务；`harbor-model-api`/Candle/VLM 只作为内部或过渡 backend，不再成为对外 systemd/API 契约
-- Model Center 是共享能力层：release 默认保持 local-first，云端只作为 `semantic.router` 与 `retrieval.answer` 的受控 fallback
+- HarborBeacon 单端口封装本地推理 facade；`harbor-model-api`/Candle/VLM 只作为内部 backend，不再成为对外 systemd/API 契约
+- Runtime Manager + Model Center 是共享能力层：release 默认保持 Harbor-managed Candle-first local runtime，云端只作为 `semantic.router` 与 `retrieval.answer` 的受控 fallback
+- ISO / release bundle 路线允许内置约 0.5B bootstrap LLM，用于 IM / WebUI 自然语言入口、意图分类、参数抽取和配置引导；大模型、VLM、ASR 与强 embedding 默认仍按需下载或高级外接
 - `llm-cloud-siliconflow` preset 使用 `https://api.siliconflow.cn/v1`，API key 由 endpoint metadata secret 保存并通过 admin API redaction 返回
 - 本地模型下载默认 mirror 为 `https://hf-mirror.com`；实际优先级为 Harbor Assistant 输入 mirror -> `HF_ENDPOINT` -> 默认 mirror
 
@@ -263,15 +264,17 @@ sudo install-harborbeacon-release \
 
 ## 4.2 Model Backend Benchmark Gate
 
-在把 HarborOS 的默认 backend 从 `openai_proxy` 切到 `candle` 之前，先跑
-repo-local benchmark lane。
+在把某个 Harbor-managed runtime/model 写成 Harbor Assistant 默认可用之前，
+先跑 repo-local benchmark lane。
 这里的 lane 分工固定为：
 
-- `.182` 是权威 Candle runtime gate
-- `.223` 只用于 build / prefetch / spawned benchmark 证据
-- live path 继续通过 `127.0.0.1:4174/api/inference/v1` 暴露默认
-  `openai_proxy`
-- `4186` 继续保留给 Candle candidate lane
+- `.82` 是当前 RC/GA target；`.182` 是历史 Candle runtime gate，保留为可复验 target
+- `.197` 是当前 release builder；`.223` 只用于历史 build / prefetch / spawned benchmark 证据
+- live path 继续通过 `127.0.0.1:4174/api/inference/v1` 暴露本地推理 facade
+- Harbor-managed Candle-first 是默认产品路径；external OpenAI-compatible endpoint 只在用户高级配置后参与
+- `4186` 可继续保留给 Candle candidate lane
+- ISO nginx / middleware 保持服务级入口：`/api/harbor-beacon/* -> 127.0.0.1:4174` 与 `/api/harbor-gate/* -> 127.0.0.1:8787`，不为模型 runtime 增加新 location
+- 现行 `harboros-beacon.service` deb 可继续使用 `/var/lib/harboros-beacon/*.json` 保存 service state；Harbor-managed model-store 独立放在 `/mnt/software/harborbeacon-agent-ci/model-store`
 
 观察已运行服务：
 
@@ -279,8 +282,8 @@ repo-local benchmark lane。
 cargo run --bin benchmark-local-model-backend -- \
   --base-url http://127.0.0.1:4174/api/inference/v1 \
   --healthz-url http://127.0.0.1:4174/api/inference/healthz \
-  --backend openai_proxy \
-  --output /tmp/local-model-benchmark-openai-proxy.json
+  --backend candle \
+  --output /tmp/local-model-benchmark-candle-attached.json
 ```
 
 正式 promotion gate：
@@ -295,27 +298,29 @@ cargo run --bin benchmark-local-model-backend -- \
   --output /tmp/local-model-benchmark-candle.json
 ```
 
-只有当报告里的 `gate.promotable=true`，才允许规划把 env 里的
-`HARBOR_MODEL_API_BACKEND` 改成 `candle` 的单独 cutover rehearsal。否则保持
-`openai_proxy`，HarborBeacon 的 local OpenAI-compatible seam 不变。
+只有当报告里的 `gate.promotable=true`，才允许把对应 runtime/model 写成
+Harbor Assistant 默认可用。Bootstrap LLM gate 只证明自然语言入口、意图分类、
+参数抽取和配置引导可用；full answer / embedding 仍需要自己的 gate。
 
 补充说明：
 
-- `127.0.0.1:4186` 只保留给 `candle` 旁路实验实例，例如
-  `harbor-model-api-candle-exp` 这种 transient unit。
-- 当前 Candle 候选默认组合是 `Qwen/Qwen3-1.7B + jinaai/jina-embeddings-v2-base-zh`。
+- `127.0.0.1:4186` 可保留给 `candle` 候选验证实例，例如
+  `harbor-model-api-candle-exp` 这种 transient unit；产品默认路径不依赖用户
+  `127.0.0.1:11434`。
+- Bootstrap LLM 候选是 `Qwen/Qwen2.5-0.5B-Instruct`，`Qwen/Qwen3-0.6B` 可在通过 gate 后作为同级候选。
+- Full local answer / embedding 候选默认组合是 `Qwen/Qwen3-1.7B + jinaai/jina-embeddings-v2-base-zh`。
 - `Qwen3.5` 已明确延期到后续 loader/backend 轮次，不进入这一轮 gate。
 - HarborOS env template 允许保留这 3 个 side-lane 变量：
   - `HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID`
   - `HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID`
   - `HARBOR_MODEL_API_CANDLE_CACHE_DIR`
-- 只要 `/healthz` 仍报告 `degraded` / `ready=false`，或者 chat / embeddings 任一
-  gate 没过，就不能把 `4186` 的结果写成 Candle 已可切默认 backend。
+- `/healthz` 必须区分 runtime alive、model available 与 model loaded；只要
+  bootstrap 或 full model 的相应 gate 没过，就不能把该模型写成默认可用。
 - `.223` 的 spawned benchmark 只保留为 build / prefetch 兼容性证据；是否允许
   进入 cutover rehearsal，只看 `.182` 的 target-runtime report。
-- 当 `.182` 已经拿到 `gate.promotable=true` 的 Candle report 时，下一步也仍然是
-  单独开一轮 cutover rehearsal，而不是直接把 HarborBeacon 单端口推理面从
-  `openai_proxy` 改成 `candle`。
+- 当 `.82` / `.182` 已经拿到 `gate.promotable=true` 的 Candle report 时，下一步也仍然是
+  单独开一轮 Runtime Manager cutover rehearsal，而不是让 HarborBeacon 自动接管
+  用户外部 OpenAI-compatible runtime。
 
 ## 5. HarborOS 安装
 

@@ -157,6 +157,7 @@ pub fn redact_model_center_state(state: &AdminModelCenterState) -> AdminModelCen
         route_policies: state.route_policies.clone(),
         model_store_root: state.model_store_root.clone(),
         capability_bindings: state.capability_bindings.clone(),
+        runtimes: state.runtimes.clone(),
     }
 }
 
@@ -850,6 +851,8 @@ struct LocalRuntimeProjection {
     api_key_configured: bool,
     ready: bool,
     backend_ready: bool,
+    chat_model: Option<String>,
+    embedding_model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -889,6 +892,7 @@ fn runtime_wired_model_center_state(state: &AdminModelCenterState) -> AdminModel
         route_policies: state.route_policies.clone(),
         model_store_root: state.model_store_root.clone(),
         capability_bindings: state.capability_bindings.clone(),
+        runtimes: state.runtimes.clone(),
     }
 }
 
@@ -1041,6 +1045,7 @@ fn probe_local_runtime_target(target: &LocalRuntimeProbeTarget) -> LocalRuntimeP
             api_key_configured: target.api_key_configured,
             ready: false,
             backend_ready: false,
+            ..Default::default()
         };
     }
 
@@ -1054,6 +1059,7 @@ fn probe_local_runtime_target(target: &LocalRuntimeProbeTarget) -> LocalRuntimeP
                 api_key_configured: target.api_key_configured,
                 ready: false,
                 backend_ready: false,
+                ..Default::default()
             }
         }
     };
@@ -1068,6 +1074,7 @@ fn probe_local_runtime_target(target: &LocalRuntimeProbeTarget) -> LocalRuntimeP
                 api_key_configured: target.api_key_configured,
                 ready: false,
                 backend_ready: false,
+                ..Default::default()
             }
         }
     };
@@ -1081,6 +1088,7 @@ fn probe_local_runtime_target(target: &LocalRuntimeProbeTarget) -> LocalRuntimeP
                 api_key_configured: target.api_key_configured,
                 ready: false,
                 backend_ready: false,
+                ..Default::default()
             }
         }
     };
@@ -1094,6 +1102,7 @@ fn probe_local_runtime_target(target: &LocalRuntimeProbeTarget) -> LocalRuntimeP
                 api_key_configured: target.api_key_configured,
                 ready: false,
                 backend_ready: false,
+                ..Default::default()
             }
         }
     };
@@ -1112,6 +1121,18 @@ fn probe_local_runtime_target(target: &LocalRuntimeProbeTarget) -> LocalRuntimeP
             .and_then(|value| value.get("ready"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        chat_model: payload
+            .get("chat_model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        embedding_model: payload
+            .get("embedding_model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
     }
 }
 
@@ -1188,7 +1209,12 @@ fn overlay_endpoints_with_runtime_truth(
                         set_metadata_bool(&mut overlayed.metadata, "api_key_configured", true);
                     }
                     if matches!(overlayed.model_kind, ModelKind::Llm | ModelKind::Embedder) {
-                        if runtime.ready && runtime.backend_ready {
+                        let runtime_model_available = match overlayed.model_kind {
+                            ModelKind::Llm => runtime.chat_model.is_some(),
+                            ModelKind::Embedder => runtime.embedding_model.is_some(),
+                            _ => false,
+                        };
+                        if runtime.ready && runtime.backend_ready && runtime_model_available {
                             overlayed.status = ModelEndpointStatus::Active;
                         } else if overlayed.status == ModelEndpointStatus::Active {
                             overlayed.status = ModelEndpointStatus::Degraded;
@@ -1815,7 +1841,7 @@ mod tests {
                     (&Method::Get, "/healthz") => request
                         .respond(
                             Response::from_string(
-                                r#"{"ready":true,"backend":{"ready":true,"kind":"candle"}}"#,
+                                r#"{"ready":true,"backend":{"ready":true,"kind":"candle"},"chat_model":"Qwen/Qwen2.5-0.5B-Instruct"}"#,
                             )
                             .with_header(healthz_header.clone()),
                         )
@@ -2205,7 +2231,7 @@ mod tests {
                     (&Method::Get, "/healthz") => request
                         .respond(
                             Response::from_string(
-                                r#"{"ready":true,"backend":{"ready":true,"kind":"candle"}}"#,
+                                r#"{"ready":true,"backend":{"ready":true,"kind":"candle"},"chat_model":"Qwen/Qwen2.5-0.5B-Instruct"}"#,
                             )
                             .with_header(healthz_header.clone()),
                         )

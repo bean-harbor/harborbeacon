@@ -18,7 +18,49 @@ IM_AGENT_SERVICE_TOKEN=$token
 EOF
 }
 
+append_env_if_missing() {
+  local env_file="$1"
+  local key="$2"
+  local value="$3"
+  if ! grep -q "^${key}=" "$env_file" 2>/dev/null; then
+    printf '%s=%s\n' "$key" "$value" >> "$env_file"
+  fi
+}
+
+shared_token() {
+  local env_file="/etc/default/harboros-beacon-gate"
+  if [ ! -f "$env_file" ]; then
+    return
+  fi
+  sed -n 's/^HARBOR_TASK_API_BEARER_TOKEN=//p' "$env_file" | tail -n 1
+}
+
+ensure_harborbeacon_runtime_env() {
+  local env_file="/etc/default/harboros-beacon"
+  local writable_root="/mnt/software/harborbeacon-agent-ci"
+  local candle_root="${writable_root}/model-store/runtimes/harbor-candle"
+  local token
+
+  install -d -m 0755 /etc/default
+  install -d -m 0755 "${candle_root}/cache"
+  install -d -m 0755 "${candle_root}/bootstrap-llm"
+  touch "$env_file"
+  chmod 0644 "$env_file"
+
+  append_env_if_missing "$env_file" "HARBOR_HARBOROS_WRITABLE_ROOT" "$writable_root"
+  append_env_if_missing "$env_file" "HARBOR_MODEL_API_BASE_URL" "http://127.0.0.1:4174/api/inference/v1"
+  token="$(shared_token || true)"
+  if [ -n "$token" ]; then
+    append_env_if_missing "$env_file" "HARBOR_MODEL_API_TOKEN" "$token"
+  fi
+  append_env_if_missing "$env_file" "HARBOR_MODEL_API_BACKEND" "candle"
+  append_env_if_missing "$env_file" "HARBOR_MODEL_API_CHAT_MODEL" "Qwen/Qwen2.5-0.5B-Instruct"
+  append_env_if_missing "$env_file" "HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID" "${candle_root}/bootstrap-llm"
+  append_env_if_missing "$env_file" "HARBOR_MODEL_API_CANDLE_CACHE_DIR" "${candle_root}/cache"
+}
+
 ensure_shared_token_env
+ensure_harborbeacon_runtime_env
 systemctl daemon-reload
 systemctl enable harboros-beacon.service
 systemctl restart harboros-beacon.service

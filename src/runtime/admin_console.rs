@@ -367,6 +367,8 @@ pub struct AdminModelCenterState {
     pub model_store_root: String,
     #[serde(default)]
     pub capability_bindings: Vec<ModelCapabilityBindingRecord>,
+    #[serde(default)]
+    pub runtimes: Vec<ModelRuntimeRecord>,
 }
 
 impl Default for AdminModelCenterState {
@@ -376,6 +378,7 @@ impl Default for AdminModelCenterState {
             route_policies: default_model_route_policies(),
             model_store_root: default_model_store_root(),
             capability_bindings: Vec::new(),
+            runtimes: default_model_runtimes(),
         }
     }
 }
@@ -385,6 +388,39 @@ pub struct ModelCapabilityBindingRecord {
     pub capability_id: String,
     pub model_id: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelRuntimeRecord {
+    pub runtime_id: String,
+    pub display_name: String,
+    pub runtime_kind: String,
+    pub provider_key: String,
+    pub status: String,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default)]
+    pub installable: bool,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub runtime_profiles: Vec<String>,
+    #[serde(default)]
+    pub bind_url: Option<String>,
+    #[serde(default)]
+    pub healthz_url: Option<String>,
+    #[serde(default)]
+    pub model_store_path: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub installed_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1656,6 +1692,70 @@ impl AdminConsoleStore {
         self.save_projected_state(state)
     }
 
+    pub fn save_model_runtime(
+        &self,
+        runtime: ModelRuntimeRecord,
+    ) -> Result<AdminConsoleState, String> {
+        let mut state = self.load_or_create_state()?;
+        let runtime = sanitize_model_runtime(runtime, &state.models.model_store_root)?;
+        if let Some(existing) = state
+            .models
+            .runtimes
+            .iter_mut()
+            .find(|existing| existing.runtime_id == runtime.runtime_id)
+        {
+            *existing = runtime;
+        } else {
+            state.models.runtimes.push(runtime);
+        }
+        self.save_projected_state(state)
+    }
+
+    pub fn install_model_runtime(&self, runtime_id: &str) -> Result<ModelRuntimeRecord, String> {
+        let runtime_id =
+            non_empty_opt(runtime_id).ok_or_else(|| "runtime_id 不能为空".to_string())?;
+        let mut state = self.load_or_create_state()?;
+        let Some(existing) = state
+            .models
+            .runtimes
+            .iter()
+            .find(|runtime| runtime.runtime_id == runtime_id)
+            .cloned()
+        else {
+            return Err(format!("未找到 runtime {runtime_id}"));
+        };
+        if !existing.managed {
+            return Err(format!(
+                "runtime {} 不是 Harbor-managed runtime",
+                existing.display_name
+            ));
+        }
+        if !existing.installable {
+            return Err(format!(
+                "runtime {} 当前包未提供一键安装",
+                existing.display_name
+            ));
+        }
+
+        let now = model_test_timestamp();
+        let mut runtime = existing;
+        runtime.status = "installed".to_string();
+        runtime.enabled = true;
+        runtime.installed_at = runtime.installed_at.or_else(|| Some(now.clone()));
+        runtime.updated_at = Some(now);
+        runtime.message = format!("{} 已由 Harbor Assistant 启用。", runtime.display_name);
+        if let Some(existing) = state
+            .models
+            .runtimes
+            .iter_mut()
+            .find(|existing| existing.runtime_id == runtime.runtime_id)
+        {
+            *existing = sanitize_model_runtime(runtime.clone(), &state.models.model_store_root)?;
+        }
+        self.save_projected_state(state)?;
+        Ok(runtime)
+    }
+
     pub fn save_model_capability_binding(
         &self,
         capability_id: &str,
@@ -2465,12 +2565,94 @@ pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCe
     }
     capability_bindings.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
 
+    let mut runtimes = Vec::new();
+    for runtime in state.runtimes {
+        if let Ok(runtime) = sanitize_model_runtime(runtime, &model_store_root) {
+            runtimes.push(runtime);
+        }
+    }
+    let existing_runtime_ids = runtimes
+        .iter()
+        .map(|runtime| runtime.runtime_id.clone())
+        .collect::<HashSet<_>>();
+    for runtime in default_model_runtimes_for_store_root(&model_store_root) {
+        if existing_runtime_ids.contains(&runtime.runtime_id) {
+            continue;
+        }
+        if let Ok(runtime) = sanitize_model_runtime(runtime, &model_store_root) {
+            runtimes.push(runtime);
+        }
+    }
+    runtimes.sort_by(|left, right| left.runtime_id.cmp(&right.runtime_id));
+
     AdminModelCenterState {
         endpoints,
         route_policies,
         model_store_root,
         capability_bindings,
+        runtimes,
     }
+}
+
+pub fn sanitize_model_runtime(
+    mut runtime: ModelRuntimeRecord,
+    model_store_root: &str,
+) -> Result<ModelRuntimeRecord, String> {
+    runtime.runtime_id = runtime.runtime_id.trim().to_string();
+    if runtime.runtime_id.is_empty() {
+        return Err("runtime_id 不能为空".to_string());
+    }
+    runtime.display_name = non_empty_opt(&runtime.display_name)
+        .unwrap_or_else(|| runtime.runtime_id.replace('-', " "));
+    runtime.runtime_kind =
+        non_empty_opt(&runtime.runtime_kind).unwrap_or_else(|| "managed_runtime".to_string());
+    runtime.provider_key =
+        non_empty_opt(&runtime.provider_key).unwrap_or_else(|| "harbor".to_string());
+    runtime.status = non_empty_opt(&runtime.status).unwrap_or_else(|| "not_installed".to_string());
+    runtime.capabilities = sanitize_string_list(runtime.capabilities);
+    runtime.runtime_profiles = sanitize_string_list(runtime.runtime_profiles);
+    if runtime.capabilities.is_empty() {
+        runtime.capabilities = runtime_capabilities_for_id(&runtime.runtime_id);
+    }
+    if runtime.runtime_profiles.is_empty() {
+        runtime.runtime_profiles = runtime_profiles_for_id(&runtime.runtime_id);
+    }
+    runtime.bind_url = runtime.bind_url.and_then(|value| non_empty_opt(&value));
+    runtime.healthz_url = runtime.healthz_url.and_then(|value| non_empty_opt(&value));
+    runtime.model_store_path = non_empty_opt(&runtime.model_store_path)
+        .unwrap_or_else(|| model_runtime_store_path(model_store_root, &runtime.runtime_id));
+    runtime.message = non_empty_opt(&runtime.message)
+        .unwrap_or_else(|| default_model_runtime_message(&runtime.runtime_id, &runtime.status));
+    runtime.installed_at = runtime.installed_at.and_then(|value| non_empty_opt(&value));
+    runtime.updated_at = runtime.updated_at.and_then(|value| non_empty_opt(&value));
+    runtime.metadata = normalize_json_object(runtime.metadata);
+    if runtime.runtime_id == "harbor-candle" {
+        runtime.enabled = true;
+        if runtime.status == "not_installed" {
+            runtime.status = "idle".to_string();
+        }
+        if let Some(object) = runtime.metadata.as_object_mut() {
+            object
+                .entry("install_mode".to_string())
+                .or_insert_with(|| json!("bundled_embedded_runtime"));
+            object
+                .entry("owns_model_store".to_string())
+                .or_insert_with(|| json!(true));
+            object
+                .entry("external_endpoint".to_string())
+                .or_insert_with(|| json!(false));
+            object
+                .entry("default_enabled".to_string())
+                .or_insert_with(|| json!(true));
+            object
+                .entry("lazy_load_models".to_string())
+                .or_insert_with(|| json!(true));
+            object
+                .entry("bootstrap_model_id".to_string())
+                .or_insert_with(|| json!("Qwen/Qwen2.5-0.5B-Instruct"));
+        }
+    }
+    Ok(runtime)
 }
 
 pub fn sanitize_model_endpoint(mut endpoint: ModelEndpoint) -> Result<ModelEndpoint, String> {
@@ -2619,6 +2801,144 @@ fn set_model_endpoint_metadata_bool(endpoint: &mut ModelEndpoint, key: &str, val
     }
 }
 
+pub fn default_model_runtimes() -> Vec<ModelRuntimeRecord> {
+    default_model_runtimes_for_store_root(&default_model_store_root())
+}
+
+pub fn default_model_runtimes_for_store_root(model_store_root: &str) -> Vec<ModelRuntimeRecord> {
+    let local_base_url = local_model_api_base_url();
+    let local_healthz_url = local_model_api_healthz_url(&local_base_url);
+    vec![
+        ModelRuntimeRecord {
+            runtime_id: "harbor-candle".to_string(),
+            display_name: "Harbor Candle Runtime".to_string(),
+            runtime_kind: "embedded_candle".to_string(),
+            provider_key: "harbor".to_string(),
+            status: "idle".to_string(),
+            managed: true,
+            installable: true,
+            enabled: true,
+            capabilities: vec!["llm".to_string(), "embedding".to_string()],
+            runtime_profiles: vec![
+                "harbor-candle".to_string(),
+                "harbor-model-api-candle".to_string(),
+            ],
+            bind_url: Some(local_base_url),
+            healthz_url: Some(local_healthz_url),
+            model_store_path: model_runtime_store_path(model_store_root, "harbor-candle"),
+            message: "Harbor-managed Candle is enabled by default and lazy-loads Harbor-owned local models without using a user Ollama instance.".to_string(),
+            installed_at: None,
+            updated_at: None,
+            metadata: json!({
+                "install_mode": "bundled_embedded_runtime",
+                "owns_model_store": true,
+                "external_endpoint": false,
+                "default_enabled": true,
+                "lazy_load_models": true,
+                "bootstrap_model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+            }),
+        },
+        ModelRuntimeRecord {
+            runtime_id: "harbor-vlm-sidecar".to_string(),
+            display_name: "Harbor Vision Runtime".to_string(),
+            runtime_kind: "managed_sidecar".to_string(),
+            provider_key: "harbor".to_string(),
+            status: "not_available".to_string(),
+            managed: true,
+            installable: false,
+            enabled: false,
+            capabilities: vec!["vlm".to_string()],
+            runtime_profiles: vec!["harbor-vlm-sidecar".to_string()],
+            bind_url: None,
+            healthz_url: None,
+            model_store_path: model_runtime_store_path(model_store_root, "harbor-vlm-sidecar"),
+            message: "Harbor Vision Runtime is reserved for managed VLM packages; use advanced OpenAI-compatible endpoint until the package is available.".to_string(),
+            installed_at: None,
+            updated_at: None,
+            metadata: json!({
+                "install_mode": "managed_sidecar_package",
+                "external_endpoint": false,
+            }),
+        },
+        ModelRuntimeRecord {
+            runtime_id: "harbor-ocr-runtime".to_string(),
+            display_name: "Harbor OCR Runtime".to_string(),
+            runtime_kind: "managed_system_tool".to_string(),
+            provider_key: "harbor".to_string(),
+            status: "not_available".to_string(),
+            managed: true,
+            installable: false,
+            enabled: false,
+            capabilities: vec!["ocr".to_string()],
+            runtime_profiles: vec!["harbor-ocr-runtime".to_string()],
+            bind_url: None,
+            healthz_url: None,
+            model_store_path: model_runtime_store_path(model_store_root, "harbor-ocr-runtime"),
+            message: "Harbor OCR Runtime slot is managed separately from custom OCR endpoints.".to_string(),
+            installed_at: None,
+            updated_at: None,
+            metadata: json!({
+                "install_mode": "managed_system_tool",
+                "external_endpoint": false,
+            }),
+        },
+        ModelRuntimeRecord {
+            runtime_id: "harbor-asr-runtime".to_string(),
+            display_name: "Harbor Speech Runtime".to_string(),
+            runtime_kind: "managed_sidecar".to_string(),
+            provider_key: "harbor".to_string(),
+            status: "not_available".to_string(),
+            managed: true,
+            installable: false,
+            enabled: false,
+            capabilities: vec!["asr".to_string()],
+            runtime_profiles: vec!["harbor-asr-runtime".to_string()],
+            bind_url: None,
+            healthz_url: None,
+            model_store_path: model_runtime_store_path(model_store_root, "harbor-asr-runtime"),
+            message: "Harbor Speech Runtime is reserved for managed ASR packages; use advanced external endpoints until available.".to_string(),
+            installed_at: None,
+            updated_at: None,
+            metadata: json!({
+                "install_mode": "managed_sidecar_package",
+                "external_endpoint": false,
+            }),
+        },
+    ]
+}
+
+fn runtime_capabilities_for_id(runtime_id: &str) -> Vec<String> {
+    default_model_runtimes()
+        .into_iter()
+        .find(|runtime| runtime.runtime_id == runtime_id)
+        .map(|runtime| runtime.capabilities)
+        .unwrap_or_default()
+}
+
+fn runtime_profiles_for_id(runtime_id: &str) -> Vec<String> {
+    default_model_runtimes()
+        .into_iter()
+        .find(|runtime| runtime.runtime_id == runtime_id)
+        .map(|runtime| runtime.runtime_profiles)
+        .unwrap_or_default()
+}
+
+fn default_model_runtime_message(runtime_id: &str, status: &str) -> String {
+    default_model_runtimes()
+        .into_iter()
+        .find(|runtime| runtime.runtime_id == runtime_id)
+        .map(|runtime| runtime.message)
+        .unwrap_or_else(|| format!("runtime status: {status}"))
+}
+
+fn model_runtime_store_path(model_store_root: &str, runtime_id: &str) -> String {
+    Path::new(model_store_root)
+        .join("runtimes")
+        .join(runtime_id)
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub fn sanitize_model_route_policy(
     mut policy: ModelRoutePolicy,
 ) -> Result<ModelRoutePolicy, String> {
@@ -2712,7 +3032,7 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
             model_kind: ModelKind::Llm,
             endpoint_kind: ModelEndpointKind::Local,
             provider_key: "openai_compatible".to_string(),
-            model_name: "harbor-local-chat".to_string(),
+            model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
             capability_tags: vec!["chat".to_string(), "local_first".to_string()],
             cost_policy: json!({"cost_hint": "local_or_sidecar"}),
             status: ModelEndpointStatus::Degraded,
@@ -4914,9 +5234,9 @@ mod tests {
 
     use super::{
         account_management_snapshot, build_platform_state, dedupe_rtsp_paths,
-        default_model_endpoints, default_model_route_policies, default_model_store_root,
-        default_rtsp_paths, derive_rtsp_hints, device_rtsp_credential_id, normalize_binding_code,
-        normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path,
+        default_model_endpoints, default_model_route_policies, default_model_runtimes,
+        default_model_store_root, default_rtsp_paths, derive_rtsp_hints, device_rtsp_credential_id,
+        normalize_binding_code, normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path,
         resolved_identity_binding_records, resolved_remote_view_config,
         sanitize_bridge_provider_config, sanitize_defaults, sanitize_model_center_state,
         user_default_delivery_surface, user_recent_interactive_surface, AdminConsoleStore,
@@ -5787,6 +6107,56 @@ mod tests {
             .find(|policy| policy.route_policy_id == "retrieval.vision_summary")
             .expect("vlm policy");
         assert!(!vlm_policy.fallback_order.iter().any(|kind| kind == "cloud"));
+
+        let runtimes = default_model_runtimes();
+        let candle = runtimes
+            .iter()
+            .find(|runtime| runtime.runtime_id == "harbor-candle")
+            .expect("harbor candle runtime");
+        assert!(candle.managed);
+        assert!(candle.installable);
+        assert!(candle.enabled);
+        assert_eq!(candle.status, "idle");
+        assert_eq!(
+            candle.metadata["bootstrap_model_id"],
+            json!("Qwen/Qwen2.5-0.5B-Instruct")
+        );
+        assert!(candle
+            .runtime_profiles
+            .iter()
+            .any(|profile| profile == "harbor-candle"));
+        assert!(candle
+            .model_store_path
+            .replace('\\', "/")
+            .ends_with("runtimes/harbor-candle"));
+    }
+
+    #[test]
+    fn install_model_runtime_enables_harbor_managed_candle() {
+        let registry_path = temp_path("registry-model-runtime-install");
+        let admin_path = temp_path("admin-model-runtime-install");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        let installed = store
+            .install_model_runtime("harbor-candle")
+            .expect("install runtime");
+        assert_eq!(installed.runtime_id, "harbor-candle");
+        assert!(installed.enabled);
+        assert_eq!(installed.status, "installed");
+
+        let state = store.load_or_create_state().expect("reload state");
+        let candle = state
+            .models
+            .runtimes
+            .iter()
+            .find(|runtime| runtime.runtime_id == "harbor-candle")
+            .expect("persisted candle runtime");
+        assert!(candle.enabled);
+        assert_eq!(candle.status, "installed");
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
     }
 
     #[test]
@@ -5814,6 +6184,7 @@ mod tests {
             route_policies: default_model_route_policies(),
             model_store_root: default_model_store_root(),
             capability_bindings: Vec::new(),
+            runtimes: Vec::new(),
         };
 
         let sanitized = sanitize_model_center_state(state);

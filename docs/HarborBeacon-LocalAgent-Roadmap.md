@@ -15,8 +15,9 @@
 > 已验证：`/ui/harbor-assistant`、`/ui/harbor-assistant?tab=search`、knowledge search/preview、protected
 > `POST /api/web/turns` content retrieval and local-first architecture explanation；
 > `/api/turns` 仅作为 deprecated alias 保留。
-> 下一阶段：先补 release evidence/rollback notes，再推进 local model promotion
-> gate，最后恢复 Home Agent Hub / AIoT MVP 队列。
+> 下一阶段：先补 release evidence/rollback notes，再推进 Runtime Manager 的
+> Harbor-managed Candle-first 路线和 ISO bootstrap LLM，最后恢复 Home Agent
+> Hub / AIoT MVP 队列。
 >
 > 本文后续早期 v1.5 phase 描述保留为历史上下文；当前执行、验收与回滚以
 > `HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md` 和外部 v2.0 contract 为准。
@@ -34,7 +35,8 @@
 - `Local Agent V2` 负责平台骨干
 - `Home Agent Hub` 负责首个垂直域产品闭环
 - Home Agent Hub 已验证出的 artifact / event / long-running task / 补参机制，后续应反哺平台抽象
-- 模型能力按共享能力层治理，不再把 Candle、sidecar、Mistral 或 SiliconFlow 各自写成业务域；统一通过 Model Center endpoint + route policy 决策。
+- 模型能力按共享能力层治理，不再把 Candle、sidecar、Mistral 或 SiliconFlow 各自写成业务域；统一通过 Runtime Manager、Model Center endpoint 与 route policy 决策。
+- 默认产品体验调整为 Harbor-managed Candle-first：Candle 负责默认 LLM / embedding runtime，约 0.5B bootstrap LLM 随 ISO 提供基础自然语言入口；OpenAI-compatible endpoint 只作为高级外接配置，不自动复用用户 `127.0.0.1:11434`。
 - 当前模型路线保持 local-first；云端 fallback 只进入 `semantic.router` 与 `retrieval.answer`，并要求 endpoint redaction、attempt audit 和 policy gate。
 - Hugging Face 模型下载走 mirror-aware download job：Harbor Assistant 输入 mirror 优先，其次 `HF_ENDPOINT`，最后默认 `https://hf-mirror.com`。
 
@@ -248,16 +250,17 @@ P0:
 1. Land the post-RC2 docs-only closeout: RC2 evidence, rollback notes, current `.82/.197` targets, and the next-stage backlog.
 2. Keep the v2.0 seam frozen: no v1.5/v2.0 runtime dual stack, no `/api/tasks` active fallback, no public `args.resume_token`.
 3. Promote RC2 toward a GA candidate from merged mainline code only.
-4. Run the `.82` local model promotion gate before claiming active local runtime execution.
+4. Land the Runtime Manager Candle-first cutover plan: default Candle runtime `enabled/idle`, no default user-Ollama/`11434` dependency, and healthz separates runtime alive from model loaded.
+5. Add the ISO bootstrap LLM lane: bundle a ~0.5B Qwen-class model for IM / WebUI natural-language parsing and setup guidance, lazy-load it, and avoid presenting it as the full answer/RAG model.
 
 P1:
 
 1. Harden Harbor Assistant and Search as product surfaces while keeping them on real `/api/beacon/*` APIs through the HarborGate northbound edge.
 2. Extend release packaging toward HarborNAS ISO integration without changing the v2.0 public contract.
-3. Add local-first observability: fallback ratio, local/backend readiness, policy decision evidence, and failed-promotion reasons.
+3. Add local-first observability: fallback ratio, runtime/model readiness, policy decision evidence, bootstrap model usage, and failed-promotion reasons.
 
 P2:
 
-1. Resume Home Agent Hub / AIoT MVP after GA and local model gate decisions.
+1. Resume Home Agent Hub / AIoT MVP after GA and Candle-first/bootstrap runtime decisions.
 2. Continue Browser/MCP fallback optimization inside the HarborOS System Domain.
 3. Re-rank orchestration, cost, cache, OCR/ASR, and multimodal expansion work after the local runtime proof.

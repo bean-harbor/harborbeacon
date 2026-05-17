@@ -38,10 +38,13 @@
 ## 0.5 模型架构决策（当前权威）
 
 - 模型是 HarborBeacon 的共享能力层，不是独立业务域；业务域仍按 HarborOS System Domain、Home Device Domain、IM Gateway 等边界治理。
-- 当前实现保持 local-first：本地 OpenAI-compatible endpoint 是默认路径，Candle / sidecar / Mistral 只是可替换 backend 或旁路候选，不再各自形成一套产品架构。
+- 当前产品路线保持 local-first，但默认体验从“用户自带本地 OpenAI-compatible upstream”调整为 **Harbor-managed Candle-first local runtime**：Harbor Assistant 通过 HarborBeacon 的推理 facade 调用 Runtime Manager，默认由 Harbor 自管 Candle 承接 LLM / embedding；VLM、OCR、ASR 由 Harbor-managed sidecar 或系统 runtime 补齐。
+- OpenAI-compatible endpoint 保留为高级外接配置，用于用户自带 Ollama / vLLM / SGLang / cloud API；Harbor 不自动扫描、复用、启动、停止或迁移用户的 `127.0.0.1:11434`。
+- ISO 默认预置 Harbor Candle runtime 和一个约 0.5B 的 bootstrap LLM，用于 IM / WebUI 自然语言入口、意图分类、参数抽取和配置引导；该模型不承诺高质量长问答、复杂推理、RAG 最终答案或多模态理解。首选 `Qwen/Qwen2.5-0.5B-Instruct`，`Qwen/Qwen3-0.6B` 作为通过 runtime gate 后的同级候选。
+- Candle 默认启用为 `installed/enabled/idle`，但不在开机时加载模型权重；模型权重在首次自然语言请求、能力绑定或用户显式选择模型时 lazy-load。
 - 云端只作为受控 fallback。第一版仅覆盖 `semantic.router` 与 `retrieval.answer`，不覆盖 AIoT 控制、HarborOS 命令、OCR、VLM、embedding 默认路径。
 - Harbor Assistant 的 `Models & Policies` 提供 `llm-cloud-siliconflow` preset，使用 OpenAI-compatible `https://api.siliconflow.cn/v1`；API key 作为 endpoint secret 保存，读回时必须 redacted，空 key 不覆盖已保存 secret。
-- 本地模型下载默认使用 Hugging Face mirror `https://hf-mirror.com`，优先级为 Harbor Assistant 输入 mirror -> `HF_ENDPOINT` -> 默认 mirror。
+- 可选本地模型下载默认使用 Hugging Face mirror `https://hf-mirror.com`，优先级为 Harbor Assistant 输入 mirror -> `HF_ENDPOINT` -> 默认 mirror；下载模型写入 Harbor 自己的 model-store，不写入用户 Ollama 模型库。
 
 ## 1. 项目目标
 
@@ -55,10 +58,10 @@
 当前 post-RC2 执行顺序:
 
 1. 补齐 release evidence、rollback notes、daily closeout、ISO integration checklist。
-2. 在 `.82` 上跑 local model promotion gate；只有 `gate.promotable=true`
-   才规划默认 backend cutover。
-3. 继续硬化 Harbor Assistant 产品面，保持真实同源 API。
-4. 恢复 Home Agent Hub / AIoT MVP 队列，不把 Home Device Domain 折叠进
+2. 落地 Runtime Manager 的 Candle-first 默认路径：Candle runtime 默认 enabled/idle，healthz 区分 runtime alive 与 model loaded，默认路径不再探测用户 `11434`。
+3. 把约 0.5B bootstrap LLM 纳入 ISO / first-boot 计划，只绑定到自然语言入口、意图分类、参数抽取和配置引导；1.5B+、VLM、ASR、embedding 强模型继续按需下载或高级外接。
+4. 继续硬化 Harbor Assistant 产品面，保持真实同源 API，并按 capability 显示 runtime/model readiness。
+5. 恢复 Home Agent Hub / AIoT MVP 队列，不把 Home Device Domain 折叠进
    HarborOS System Domain。
 
 ---

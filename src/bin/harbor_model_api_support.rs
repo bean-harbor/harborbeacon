@@ -9,13 +9,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result as AnyResult};
-use candle::{DType, Device, Module, Tensor};
-use candle_nn::VarBuilder;
+use candle::{DType, Device, Tensor};
+use candle_nn::{Module, VarBuilder};
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::jina_bert::{
     BertModel as JinaBertModel, Config as JinaBertConfig,
 };
-use candle_transformers::models::qwen3::{Config as QwenConfig, ModelForCausalLM as QwenModel};
+use candle_transformers::models::qwen2::{Config as Qwen2Config, ModelForCausalLM as Qwen2Model};
+use candle_transformers::models::qwen3::{Config as Qwen3Config, ModelForCausalLM as Qwen3Model};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -25,13 +26,15 @@ use tiny_http::{Header, Method, Request, Response, StatusCode};
 use tokenizers::Tokenizer;
 
 const DEFAULT_BIND: &str = "127.0.0.1:4176";
-const DEFAULT_UPSTREAM_BASE_URL: &str = "http://127.0.0.1:11434/v1";
-const DEFAULT_CHAT_MODEL: &str = "harbor-local-chat";
+const DEFAULT_UPSTREAM_BASE_URL: &str = "";
+const DEFAULT_CHAT_MODEL: &str = "Qwen/Qwen2.5-0.5B-Instruct";
 const DEFAULT_EMBEDDING_MODEL: &str = "harbor-local-embed";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_CANDLE_CHAT_MODEL_ID: &str = "Qwen/Qwen3-1.7B";
+const DEFAULT_CANDLE_CHAT_MODEL_ID: &str =
+    "/mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/bootstrap-llm";
 const DEFAULT_CANDLE_EMBEDDING_MODEL_ID: &str = "jinaai/jina-embeddings-v2-base-zh";
-const DEFAULT_CANDLE_CACHE_DIR: &str = "/mnt/software/harborbeacon-agent-ci/candle-cache";
+const DEFAULT_CANDLE_CACHE_DIR: &str =
+    "/mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/cache";
 const DEFAULT_CANDLE_MAX_NEW_TOKENS: usize = 64;
 const DEFAULT_CANDLE_TEMPERATURE: f64 = 0.2;
 const DEFAULT_CANDLE_REPEAT_PENALTY: f32 = 1.1;
@@ -41,7 +44,7 @@ const SERVICE_NAME: &str = "harbor-model-api";
 const HEALTH_OK: &str = "ok";
 const HEALTH_DEGRADED: &str = "degraded";
 const CANDLE_CANDIDATE_NOTE: &str =
-    "candle candidate backend on side lane; keep openai_proxy as the default backend until benchmark gate clears promotion";
+    "Harbor-managed Candle runtime is the default local runtime; model weights lazy-load on demand";
 const CANDLE_SYSTEM_PROMPT: &str = "你是 HarborBeacon 的 Candle 实验后端。请用简洁中文直接回答；如果问题要求只回答一个词或“是/否”，请严格遵守。示例：问：请只回答“是”或“否”：摄像头能用于抓拍吗？答：是。问：请只回答一个词：“樱花”更像植物、工具还是地点？答：植物。问：请只回答一个词：在“录像”和“抓拍”里，哪一个更像持续动作？答：录像。";
 const CANDLE_OUTPUT_POLICY_PROMPT: &str =
     "只输出最终答案，不要输出 <think>、推理、分析、解释、前言、步骤说明或额外空行；如果答案可以很短，就尽量用最短可用表述。";
@@ -123,7 +126,7 @@ impl Default for ModelApiConfig {
     fn default() -> Self {
         Self {
             bind: DEFAULT_BIND.to_string(),
-            backend: BackendKind::OpenAIProxy,
+            backend: BackendKind::Candle,
             upstream_base_url: DEFAULT_UPSTREAM_BASE_URL.to_string(),
             chat_model: DEFAULT_CHAT_MODEL.to_string(),
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
@@ -409,8 +412,10 @@ struct HealthReport {
     backend: BackendSummary,
     bind: String,
     upstream_base_url: String,
-    chat_model: String,
-    embedding_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
     ready: bool,
@@ -420,6 +425,8 @@ struct HealthReport {
 struct BackendSummary {
     kind: &'static str,
     ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_loaded: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
 }
@@ -497,6 +504,12 @@ enum CandleRuntimeState {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CandleRuntimeStateSummary {
+    loaded: bool,
+    last_error: Option<String>,
+}
+
 #[derive(Debug)]
 struct CandleRuntime {
     chat: CandleChatRuntime,
@@ -505,10 +518,47 @@ struct CandleRuntime {
 
 #[derive(Debug)]
 struct CandleChatRuntime {
-    model: QwenModel,
+    model: CandleChatModel,
     tokenizer: Tokenizer,
     device: Device,
     eos_tokens: Vec<u32>,
+}
+
+#[derive(Debug)]
+enum CandleChatModel {
+    Qwen2(Qwen2Model),
+    Qwen3(Qwen3Model),
+}
+
+impl CandleChatModel {
+    fn forward(&mut self, input: &Tensor, offset: usize) -> candle::Result<Tensor> {
+        match self {
+            Self::Qwen2(model) => model.forward(input, offset),
+            Self::Qwen3(model) => model.forward(input, offset),
+        }
+    }
+
+    fn clear_kv_cache(&mut self) {
+        match self {
+            Self::Qwen2(model) => model.clear_kv_cache(),
+            Self::Qwen3(model) => model.clear_kv_cache(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandleChatModelFamily {
+    Qwen2,
+    Qwen3,
+}
+
+impl CandleChatModelFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Qwen2 => "qwen2",
+            Self::Qwen3 => "qwen3",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -516,7 +566,6 @@ struct CandleEmbeddingRuntime {
     model: JinaBertModel,
     tokenizer: Tokenizer,
     device: Device,
-    dimensions: usize,
 }
 
 #[derive(Debug)]
@@ -558,6 +607,12 @@ struct SafetensorIndex {
     weight_map: HashMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CandleChatConfigProbe {
+    model_type: Option<String>,
+    architectures: Option<Vec<String>>,
+}
+
 impl CandleBackend {
     fn new(config: CandleConfig) -> Self {
         Self {
@@ -567,42 +622,68 @@ impl CandleBackend {
     }
 
     fn health(&self, config: &ModelApiConfig) -> HealthReport {
-        match self.ensure_runtime_loaded() {
-            Ok(dimensions) => HealthReport {
-                service: SERVICE_NAME,
-                status: HEALTH_OK,
-                backend: BackendSummary {
-                    kind: BackendKind::Candle.as_str(),
-                    ready: true,
-                    note: Some(CANDLE_CANDIDATE_NOTE.to_string()),
-                },
-                bind: config.bind.clone(),
-                upstream_base_url: config.upstream_base_url.clone(),
-                chat_model: self.config.chat_model_id.clone(),
-                embedding_model: self.config.embedding_model_id.clone(),
-                note: Some(format!(
-                    "{CANDLE_CANDIDATE_NOTE}; chat and embeddings are loaded (embedding dims {dimensions})"
-                )),
+        let state = self.runtime_state_summary();
+        let chat_available =
+            state.loaded || local_model_assets_available(&self.config.chat_model_id);
+        let embedding_available =
+            state.loaded || local_model_assets_available(&self.config.embedding_model_id);
+        let mut notes = vec![CANDLE_CANDIDATE_NOTE.to_string()];
+        if state.loaded {
+            notes.push("model weights are loaded".to_string());
+        } else {
+            notes.push("runtime is idle; model weights are not loaded".to_string());
+        }
+        if !chat_available {
+            notes.push(format!(
+                "chat model assets are not present at {}",
+                self.config.chat_model_id
+            ));
+        }
+        if !embedding_available {
+            notes.push(format!(
+                "embedding model assets are not present at {}",
+                self.config.embedding_model_id
+            ));
+        }
+        if let Some(error) = state.last_error.as_ref() {
+            notes.push(format!("last load error: {}", trim_for_note(error)));
+        }
+
+        HealthReport {
+            service: SERVICE_NAME,
+            status: HEALTH_OK,
+            backend: BackendSummary {
+                kind: BackendKind::Candle.as_str(),
                 ready: true,
+                model_loaded: Some(state.loaded),
+                note: Some(CANDLE_CANDIDATE_NOTE.to_string()),
             },
-            Err(error) => HealthReport {
-                service: SERVICE_NAME,
-                status: HEALTH_DEGRADED,
-                backend: BackendSummary {
-                    kind: BackendKind::Candle.as_str(),
-                    ready: false,
-                    note: Some(CANDLE_CANDIDATE_NOTE.to_string()),
-                },
-                bind: config.bind.clone(),
-                upstream_base_url: config.upstream_base_url.clone(),
-                chat_model: self.config.chat_model_id.clone(),
-                embedding_model: self.config.embedding_model_id.clone(),
-                note: Some(format!(
-                    "{CANDLE_CANDIDATE_NOTE}; last load error: {}",
-                    trim_for_note(&error)
-                )),
-                ready: false,
+            bind: config.bind.clone(),
+            upstream_base_url: config.upstream_base_url.clone(),
+            chat_model: chat_available.then(|| config.chat_model.clone()),
+            embedding_model: embedding_available.then(|| config.embedding_model.clone()),
+            note: Some(notes.join("; ")),
+            ready: true,
+        }
+    }
+
+    fn runtime_state_summary(&self) -> CandleRuntimeStateSummary {
+        let Ok(state) = self.state.lock() else {
+            return CandleRuntimeStateSummary {
+                loaded: false,
+                last_error: Some("candle runtime lock is poisoned".to_string()),
+            };
+        };
+        match &*state {
+            CandleRuntimeState::Ready(_) => CandleRuntimeStateSummary {
+                loaded: true,
+                last_error: None,
             },
+            CandleRuntimeState::Failed(error) => CandleRuntimeStateSummary {
+                loaded: false,
+                last_error: Some(error.clone()),
+            },
+            CandleRuntimeState::Uninitialized => CandleRuntimeStateSummary::default(),
         }
     }
 
@@ -637,7 +718,7 @@ impl CandleBackend {
                 "id": format!("chatcmpl-{}", current_timestamp_ms()),
                 "object": "chat.completion",
                 "created": current_timestamp_secs(),
-                "model": self.config.chat_model_id,
+                "model": config.chat_model.clone(),
                 "choices": [
                     {
                         "index": 0,
@@ -655,8 +736,7 @@ impl CandleBackend {
                 },
                 "experimental": {
                     "backend": "candle",
-                    "mode": "candidate-side-lane",
-                    "default_backend": "openai_proxy",
+                    "mode": "harbor-managed-local-runtime",
                 },
                 "note": CANDLE_CANDIDATE_NOTE,
                 "bind": config.bind,
@@ -703,15 +783,14 @@ impl CandleBackend {
                         "embedding": value.values,
                     }))
                     .collect::<Vec<_>>(),
-                "model": self.config.embedding_model_id,
+                "model": config.embedding_model.clone(),
                 "usage": {
                     "prompt_tokens": prompt_tokens,
                     "total_tokens": prompt_tokens,
                 },
                 "experimental": {
                     "backend": "candle",
-                    "mode": "candidate-side-lane",
-                    "default_backend": "openai_proxy",
+                    "mode": "harbor-managed-local-runtime",
                 },
                 "note": CANDLE_CANDIDATE_NOTE,
                 "bind": config.bind,
@@ -761,10 +840,6 @@ impl CandleBackend {
         }
     }
 
-    fn ensure_runtime_loaded(&self) -> Result<usize, String> {
-        self.with_runtime(|runtime| Ok(runtime.embeddings.dimensions))
-    }
-
     fn load_runtime(&self) -> AnyResult<CandleRuntime> {
         let cache_dir = PathBuf::from(self.config.cache_dir.trim());
         if cache_dir.as_os_str().is_empty() {
@@ -789,20 +864,7 @@ impl CandleBackend {
         let chat_tokenizer = Tokenizer::from_file(&chat_assets.tokenizer_file)
             .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
         let device = Device::Cpu;
-        let chat_vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&chat_assets.weight_files, DType::F32, &device)
-                .context("failed to mmap qwen3 model weights")?
-        };
-        let config: QwenConfig =
-            serde_json::from_slice(&fs::read(&chat_assets.config_file).with_context(|| {
-                format!(
-                    "failed to read qwen3 config {}",
-                    chat_assets.config_file.display()
-                )
-            })?)
-            .context("failed to parse qwen3 config")?;
-        let chat_model =
-            QwenModel::new(&config, chat_vb).context("failed to construct qwen3 model")?;
+        let chat_model = load_candle_chat_model(&chat_assets, &device)?;
 
         let mut eos_tokens = Vec::new();
         for token in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
@@ -826,7 +888,6 @@ impl CandleBackend {
             })?,
         )
         .context("failed to parse jina embedding config")?;
-        let embedding_dimensions = embedding_config.hidden_size;
         let embedding_model = JinaBertModel::new(embedding_vb, &embedding_config)
             .context("failed to construct jina embedding model")?;
 
@@ -841,7 +902,6 @@ impl CandleBackend {
                 model: embedding_model,
                 tokenizer: embedding_tokenizer,
                 device,
-                dimensions: embedding_dimensions,
             },
         })
     }
@@ -1036,12 +1096,13 @@ impl OpenAIProxyBackend {
                 backend: BackendSummary {
                     kind: BackendKind::OpenAIProxy.as_str(),
                     ready: true,
+                    model_loaded: None,
                     note: None,
                 },
                 bind: config.bind.clone(),
                 upstream_base_url: self.upstream_base_url.clone(),
-                chat_model: self.chat_model.clone(),
-                embedding_model: self.embedding_model.clone(),
+                chat_model: Some(self.chat_model.clone()),
+                embedding_model: Some(self.embedding_model.clone()),
                 note: Some(format!(
                     "upstream health checked via {}",
                     ready_url.unwrap_or_else(|| join_url(&self.upstream_base_url, "/models"))
@@ -1055,6 +1116,7 @@ impl OpenAIProxyBackend {
                 backend: BackendSummary {
                     kind: BackendKind::OpenAIProxy.as_str(),
                     ready: false,
+                    model_loaded: None,
                     note: Some(format!(
                         "upstream health check failed at {} and {}; timeout {} ms",
                         probe_urls[0], probe_urls[1], self.timeout_ms
@@ -1062,8 +1124,8 @@ impl OpenAIProxyBackend {
                 },
                 bind: config.bind.clone(),
                 upstream_base_url: self.upstream_base_url.clone(),
-                chat_model: self.chat_model.clone(),
-                embedding_model: self.embedding_model.clone(),
+                chat_model: Some(self.chat_model.clone()),
+                embedding_model: Some(self.embedding_model.clone()),
                 note: Some(
                     "openai_proxy backend is configured but upstream is unhealthy".to_string(),
                 ),
@@ -1728,6 +1790,15 @@ fn strip_prefix_case_insensitive<'a>(text: &'a str, prefix: &str) -> Option<&'a 
     }
 }
 
+fn local_model_assets_available(model_id: &str) -> bool {
+    let trimmed = model_id.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let model_path = PathBuf::from(trimmed);
+    model_path.exists() && resolve_local_model_assets(&model_path).is_ok()
+}
+
 fn resolve_model_assets(model_id: &str) -> AnyResult<ResolvedModelAssets> {
     let trimmed = model_id.trim();
     if trimmed.is_empty() {
@@ -1740,6 +1811,67 @@ fn resolve_model_assets(model_id: &str) -> AnyResult<ResolvedModelAssets> {
     } else {
         resolve_hf_model_assets(trimmed)
     }
+}
+
+fn load_candle_chat_model(
+    assets: &ResolvedModelAssets,
+    device: &Device,
+) -> AnyResult<CandleChatModel> {
+    let config_bytes = fs::read(&assets.config_file).with_context(|| {
+        format!(
+            "failed to read chat config {}",
+            assets.config_file.display()
+        )
+    })?;
+    let family = detect_candle_chat_model_family(&config_bytes)?;
+    let vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(&assets.weight_files, DType::F32, device)
+            .with_context(|| format!("failed to mmap {} model weights", family.as_str()))?
+    };
+    match family {
+        CandleChatModelFamily::Qwen2 => {
+            let config: Qwen2Config =
+                serde_json::from_slice(&config_bytes).context("failed to parse qwen2 config")?;
+            Qwen2Model::new(&config, vb)
+                .map(CandleChatModel::Qwen2)
+                .context("failed to construct qwen2 model")
+        }
+        CandleChatModelFamily::Qwen3 => {
+            let config: Qwen3Config =
+                serde_json::from_slice(&config_bytes).context("failed to parse qwen3 config")?;
+            Qwen3Model::new(&config, vb)
+                .map(CandleChatModel::Qwen3)
+                .context("failed to construct qwen3 model")
+        }
+    }
+}
+
+fn detect_candle_chat_model_family(config_bytes: &[u8]) -> AnyResult<CandleChatModelFamily> {
+    let probe: CandleChatConfigProbe =
+        serde_json::from_slice(config_bytes).context("failed to parse candle chat config probe")?;
+    let model_type = probe
+        .model_type
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if model_type == "qwen2" {
+        return Ok(CandleChatModelFamily::Qwen2);
+    }
+    if model_type == "qwen3" {
+        return Ok(CandleChatModelFamily::Qwen3);
+    }
+
+    let architectures = probe.architectures.unwrap_or_default();
+    if architectures.iter().any(|value| value.contains("Qwen2")) {
+        return Ok(CandleChatModelFamily::Qwen2);
+    }
+    if architectures.iter().any(|value| value.contains("Qwen3")) {
+        return Ok(CandleChatModelFamily::Qwen3);
+    }
+
+    Err(anyhow!(
+        "unsupported candle chat model family; expected qwen2 or qwen3"
+    ))
 }
 
 fn resolve_local_model_assets(model_path: &PathBuf) -> AnyResult<ResolvedModelAssets> {
@@ -1996,7 +2128,7 @@ fn print_usage() {
 pub fn print_startup_banner(config: &ModelApiConfig) {
     match config.backend {
         BackendKind::Candle => println!(
-            "{} listening on http://{} (backend {}, chat model {}, embedding model {}, cache {}, candidate side lane)",
+            "{} listening on http://{} (backend {}, chat model {}, embedding model {}, cache {}, Harbor-managed local runtime)",
             SERVICE_NAME,
             config.bind,
             config.backend,
@@ -2068,7 +2200,7 @@ mod tests {
     fn default_config_stays_local_first() {
         let config = ModelApiConfig::default();
         assert_eq!(config.bind, DEFAULT_BIND);
-        assert_eq!(config.backend, BackendKind::OpenAIProxy);
+        assert_eq!(config.backend, BackendKind::Candle);
         assert_eq!(config.upstream_base_url, DEFAULT_UPSTREAM_BASE_URL);
         assert_eq!(config.chat_model, DEFAULT_CHAT_MODEL);
         assert_eq!(config.embedding_model, DEFAULT_EMBEDDING_MODEL);
@@ -2079,6 +2211,51 @@ mod tests {
         );
         assert_eq!(config.candle.cache_dir, DEFAULT_CANDLE_CACHE_DIR);
         assert_eq!(config.candle.max_new_tokens, DEFAULT_CANDLE_MAX_NEW_TOKENS);
+    }
+
+    #[test]
+    fn candle_chat_model_family_detects_qwen2_and_qwen3() {
+        let qwen2 = serde_json::to_vec(&json!({
+            "model_type": "qwen2",
+            "architectures": ["Qwen2ForCausalLM"]
+        }))
+        .unwrap();
+        let qwen3 = serde_json::to_vec(&json!({
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"]
+        }))
+        .unwrap();
+        let qwen2_by_arch = serde_json::to_vec(&json!({
+            "architectures": ["Qwen2ForCausalLM"]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            detect_candle_chat_model_family(&qwen2).unwrap(),
+            CandleChatModelFamily::Qwen2
+        );
+        assert_eq!(
+            detect_candle_chat_model_family(&qwen3).unwrap(),
+            CandleChatModelFamily::Qwen3
+        );
+        assert_eq!(
+            detect_candle_chat_model_family(&qwen2_by_arch).unwrap(),
+            CandleChatModelFamily::Qwen2
+        );
+    }
+
+    #[test]
+    fn candle_chat_model_family_rejects_unsupported_models() {
+        let unsupported = serde_json::to_vec(&json!({
+            "model_type": "llama",
+            "architectures": ["LlamaForCausalLM"]
+        }))
+        .unwrap();
+
+        let error = detect_candle_chat_model_family(&unsupported)
+            .expect_err("unsupported model family should fail")
+            .to_string();
+        assert!(error.contains("unsupported candle chat model family"));
     }
 
     #[test]
@@ -2141,7 +2318,7 @@ mod tests {
     }
 
     #[test]
-    fn candle_health_reports_degraded_when_runtime_is_missing() {
+    fn candle_health_reports_idle_without_loading_missing_models() {
         let config = ModelApiConfig {
             backend: BackendKind::Candle,
             ..ModelApiConfig::default()
@@ -2151,13 +2328,17 @@ mod tests {
         candle.embedding_model_id = std::env::temp_dir().display().to_string();
         let backend = CandleBackend::new(candle);
         let report = backend.health(&config);
-        assert!(!report.ready);
-        assert_eq!(report.status, HEALTH_DEGRADED);
+        assert!(report.ready);
+        assert_eq!(report.status, HEALTH_OK);
         assert_eq!(report.backend.kind, "candle");
+        assert_eq!(report.backend.ready, true);
+        assert_eq!(report.backend.model_loaded, Some(false));
+        assert!(report.chat_model.is_none());
+        assert!(report.embedding_model.is_none());
         assert!(report
             .note
             .as_deref()
-            .is_some_and(|note| note.contains("last load error")));
+            .is_some_and(|note| note.contains("runtime is idle")));
     }
 
     #[test]

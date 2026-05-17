@@ -551,19 +551,42 @@ HARBOR_MEDIA_TOOLS_SHA256=<archive-sha256>
 
 ## 11. 可选 AI / 多模态依赖
 
-基础 ISO 不强制内置大模型，但建议预留模型目录和配置。
+基础 ISO 不强制内置大模型、VLM 或 ASR 包，但默认应内置 Harbor-managed
+Candle runtime 和一个约 0.5B 的 bootstrap LLM，用于 IM / WebUI 自然语言入口、
+意图分类、参数抽取和配置引导。该模型不作为高质量长问答、RAG 最终答案、
+复杂推理或多模态模型来宣传。
 
-OpenAI-compatible LLM upstream 可选：
+Bootstrap LLM 建议：
+
+```text
+preferred: Qwen/Qwen2.5-0.5B-Instruct
+candidate after runtime gate: Qwen/Qwen3-0.6B
+runtime: harbor-candle
+load policy: lazy-load
+scope: semantic_router / assistant_input_parser / setup guidance
+```
+
+模型目录建议写入 Harbor 自己的 writable model-store，例如：
+
+```text
+<writable-root>/model-store/runtimes/harbor-candle/bootstrap-llm
+```
+
+Harbor 不写入用户 Ollama 模型库，也不自动扫描、启动、停止或迁移用户的
+`127.0.0.1:11434`。
+
+OpenAI-compatible LLM upstream 仍是高级外接配置，可选：
 
 ```text
 Ollama
 vLLM
+SGLang
 llama.cpp server
 LM Studio
 任意 OpenAI-compatible API
 ```
 
-默认 upstream 示例：
+示例 base URL 只应出现在高级设置里：
 
 ```text
 http://127.0.0.1:11434/v1
@@ -601,6 +624,7 @@ yolov8n.pt
 
 - HarborGate Rust binary。
 - HarborBeacon Rust release binaries。
+- Harbor Candle runtime 与 bootstrap LLM model directory。
 - HarborNAS WebUI production dist。
 - `yolov8n.pt`，如果启用 YOLO。
 - VLM model directory，如果启用内部 VLM backend。
@@ -610,6 +634,7 @@ yolov8n.pt
 建议默认目录：
 
 ```text
+/var/lib/harboros-beacon
 /var/lib/harborbeacon-agent-ci
 /var/lib/harborbeacon-agent-ci/current
 /var/lib/harborbeacon-agent-ci/runtime
@@ -623,19 +648,23 @@ yolov8n.pt
 
 | 路径 | 用途 |
 |---|---|
+| `/var/lib/harboros-beacon` | 现行 `harboros-beacon.service` deb 的 service state；不要求 ISO middleware 迁移 |
 | `/var/lib/harborbeacon-agent-ci` | exec-capable install root |
 | `/var/lib/harborbeacon-agent-ci/current` | 当前 release symlink |
-| `/var/lib/harborbeacon-agent-ci/runtime` | runtime state 根目录 |
+| `/var/lib/harborbeacon-agent-ci/runtime` | release-bundle runtime state 根目录；可与现行 deb state 并存 |
 | `/var/lib/harborbeacon-agent-ci/logs` | 服务日志辅助目录 |
 | `/var/lib/harborbeacon-agent-ci/captures` | snapshot / video / artifact capture |
 | `/mnt/software/harborbeacon-agent-ci` | HarborOS writable root |
-| `/mnt/software/harborbeacon-models` | 模型缓存目录 |
+| `/mnt/software/harborbeacon-agent-ci/model-store` | Harbor-managed runtime / model-store；不写入用户 Ollama 模型库 |
+| `/mnt/software/harborbeacon-models` | 历史模型缓存目录；新 Harbor-managed runtime 优先使用上面的 model-store |
 
 状态隔离要求：
 
 - HarborBeacon admin state、device registry、task conversations 独立保存。
+- 当前 deb service 可以继续使用 `/var/lib/harboros-beacon/*.json`；它是 service state，不是 model-store。
 - HarborGate sessions、platform credential state、Weixin state 独立保存。
 - HarborNAS WebUI 不直接读写这些 state 文件，只通过 HTTP API。
+- ISO nginx / middleware 只需要保留 `/api/harbor-beacon/* -> 127.0.0.1:4174` 与 `/api/harbor-gate/* -> 127.0.0.1:8787`，不承担 state path 迁移。
 
 ## 13. 环境变量与凭据归属
 
@@ -656,9 +685,10 @@ HARBOR_HARBOROS_USER=<service-user>
 HARBOR_HARBOROS_WRITABLE_ROOT=/mnt/software/harborbeacon-agent-ci
 HARBOR_KNOWLEDGE_INDEX_ROOT=/mnt/software/harborbeacon-agent-ci/knowledge-index
 
-HARBOR_TASK_API_ADMIN_STATE=/var/lib/harborbeacon-agent-ci/runtime/admin-console.json
-HARBOR_TASK_API_DEVICE_REGISTRY=/var/lib/harborbeacon-agent-ci/runtime/device-registry.json
-HARBOR_TASK_API_CONVERSATIONS=/var/lib/harborbeacon-agent-ci/runtime/task-api-conversations.json
+# Existing harboros-beacon deb may keep these as explicit ExecStart flags:
+# --admin-state /var/lib/harboros-beacon/admin-console.json
+# --device-registry /var/lib/harboros-beacon/device-registry.json
+# --conversations /var/lib/harboros-beacon/task-api-conversations.json
 HARBOR_TASK_API_BEARER_TOKEN=<shared-token>
 
 HARBOR_TASK_API_URL=http://127.0.0.1:4174
@@ -667,10 +697,15 @@ HARBORBEACON_WEB_API_TOKEN=<shared-token>
 
 HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4174/api/inference/v1
 HARBOR_MODEL_API_TOKEN=<shared-token>
-HARBOR_MODEL_API_BACKEND=openai_proxy
-HARBOR_MODEL_API_UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1
-HARBOR_MODEL_API_CHAT_MODEL=harbor-local-chat
+HARBOR_MODEL_API_BACKEND=candle
+HARBOR_MODEL_API_CHAT_MODEL=Qwen/Qwen2.5-0.5B-Instruct
 HARBOR_MODEL_API_EMBEDDING_MODEL=harbor-local-embed
+HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID=/mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/bootstrap-llm
+HARBOR_MODEL_API_CANDLE_CACHE_DIR=/mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/cache
+
+# External OpenAI-compatible endpoints are configured by Harbor Assistant
+# Advanced Settings, not by default ISO env. Example only:
+# HARBOR_MODEL_API_UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1
 
 HARBORGATE_BASE_URL=http://127.0.0.1:8787
 HARBORGATE_BEARER_TOKEN=<shared-token>
@@ -945,13 +980,23 @@ RC2 live smoke 参考：
 
 ## 18. Local-First Promotion Gate
 
-ISO 默认可以保留 `HARBOR_MODEL_API_BACKEND=openai_proxy`，但产品说法必须明确：
+ISO 默认路径调整为 Harbor-managed Candle-first，但需要区分三层状态：
 
-- 默认策略是 local-first。
+- Candle runtime 可以默认 `installed/enabled/idle`。
+- Bootstrap LLM 可以随 ISO 预置，但必须 lazy-load。
+- 1.5B+ LLM、VLM、ASR、强 embedding 和外部 OpenAI-compatible endpoint 仍按需安装或高级配置。
+
+产品说法必须明确：
+
+- 默认策略是 Harbor-managed local-first。
+- Bootstrap LLM 只承接 IM / WebUI 自然语言入口、意图分类、参数抽取和配置引导。
 - cloud 只有在 privacy/resource policy 放行时作为受控 fallback。
 - SiliconFlow 是当前 `.82` fallback proof，不是默认架构。
+- 用户自己的 Ollama / vLLM / SGLang / cloud endpoint 只在 Advanced Settings 手动配置后参与路由。
 
-只有当 `.82` local model benchmark report 里的 `gate.promotable=true`，才允许规划把默认 backend 切到 `candle` 的单独 cutover rehearsal。否则 ISO 应保留 openai-compatible seam 和 fallback policy，不把 local model 写成已默认启用。
+只有当 `.82` runtime/model benchmark report 里的相关 gate 通过时，才允许把
+bootstrap LLM 写成“ISO 默认可用”。更大模型或新 backend 仍需要单独 promotion
+gate；未通过时只能显示为可安装或高级外接，不得写成已默认启用。
 
 ## 19. 已知风险与需要 HarborNAS owner 确认的问题
 
@@ -960,6 +1005,7 @@ ISO 默认可以保留 `HARBOR_MODEL_API_BACKEND=openai_proxy`，但产品说法
 - HarborGate README 标注：如果启用 `HARBORBEACON_TASK_API_URL`，必须确认代码已从历史 task client 切到 v2.0 `/api/turns` client；否则属于 release gate blocker。
 - `tools/build_release_bundle.sh` 支持 `frontend/harbor-assistant` 验证 shell；正式 ISO 应以 `HarborNAS-webui` 的 `/ui/harbor-assistant` 为准。
 - VLM / YOLO / 本地 LLM 模型较大，是否内置会显著影响 ISO 体积。
+- Bootstrap LLM 虽小于完整本地大模型，但仍会增加 ISO 体积；需要 HarborNAS owner 确认最终镜像预算与 license/provenance 打包方式。
 - `ffmpeg` 和 `ffprobe` 对 camera / video / snapshot / RTSP credential
   validation 很关键；若 release bundle 缺 `media-tools/bin/ffmpeg` 或
   `media-tools/bin/ffprobe`，installer 默认必须 fail-fast。
@@ -974,5 +1020,5 @@ ISO 默认可以保留 `HARBOR_MODEL_API_BACKEND=openai_proxy`，但产品说法
 - production `/api/beacon/**` proxy 由 nginx、middleware proxy，还是 HarborNAS WebUI 服务层实现。
 - HarborGate Feishu setup portal / QR onboarding 是否直接暴露给 LAN 手机访问。
 - Weixin runner 是否默认安装并 disabled，还是仅在用户开启 Weixin 后安装。
-- 是否默认内置 YOLO / VLM 模型，还是首启后按需下载。
+- 是否接受默认内置约 0.5B bootstrap LLM；YOLO / VLM / ASR / 1.5B+ LLM 仍默认首启后按需下载。
 - HarborNAS WebUI 是否把 Harbor Assistant 放入默认导航，还是 feature flag 控制。

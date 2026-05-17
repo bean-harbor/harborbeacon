@@ -42,14 +42,14 @@ use harborbeacon_local_agent::runtime::access_control::{
 use harborbeacon_local_agent::runtime::admin_console::{
     account_management_snapshot, dedupe_rtsp_paths, default_capture_subdirectory,
     default_clip_length_seconds, default_keyframe_count, default_keyframe_interval_seconds,
-    default_model_endpoints, default_model_store_root, device_rtsp_credential_id,
-    harboros_writable_root, normalize_delivery_surface, path_is_same_or_inside,
-    user_default_delivery_surface, user_recent_interactive_surface, validate_knowledge_settings,
-    AccountManagementSnapshot, AdminConsoleState, AdminConsoleStore, AdminDefaults,
-    AdminModelCenterState, BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord,
-    GatewayStatusSummary, HomeAssistantAdminState, HomeAssistantConfigUpdate,
+    default_model_endpoints, default_model_runtimes_for_store_root, default_model_store_root,
+    device_rtsp_credential_id, harboros_writable_root, normalize_delivery_surface,
+    path_is_same_or_inside, user_default_delivery_surface, user_recent_interactive_surface,
+    validate_knowledge_settings, AccountManagementSnapshot, AdminConsoleState, AdminConsoleStore,
+    AdminDefaults, AdminModelCenterState, BridgeProviderConfig, DeviceCredentialSecret,
+    DeviceEvidenceRecord, GatewayStatusSummary, HomeAssistantAdminState, HomeAssistantConfigUpdate,
     KnowledgeIndexJobRecord, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
-    RagResourceProfile,
+    ModelRuntimeRecord, RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::discovery::RtspProbeRequest;
 use harborbeacon_local_agent::runtime::dvr::{
@@ -218,6 +218,7 @@ pub(crate) struct ModelRuntimeActivationRequest {
     pub model_id: String,
     pub model_kind: ModelKind,
     pub local_path: Option<String>,
+    pub runtime_profiles: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -883,6 +884,7 @@ struct ModelCapabilitiesResponse {
     checked_at: String,
     status: String,
     model_store: ModelStoreStatusResponse,
+    runtime_manager: ModelRuntimeManagerResponse,
     capabilities: Vec<ModelCapabilityStatus>,
     blockers: Vec<String>,
     warnings: Vec<String>,
@@ -913,6 +915,11 @@ struct ModelCapabilityStatus {
     download_jobs: Vec<ModelDownloadJobRecord>,
     next_action: String,
     runtime_ready: bool,
+    required_runtime_profile: Option<String>,
+    runtime_installed: bool,
+    runtime_installable: bool,
+    runtime_status: Option<String>,
+    runtime_next_action: Option<String>,
     source_of_truth: String,
     evidence: Vec<String>,
 }
@@ -942,6 +949,7 @@ struct ModelCapabilityInstallableModel {
     source_kind: String,
     repo_id: Option<String>,
     file_policy: String,
+    runtime_profiles: Vec<String>,
     expected_capabilities: Vec<String>,
 }
 
@@ -970,6 +978,32 @@ struct ModelDownloadJobsResponse {
     downloads: Vec<ModelDownloadJobRecord>,
     blockers: Vec<String>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct ModelRuntimeManagerResponse {
+    generated_at: String,
+    checked_at: String,
+    status: String,
+    runtimes: Vec<ModelRuntimeStatus>,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct ModelRuntimeStatus {
+    #[serde(flatten)]
+    record: ModelRuntimeRecord,
+    installed: bool,
+    active: bool,
+    next_action: String,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct ModelRuntimeInstallResponse {
+    runtime: ModelRuntimeStatus,
+    runtime_manager: ModelRuntimeManagerResponse,
+    message: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1367,6 +1401,9 @@ impl AdminApi {
             Method::Get if path == "/api/models/capabilities" => {
                 self.handle_model_capabilities(&identity_hints).boxed()
             }
+            Method::Get if path == "/api/models/runtimes" => {
+                self.handle_model_runtimes(&identity_hints).boxed()
+            }
             Method::Get if path == "/api/models/store" => {
                 self.handle_model_store(&identity_hints).boxed()
             }
@@ -1460,6 +1497,12 @@ impl AdminApi {
             Method::Post if path == "/api/models/local-downloads" => self
                 .handle_create_model_download(&mut request, &identity_hints)
                 .boxed(),
+            Method::Post
+                if path.starts_with("/api/models/runtimes/") && path.ends_with("/install") =>
+            {
+                self.handle_install_model_runtime(path.as_str(), &identity_hints)
+                    .boxed()
+            }
             Method::Put if path == "/api/models/store" => self
                 .handle_update_model_store(&mut request, &identity_hints)
                 .boxed(),
@@ -2542,6 +2585,24 @@ impl AdminApi {
         ))
     }
 
+    fn handle_model_runtimes(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
+        ok_json(&build_model_runtime_manager_response(
+            &state.models,
+            &runtime_projection,
+        ))
+    }
+
     fn handle_model_store(
         &self,
         hints: &AccessIdentityHints,
@@ -2888,6 +2949,44 @@ impl AdminApi {
         }
     }
 
+    fn handle_install_model_runtime(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let runtime_id = match parse_model_runtime_install_path(path) {
+            Some(runtime_id) => runtime_id,
+            None => return error_json(StatusCode(400), "invalid model runtime install path"),
+        };
+        let runtime = match self.admin_store.install_model_runtime(&runtime_id) {
+            Ok(runtime) => runtime,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
+        let manager = build_model_runtime_manager_response(&state.models, &runtime_projection);
+        let runtime_status = manager
+            .runtimes
+            .iter()
+            .find(|candidate| candidate.record.runtime_id == runtime.runtime_id)
+            .cloned()
+            .unwrap_or_else(|| model_runtime_status(runtime, &runtime_projection));
+        ok_json(&ModelRuntimeInstallResponse {
+            message: format!(
+                "{} is enabled for Harbor-managed models.",
+                runtime_status.record.display_name
+            ),
+            runtime: runtime_status,
+            runtime_manager: manager,
+        })
+    }
+
     fn handle_select_model_capability(
         &self,
         path: &str,
@@ -2905,13 +3004,13 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        if let Err(error) = self
-            .admin_store
-            .save_model_capability_binding(&capability_id, &body.model_id)
+        if let Err(error) = self.activate_selected_model_capability(&capability_id, &body.model_id)
         {
             return error_json(StatusCode(422), &error);
         }
-        if let Err(error) = self.activate_selected_model_capability(&capability_id, &body.model_id)
+        if let Err(error) = self
+            .admin_store
+            .save_model_capability_binding(&capability_id, &body.model_id)
         {
             return error_json(StatusCode(422), &error);
         }
@@ -2923,7 +3022,7 @@ impl AdminApi {
         capability_id: &str,
         model_id: &str,
     ) -> Result<(), String> {
-        let Some(model_kind) = runtime_model_kind_for_capability(capability_id) else {
+        let Some(capability_model_kind) = model_kind_for_capability(capability_id) else {
             return Ok(());
         };
         let state = self.admin_store.load_or_create_state()?;
@@ -2940,18 +3039,40 @@ impl AdminApi {
                 model.display_name
             ));
         }
-        if !catalog_model_matches_kind_or_capability(model, model_kind, capability_id) {
+        if !catalog_model_matches_kind_or_capability(model, capability_model_kind, capability_id) {
             return Err(format!(
                 "模型 {} 不适用于 {} 能力",
                 model.display_name, capability_id
             ));
         }
+        if let Some(profile) = managed_runtime_profile_for_model(model) {
+            let runtime_projection = LocalModelRuntimeProjection::default();
+            let runtime_status =
+                model_runtime_status_for_profile(&state.models, &runtime_projection, profile)
+                    .ok_or_else(|| format!("未找到 Harbor-managed runtime profile {profile}"))?;
+            if !runtime_status.installed {
+                return Err(format!(
+                    "请先安装 {}，再选择 {}",
+                    runtime_status.record.display_name, model.display_name
+                ));
+            }
+        } else if external_runtime_profile_for_model(model) {
+            return Err(format!(
+                "模型 {} 需要在高级设置配置 OpenAI-compatible runtime；Harbor 不会自动启动或接管外部 runtime",
+                model.display_name
+            ));
+        }
+
+        let Some(model_kind) = runtime_model_kind_for_capability(capability_id) else {
+            return Ok(());
+        };
 
         let request = ModelRuntimeActivationRequest {
             capability_id: capability_id.to_string(),
             model_id: model.model_id.clone(),
             model_kind,
             local_path: model.local_path.clone(),
+            runtime_profiles: model.runtime_profiles.clone(),
         };
         let result = if let Some(handler) = self.model_runtime_activation.as_ref() {
             handler(request)?
@@ -2980,6 +3101,7 @@ impl AdminApi {
             "activation_message": result.message,
             "activation_requested_at": now_unix_string(),
             "runtime_auto_activation": true,
+            "runtime_profiles": model.runtime_profiles.clone(),
         });
         if let Some(runtime_model_id) = result.runtime_model_id.as_ref() {
             set_metadata_string(&mut metadata, "runtime_model_id", runtime_model_id.clone());
@@ -5092,6 +5214,18 @@ fn parse_model_download_cancel_path(path: &str) -> Option<String> {
     }
 }
 
+fn parse_model_runtime_install_path(path: &str) -> Option<String> {
+    let runtime_id = path
+        .strip_prefix("/api/models/runtimes/")?
+        .strip_suffix("/install")?
+        .trim();
+    if runtime_id.is_empty() || runtime_id.contains('/') {
+        None
+    } else {
+        percent_decode_path_segment(runtime_id).ok()
+    }
+}
+
 fn parse_model_capability_selection_path(path: &str) -> Option<String> {
     let capability_id = path
         .strip_prefix("/api/models/capabilities/")?
@@ -6140,6 +6274,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/harboros/apps/home-assistant/install"
         || path == "/api/models/endpoints"
         || path == "/api/models/capabilities"
+        || path == "/api/models/runtimes"
         || path == "/api/models/store"
         || path == "/api/models/local-catalog"
         || path == "/api/models/policies"
@@ -6176,6 +6311,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path.starts_with("/api/models/endpoints/")
         || path == "/api/models/local-downloads"
         || path.starts_with("/api/models/local-downloads/")
+        || (path.starts_with("/api/models/runtimes/") && path.ends_with("/install"))
         || (path.starts_with("/api/models/capabilities/") && path.ends_with("/selection"))
 }
 
@@ -9026,6 +9162,7 @@ fn build_model_capabilities_response(
     let catalog = build_local_model_catalog_for_model_state(model_state, download_jobs.clone());
     let model_store = build_model_store_status(model_state);
     let generated_at = now_unix_string();
+    let runtime_manager = build_model_runtime_manager_response(model_state, runtime);
     let capabilities = vec![
         build_model_capability_status(
             model_state,
@@ -9108,7 +9245,12 @@ fn build_model_capabilities_response(
     ];
     let blockers = capabilities
         .iter()
-        .filter(|capability| matches!(capability.status.as_str(), "needs_model" | "degraded"))
+        .filter(|capability| {
+            matches!(
+                capability.status.as_str(),
+                "needs_model" | "needs_runtime" | "degraded"
+            )
+        })
         .map(|capability| format!("{}: {}", capability.capability_id, capability.next_action))
         .collect::<Vec<_>>();
     let status = if capabilities
@@ -9116,6 +9258,11 @@ fn build_model_capabilities_response(
         .any(|capability| capability.status == "degraded")
     {
         "degraded"
+    } else if capabilities
+        .iter()
+        .any(|capability| capability.status == "needs_runtime")
+    {
+        "needs-runtime"
     } else if capabilities
         .iter()
         .any(|capability| capability.status == "needs_model")
@@ -9131,10 +9278,199 @@ fn build_model_capabilities_response(
         checked_at: generated_at,
         status,
         model_store,
+        runtime_manager,
         capabilities,
         blockers,
         warnings: Vec::new(),
     }
+}
+
+fn build_model_runtime_manager_response(
+    model_state: &AdminModelCenterState,
+    runtime: &LocalModelRuntimeProjection,
+) -> ModelRuntimeManagerResponse {
+    let generated_at = now_unix_string();
+    let runtimes = model_runtime_records_for_state(model_state)
+        .into_iter()
+        .map(|record| model_runtime_status(record, runtime))
+        .collect::<Vec<_>>();
+    let blockers = runtimes
+        .iter()
+        .filter(|runtime| {
+            runtime.record.managed && !runtime.installed && runtime.record.installable
+        })
+        .map(|runtime| format!("{}: {}", runtime.record.runtime_id, runtime.next_action))
+        .collect::<Vec<_>>();
+    let status = if runtimes.iter().any(|runtime| runtime.active) {
+        "ready"
+    } else if runtimes
+        .iter()
+        .any(|runtime| runtime.record.managed && runtime.installed)
+    {
+        "installed"
+    } else if runtimes
+        .iter()
+        .any(|runtime| runtime.record.managed && runtime.record.installable)
+    {
+        "needs-runtime"
+    } else {
+        "degraded"
+    }
+    .to_string();
+
+    ModelRuntimeManagerResponse {
+        generated_at: generated_at.clone(),
+        checked_at: generated_at,
+        status,
+        runtimes,
+        blockers,
+        warnings: Vec::new(),
+    }
+}
+
+fn model_runtime_records_for_state(model_state: &AdminModelCenterState) -> Vec<ModelRuntimeRecord> {
+    let mut runtimes = model_state.runtimes.clone();
+    let mut seen = runtimes
+        .iter()
+        .map(|runtime| runtime.runtime_id.clone())
+        .collect::<HashSet<_>>();
+    for runtime in default_model_runtimes_for_store_root(&model_state.model_store_root) {
+        if seen.insert(runtime.runtime_id.clone()) {
+            runtimes.push(runtime);
+        }
+    }
+    runtimes.sort_by(|left, right| left.runtime_id.cmp(&right.runtime_id));
+    runtimes
+}
+
+fn model_runtime_status(
+    mut record: ModelRuntimeRecord,
+    runtime: &LocalModelRuntimeProjection,
+) -> ModelRuntimeStatus {
+    let runtime_ready = runtime.ready
+        && runtime.backend_ready
+        && runtime
+            .embedding_model
+            .as_ref()
+            .is_some_and(|model| !model.trim().is_empty());
+    let installed = matches!(
+        record.status.as_str(),
+        "installed" | "active" | "ready" | "running"
+    ) || record.enabled;
+    let active = installed
+        && runtime_ready
+        && record.runtime_profiles.iter().any(|profile| {
+            runtime_profile_matches_backend(profile, runtime.backend_kind.as_deref())
+        });
+    if active {
+        let has_loaded_model = runtime.chat_model.is_some() || runtime.embedding_model.is_some();
+        record.status = if has_loaded_model { "active" } else { "idle" }.to_string();
+        record.message = if has_loaded_model {
+            "Runtime 已启用，并正在服务 Harbor-managed 推理路径。".to_string()
+        } else {
+            "Runtime 已启用并处于空闲状态；选择或安装模型后会按需加载。".to_string()
+        };
+    }
+    let next_action = if active {
+        if runtime.chat_model.is_some() || runtime.embedding_model.is_some() {
+            "可以使用".to_string()
+        } else {
+            "选择或安装 Harbor-managed 模型".to_string()
+        }
+    } else if installed {
+        "选择支持的模型后会启动 runtime".to_string()
+    } else if record.installable {
+        format!("安装 {}", record.display_name)
+    } else {
+        "当前 ISO 未包含该 runtime 包，可在高级设置接入 OpenAI-compatible endpoint".to_string()
+    };
+
+    ModelRuntimeStatus {
+        record,
+        installed,
+        active,
+        next_action,
+    }
+}
+
+fn model_runtime_status_for_profile(
+    model_state: &AdminModelCenterState,
+    runtime: &LocalModelRuntimeProjection,
+    profile: &str,
+) -> Option<ModelRuntimeStatus> {
+    let canonical = canonical_managed_runtime_profile(profile)?;
+    model_runtime_records_for_state(model_state)
+        .into_iter()
+        .find(|record| {
+            record.runtime_id == canonical
+                || record
+                    .runtime_profiles
+                    .iter()
+                    .any(|profile| canonical_managed_runtime_profile(profile) == Some(canonical))
+        })
+        .map(|record| model_runtime_status(record, runtime))
+}
+
+fn runtime_profile_matches_backend(profile: &str, backend_kind: Option<&str>) -> bool {
+    let Some(canonical) = canonical_managed_runtime_profile(profile) else {
+        return false;
+    };
+    matches!(
+        (canonical, backend_kind.map(|value| value.trim().to_ascii_lowercase())),
+        ("harbor-candle", Some(kind)) if kind == "candle"
+    )
+}
+
+fn canonical_managed_runtime_profile(profile: &str) -> Option<&'static str> {
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "harbor-candle" | "harbor-model-api-candle" => Some("harbor-candle"),
+        "harbor-vlm-sidecar" | "cpu-vlm-sidecar" => Some("harbor-vlm-sidecar"),
+        "harbor-ocr-runtime" => Some("harbor-ocr-runtime"),
+        "harbor-asr-runtime" => Some("harbor-asr-runtime"),
+        _ => None,
+    }
+}
+
+fn default_managed_runtime_profile_for_capability(
+    capability_id: &str,
+    model_kind: ModelKind,
+) -> Option<&'static str> {
+    match capability_id.trim() {
+        "semantic_router" | "retrieval_answer" => Some("harbor-candle"),
+        "embedder" => Some("harbor-candle"),
+        "vlm" => Some("harbor-vlm-sidecar"),
+        "ocr" => Some("harbor-ocr-runtime"),
+        "asr" => Some("harbor-asr-runtime"),
+        _ => match model_kind {
+            ModelKind::Llm | ModelKind::Embedder => Some("harbor-candle"),
+            ModelKind::Vlm => Some("harbor-vlm-sidecar"),
+            ModelKind::Ocr => Some("harbor-ocr-runtime"),
+            ModelKind::Asr => Some("harbor-asr-runtime"),
+            _ => None,
+        },
+    }
+}
+
+fn managed_runtime_profile_for_model(model: &LocalModelCatalogItem) -> Option<&'static str> {
+    model
+        .runtime_profiles
+        .iter()
+        .find_map(|profile| canonical_managed_runtime_profile(profile))
+}
+
+fn external_runtime_profile_for_model(model: &LocalModelCatalogItem) -> bool {
+    managed_runtime_profile_for_model(model).is_none()
+        && model
+            .runtime_profiles
+            .iter()
+            .any(|profile| runtime_profile_is_external(profile))
+}
+
+fn runtime_profile_is_external(profile: &str) -> bool {
+    let normalized = profile.trim().to_ascii_lowercase();
+    normalized.contains("openai-compatible")
+        || normalized.contains("vllm")
+        || normalized.contains("sglang")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9211,6 +9547,32 @@ fn build_model_capability_status(
                     && catalog_model_matches_kind_or_capability(model, model_kind, capability_id)
             })
         });
+    let selected_external_model =
+        installed_model.is_some_and(|model| managed_runtime_profile_for_model(model).is_none());
+    let required_runtime_profile = installed_model
+        .and_then(managed_runtime_profile_for_model)
+        .or_else(|| {
+            if selected_external_model {
+                None
+            } else {
+                default_managed_runtime_profile_for_capability(capability_id, model_kind)
+            }
+        });
+    let runtime_status = required_runtime_profile
+        .and_then(|profile| model_runtime_status_for_profile(model_state, runtime, profile));
+    let runtime_installed = runtime_status
+        .as_ref()
+        .is_some_and(|status| status.installed);
+    let runtime_installable = runtime_status
+        .as_ref()
+        .is_some_and(|status| status.record.installable);
+    let runtime_status_value = runtime_status
+        .as_ref()
+        .map(|status| status.record.status.clone());
+    let runtime_next_action = runtime_status
+        .as_ref()
+        .map(|status| status.next_action.clone());
+    let runtime_missing = required_runtime_profile.is_some() && !runtime_installed;
     let endpoint_ready = endpoint.is_some_and(|value| value.status == ModelEndpointStatus::Active);
     let ready = if runtime_bound {
         runtime_ready
@@ -9223,8 +9585,12 @@ fn build_model_capability_status(
         "ready"
     } else if active_download {
         "downloading"
+    } else if runtime_missing {
+        "needs_runtime"
     } else if installed_model.is_some() {
         "installed_not_running"
+    } else if runtime_installed {
+        "needs_model"
     } else if unsupported {
         "unsupported"
     } else if endpoint.is_some() {
@@ -9233,18 +9599,25 @@ fn build_model_capability_status(
         "needs_model"
     }
     .to_string();
-    let current_model = endpoint.map(|endpoint| ModelCapabilityCurrentModel {
-        model_endpoint_id: endpoint.model_endpoint_id.clone(),
-        model_name: runtime_model_name_for_kind(model_kind, runtime)
-            .unwrap_or_else(|| endpoint.model_name.clone()),
-        provider_key: endpoint.provider_key.clone(),
-        status: endpoint.status.as_str().to_string(),
-    });
+    let current_model = (status != "needs_model")
+        .then(|| {
+            endpoint.map(|endpoint| ModelCapabilityCurrentModel {
+                model_endpoint_id: endpoint.model_endpoint_id.clone(),
+                model_name: runtime_model_name_for_kind(model_kind, runtime)
+                    .unwrap_or_else(|| endpoint.model_name.clone()),
+                provider_key: endpoint.provider_key.clone(),
+                status: endpoint.status.as_str().to_string(),
+            })
+        })
+        .flatten();
     let runtime_model_id = runtime_model_name_for_kind(model_kind, runtime);
     let policy = find_route_policy(route_policies, route_policy_id);
     let next_action = match status.as_str() {
         "ready" => "可以使用".to_string(),
         "downloading" => "等待模型下载完成".to_string(),
+        "needs_runtime" => runtime_next_action
+            .clone()
+            .unwrap_or_else(|| "安装 Harbor-managed runtime".to_string()),
         "installed_not_running" => "模型已安装，点击选择会自动切换并启动".to_string(),
         "unsupported" => "暂不支持该能力".to_string(),
         "degraded" => runtime
@@ -9259,6 +9632,15 @@ fn build_model_capability_status(
         format!("runtime_bound={runtime_bound}"),
         format!("runtime_ready={runtime_ready}"),
     ];
+    if let Some(profile) = required_runtime_profile {
+        evidence.push(format!("required_runtime_profile={profile}"));
+    }
+    if let Some(status) = runtime_status.as_ref() {
+        evidence.push(format!(
+            "runtime={} status={} installed={} active={}",
+            status.record.runtime_id, status.record.status, status.installed, status.active
+        ));
+    }
     if let Some(endpoint) = endpoint {
         evidence.push(format!(
             "endpoint={} status={}",
@@ -9283,10 +9665,15 @@ fn build_model_capability_status(
         download_jobs: capability_jobs,
         next_action,
         runtime_ready,
+        required_runtime_profile: required_runtime_profile.map(str::to_string),
+        runtime_installed,
+        runtime_installable,
+        runtime_status: runtime_status_value,
+        runtime_next_action,
         source_of_truth: if runtime_bound {
-            "local inference runtime + route policy + model catalog".to_string()
+            "runtime manager + local inference runtime + route policy + model catalog".to_string()
         } else {
-            "route policy + model endpoint + model catalog".to_string()
+            "runtime manager + route policy + model endpoint + model catalog".to_string()
         },
         evidence,
     }
@@ -9372,6 +9759,26 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             acceptance_note: Some("retrieval-quality-upgrade"),
         },
         LocalModelCatalogSpec {
+            model_id: "Qwen/Qwen2.5-0.5B-Instruct",
+            display_name: "Qwen2.5 0.5B Bootstrap Instruct",
+            provider_key: "qwen",
+            model_kind: "llm",
+            recommended_hardware: "CPU 4GB+; ISO bootstrap natural-language entry",
+            download_size_hint: "500 MB-1 GB",
+            source_kind: "huggingface",
+            repo_id: Some("Qwen/Qwen2.5-0.5B-Instruct"),
+            revision: "main",
+            file_policy: "runtime_snapshot",
+            runtime_profiles: &["harbor-candle", "harbor-model-api-candle"],
+            expected_capabilities: &[
+                "llm",
+                "semantic_router",
+                "assistant_input_parser",
+                "setup_guidance",
+            ],
+            acceptance_note: Some("iso-bootstrap"),
+        },
+        LocalModelCatalogSpec {
             model_id: "qwen2.5-1.5b-instruct",
             display_name: "Qwen2.5 1.5B Instruct",
             provider_key: "qwen",
@@ -9382,7 +9789,7 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             repo_id: Some("Qwen/Qwen2.5-1.5B-Instruct"),
             revision: "main",
             file_policy: "runtime_snapshot",
-            runtime_profiles: &["harbor-model-api-candle"],
+            runtime_profiles: &["harbor-candle", "harbor-model-api-candle"],
             expected_capabilities: &["llm"],
             acceptance_note: Some("legacy-catalog"),
         },
@@ -9397,7 +9804,7 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             repo_id: None,
             revision: "main",
             file_policy: "single_file_or_existing_cache",
-            runtime_profiles: &["harbor-model-api-candle"],
+            runtime_profiles: &["harbor-candle", "harbor-model-api-candle"],
             expected_capabilities: &["embedding"],
             acceptance_note: Some("legacy-catalog"),
         },
@@ -9428,7 +9835,7 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             repo_id: Some("HuggingFaceTB/SmolVLM-256M-Instruct"),
             revision: "main",
             file_policy: "runtime_snapshot",
-            runtime_profiles: &["openai-compatible-vlm", "cpu-vlm-sidecar"],
+            runtime_profiles: &["harbor-vlm-sidecar", "openai-compatible-vlm"],
             expected_capabilities: &["vlm", "image_text_to_text"],
             acceptance_note: Some("vm-cpu-photo-rag"),
         },
@@ -9655,6 +10062,7 @@ fn model_hardware_recommendation(
         };
     }
     if model_id.contains("smolvlm")
+        || model_id.contains("0.5b")
         || model_id.contains("1.5b")
         || model_id.contains("embedding")
         || model_id.contains("bge")
@@ -9750,6 +10158,7 @@ fn model_capability_installable_model(
         source_kind: model.source_kind.clone(),
         repo_id: model.repo_id.clone(),
         file_policy: model.file_policy.clone(),
+        runtime_profiles: model.runtime_profiles.clone(),
         expected_capabilities: model.expected_capabilities.clone(),
     }
 }
@@ -9769,6 +10178,17 @@ fn runtime_model_kind_for_capability(capability_id: &str) -> Option<ModelKind> {
     match capability_id.trim() {
         "semantic_router" | "retrieval_answer" => Some(ModelKind::Llm),
         "embedder" => Some(ModelKind::Embedder),
+        _ => None,
+    }
+}
+
+fn model_kind_for_capability(capability_id: &str) -> Option<ModelKind> {
+    match capability_id.trim() {
+        "semantic_router" | "retrieval_answer" => Some(ModelKind::Llm),
+        "embedder" => Some(ModelKind::Embedder),
+        "vlm" => Some(ModelKind::Vlm),
+        "ocr" => Some(ModelKind::Ocr),
+        "asr" => Some(ModelKind::Asr),
         _ => None,
     }
 }
@@ -10494,7 +10914,9 @@ fn run_huggingface_snapshot_download(
 }
 
 fn huggingface_download_should_fallback_to_plain_http(error_message: &str) -> bool {
-    error_message.contains("Header Content-Range is missing")
+    let normalized = error_message.to_ascii_lowercase();
+    normalized.contains("header content-range is missing")
+        || normalized.contains("header etag is missing")
 }
 
 fn huggingface_download_should_try_endpoint_fallback(error_message: &str) -> bool {
@@ -10977,6 +11399,14 @@ fn default_model_download_target_path_for_model_state(
 }
 
 fn default_model_download_target_path_in_root(root: &str, model_id: &str) -> String {
+    if model_id.trim() == "Qwen/Qwen2.5-0.5B-Instruct" {
+        return Path::new(root)
+            .join("runtimes")
+            .join("harbor-candle")
+            .join("bootstrap-llm")
+            .display()
+            .to_string();
+    }
     let slug = model_id
         .trim()
         .chars()
@@ -11091,6 +11521,11 @@ fn push_unique_root(roots: &mut Vec<String>, root: String) {
 fn find_cached_model_path(cache_roots: &[String], model_id: &str) -> Option<String> {
     let slug = model_id.replace('/', "-").to_ascii_lowercase();
     for root in cache_roots {
+        let runtime_default =
+            PathBuf::from(default_model_download_target_path_in_root(root, model_id));
+        if runtime_default.exists() {
+            return Some(runtime_default.display().to_string());
+        }
         let direct = Path::new(root).join(model_id);
         if direct.exists() {
             return Some(direct.display().to_string());
@@ -11643,10 +12078,14 @@ fn probe_local_model_runtime(endpoints: &[ModelEndpoint]) -> LocalModelRuntimePr
         chat_model: payload
             .get("chat_model")
             .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .map(str::to_string),
         embedding_model: payload
             .get("embedding_model")
             .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .map(str::to_string),
         note: payload
             .get("note")
@@ -11774,7 +12213,12 @@ fn overlay_model_endpoints_with_runtime_truth(
                     }
 
                     if matches!(overlayed.model_kind, ModelKind::Llm | ModelKind::Embedder) {
-                        if runtime.ready && runtime.backend_ready {
+                        let runtime_model_available = match overlayed.model_kind {
+                            ModelKind::Llm => runtime.chat_model.is_some(),
+                            ModelKind::Embedder => runtime.embedding_model.is_some(),
+                            _ => false,
+                        };
+                        if runtime.ready && runtime.backend_ready && runtime_model_available {
                             overlayed.status = ModelEndpointStatus::Active;
                         } else if overlayed.status == ModelEndpointStatus::Active {
                             overlayed.status = ModelEndpointStatus::Degraded;
@@ -11910,6 +12354,9 @@ fn build_embed_feature(
         String::new()
     } else if let Some(error) = runtime.error.as_ref() {
         error.clone()
+    } else if runtime.ready && runtime.backend_ready {
+        "Local embeddings runtime is ready, but no embedding model is installed or selected."
+            .to_string()
     } else {
         "Local embeddings runtime is not ready.".to_string()
     };
@@ -11972,7 +12419,12 @@ fn build_answer_feature(
 ) -> FeatureAvailabilityItem {
     let policy = find_route_policy(route_policies, "retrieval.answer");
     let endpoint = select_model_endpoint(endpoints, "llm-local-openai-compatible", ModelKind::Llm);
-    let runtime_ready = runtime.ready && runtime.backend_ready;
+    let runtime_ready = runtime.ready
+        && runtime.backend_ready
+        && runtime
+            .chat_model
+            .as_ref()
+            .is_some_and(|model| !model.trim().is_empty());
     let projection_mismatch = endpoint.is_some_and(has_projection_mismatch);
     let status = if runtime_ready {
         "available"
@@ -11985,6 +12437,8 @@ fn build_answer_feature(
         String::new()
     } else if let Some(error) = runtime.error.as_ref() {
         error.clone()
+    } else if runtime.ready && runtime.backend_ready {
+        "Local answer runtime is ready, but no chat model is installed or selected.".to_string()
     } else {
         "Local answer runtime is not ready.".to_string()
     };
@@ -13202,7 +13656,8 @@ mod tests {
         build_model_capabilities_response, build_rag_readiness_response,
         build_release_readiness_response, build_rtsp_url_from_patch,
         camera_stream_url_with_credentials, default_model_download_target_path,
-        default_model_endpoints, ensure_local_admin_access, ensure_local_camera_access,
+        default_model_download_target_path_in_root, default_model_endpoints,
+        ensure_local_admin_access, ensure_local_camera_access,
         harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
@@ -13221,10 +13676,11 @@ mod tests {
         parse_device_validation_run_path, parse_knowledge_index_job_cancel_path,
         parse_member_default_delivery_surface_update_path, parse_member_role_update_path,
         parse_model_download_cancel_path, parse_model_download_job_path, parse_model_endpoint_path,
-        parse_model_endpoint_test_path, parse_notification_target_delete_path,
-        parse_optional_unix_seconds, parse_share_link_revoke_path,
-        parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
-        percent_decode_path_segment, probe_local_model_runtime, redact_account_management_snapshot,
+        parse_model_endpoint_test_path, parse_model_runtime_install_path,
+        parse_notification_target_delete_path, parse_optional_unix_seconds,
+        parse_share_link_revoke_path, parse_shared_camera_live_page_path,
+        parse_shared_camera_live_stream_path, percent_decode_path_segment,
+        probe_local_model_runtime, redact_account_management_snapshot,
         redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
         redact_value_stream_credentials, release_item, request_identity_hints,
@@ -14181,6 +14637,10 @@ mod tests {
             parse_model_endpoint_test_path(&format!("/api/models/endpoints/{encoded}/test")),
             Some("ocr/local".to_string())
         );
+        assert_eq!(
+            parse_model_runtime_install_path("/api/models/runtimes/harbor-candle/install"),
+            Some("harbor-candle".to_string())
+        );
     }
 
     #[test]
@@ -14590,6 +15050,18 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_model_download_target_uses_candle_runtime_store() {
+        let root = unique_store_path("bootstrap-model-store").with_extension("");
+        let target = default_model_download_target_path_in_root(
+            &root.display().to_string(),
+            "Qwen/Qwen2.5-0.5B-Instruct",
+        );
+        assert!(target
+            .replace('\\', "/")
+            .ends_with("runtimes/harbor-candle/bootstrap-llm"));
+    }
+
+    #[test]
     fn local_model_catalog_surfaces_huggingface_qwen_live_test_models() {
         let catalog = build_local_model_catalog(Vec::new());
 
@@ -14639,6 +15111,26 @@ mod tests {
         );
         assert!(qwen25.installable);
 
+        let bootstrap = catalog
+            .models
+            .iter()
+            .find(|item| item.model_id == "Qwen/Qwen2.5-0.5B-Instruct")
+            .expect("bootstrap qwen model");
+        assert_eq!(bootstrap.source_kind, "huggingface");
+        assert_eq!(
+            bootstrap.repo_id.as_deref(),
+            Some("Qwen/Qwen2.5-0.5B-Instruct")
+        );
+        assert_eq!(bootstrap.acceptance_note.as_deref(), Some("iso-bootstrap"));
+        assert!(bootstrap
+            .expected_capabilities
+            .iter()
+            .any(|capability| capability == "assistant_input_parser"));
+        assert!(bootstrap
+            .runtime_profiles
+            .iter()
+            .any(|profile| profile == "harbor-candle"));
+
         let smolvlm = catalog
             .models
             .iter()
@@ -14654,7 +15146,7 @@ mod tests {
         assert!(smolvlm
             .runtime_profiles
             .iter()
-            .any(|profile| profile == "cpu-vlm-sidecar"));
+            .any(|profile| profile == "harbor-vlm-sidecar"));
         assert_eq!(smolvlm.acceptance_note.as_deref(), Some("vm-cpu-photo-rag"));
 
         let bge = catalog
@@ -14765,6 +15257,49 @@ mod tests {
     }
 
     #[test]
+    fn model_capabilities_surface_default_candle_runtime_and_missing_model() {
+        let runtime = LocalModelRuntimeProjection {
+            error: Some("runtime offline".to_string()),
+            ..Default::default()
+        };
+        let endpoints =
+            overlay_model_endpoints_with_runtime_truth(&default_model_endpoints(), &runtime);
+        let response = build_model_capabilities_response(
+            &AdminModelCenterState::default(),
+            &endpoints,
+            &default_model_route_policies(),
+            Vec::new(),
+            &runtime,
+        );
+
+        assert_eq!(response.runtime_manager.status, "installed");
+        let candle = response
+            .runtime_manager
+            .runtimes
+            .iter()
+            .find(|runtime| runtime.record.runtime_id == "harbor-candle")
+            .expect("harbor candle runtime");
+        assert!(candle.installed);
+        assert!(candle.record.enabled);
+        assert!(candle.record.installable);
+
+        let router = response
+            .capabilities
+            .iter()
+            .find(|capability| capability.capability_id == "semantic_router")
+            .expect("router capability");
+        assert_eq!(router.status, "needs_model");
+        assert_eq!(
+            router.required_runtime_profile.as_deref(),
+            Some("harbor-candle")
+        );
+        assert!(router.runtime_installed);
+        assert!(router.runtime_installable);
+        assert_eq!(router.next_action, "选择或安装模型");
+        assert!(router.current_model.is_none());
+    }
+
+    #[test]
     fn huggingface_snapshot_allow_patterns_keep_runtime_files_only() {
         let patterns = vec![
             "*.json".to_string(),
@@ -14783,9 +15318,12 @@ mod tests {
     }
 
     #[test]
-    fn huggingface_plain_http_fallback_handles_mirror_content_range_gap() {
+    fn huggingface_plain_http_fallback_handles_mirror_header_gaps() {
         assert!(huggingface_download_should_fallback_to_plain_http(
             "Header Content-Range is missing"
+        ));
+        assert!(huggingface_download_should_fallback_to_plain_http(
+            "Header etag is missing"
         ));
         assert!(!huggingface_download_should_fallback_to_plain_http(
             "HTTP status client error"
@@ -15960,7 +16498,7 @@ mod tests {
         let admin_path = unique_store_path("harborbeacon-model-select-state");
         let conversation_path = unique_store_path("harborbeacon-model-select-conversations");
         let model_store = unique_store_path("harborbeacon-model-select-store");
-        let model_dir = model_store.join("qwen-qwen3.5-4b");
+        let model_dir = model_store.join("qwen2.5-1.5b-instruct");
         fs::create_dir_all(&model_dir).expect("create model dir");
         fs::write(model_dir.join("config.json"), "{}").expect("write model file");
 
@@ -15969,6 +16507,9 @@ mod tests {
         admin_store
             .save_model_store_root(&model_store.to_string_lossy())
             .expect("save model store root");
+        admin_store
+            .install_model_runtime("harbor-candle")
+            .expect("enable candle runtime");
         let conversation_store = TaskConversationStore::new(conversation_path.clone());
         let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
         let seen_requests: Arc<Mutex<Vec<ModelRuntimeActivationRequest>>> =
@@ -15993,19 +16534,26 @@ mod tests {
             })
         }));
         api.admin_store
-            .save_model_capability_binding("semantic_router", "Qwen/Qwen3.5-4B")
+            .save_model_capability_binding("semantic_router", "qwen2.5-1.5b-instruct")
             .expect("save binding");
 
-        api.activate_selected_model_capability("semantic_router", "Qwen/Qwen3.5-4B")
+        api.activate_selected_model_capability("semantic_router", "qwen2.5-1.5b-instruct")
             .expect("activate selected model");
 
         let requests = seen_requests.lock().expect("request lock");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].model_kind, ModelKind::Llm);
-        assert_eq!(requests[0].model_id, "Qwen/Qwen3.5-4B");
+        assert_eq!(requests[0].model_id, "qwen2.5-1.5b-instruct");
         assert_eq!(
             requests[0].local_path.as_deref(),
             Some(model_dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            requests[0].runtime_profiles,
+            vec![
+                "harbor-candle".to_string(),
+                "harbor-model-api-candle".to_string()
+            ]
         );
         drop(requests);
 
@@ -16017,13 +16565,65 @@ mod tests {
             .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible")
             .expect("llm endpoint");
         assert_eq!(endpoint.status, ModelEndpointStatus::Active);
-        assert_eq!(endpoint.model_name, "Qwen/Qwen3.5-4B");
+        assert_eq!(endpoint.model_name, "qwen2.5-1.5b-instruct");
         assert_eq!(endpoint.metadata["runtime_auto_activation"], json!(true));
         assert_eq!(endpoint.metadata["activation_status"], json!("activated"));
         assert_eq!(
             endpoint.metadata["catalog_model_id"],
-            json!("Qwen/Qwen3.5-4B")
+            json!("qwen2.5-1.5b-instruct")
         );
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+        let _ = fs::remove_dir_all(model_store);
+    }
+
+    #[test]
+    fn external_openai_compatible_catalog_model_is_not_auto_started() {
+        let registry_path = unique_store_path("harborbeacon-model-external-registry");
+        let admin_path = unique_store_path("harborbeacon-model-external-state");
+        let conversation_path = unique_store_path("harborbeacon-model-external-conversations");
+        let model_store = unique_store_path("harborbeacon-model-external-store");
+        let model_dir = model_store.join("qwen-qwen3.5-4b");
+        fs::create_dir_all(&model_dir).expect("create model dir");
+        fs::write(model_dir.join("config.json"), "{}").expect("write model file");
+
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        admin_store
+            .save_model_store_root(&model_store.to_string_lossy())
+            .expect("save model store root");
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
+        let seen_requests: Arc<Mutex<Vec<ModelRuntimeActivationRequest>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let seen_for_handler = seen_requests.clone();
+        let api = AdminApi::new(
+            admin_store,
+            task_service,
+            PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
+            "http://harborbeacon.local:4174".to_string(),
+        )
+        .with_model_runtime_activation_handler(Arc::new(move |request| {
+            seen_for_handler
+                .lock()
+                .expect("request lock")
+                .push(request.clone());
+            Ok(ModelRuntimeActivationResult {
+                activated: true,
+                status: "activated".to_string(),
+                message: "runtime switched".to_string(),
+                runtime_model_id: Some(request.model_id.clone()),
+            })
+        }));
+
+        let error = api
+            .activate_selected_model_capability("semantic_router", "Qwen/Qwen3.5-4B")
+            .expect_err("external runtime model should not be auto-started");
+
+        assert!(error.contains("OpenAI-compatible runtime"));
+        assert!(seen_requests.lock().expect("request lock").is_empty());
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
