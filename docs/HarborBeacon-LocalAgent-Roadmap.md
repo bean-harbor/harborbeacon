@@ -36,7 +36,7 @@
 - `Home Agent Hub` 负责首个垂直域产品闭环
 - Home Agent Hub 已验证出的 artifact / event / long-running task / 补参机制，后续应反哺平台抽象
 - 模型能力按共享能力层治理，不再把 Candle、sidecar、Mistral 或 SiliconFlow 各自写成业务域；统一通过 Runtime Manager、Model Center endpoint 与 route policy 决策。
-- 默认产品体验调整为 Harbor-managed Candle-first：Candle 负责默认 LLM / embedding runtime，约 0.5B bootstrap LLM 随 ISO 提供基础自然语言入口；OpenAI-compatible endpoint 只作为高级外接配置，不自动复用用户 `127.0.0.1:11434`。
+- 默认产品体验调整为 Harbor-managed Candle-first：Candle 负责默认 LLM / embedding runtime，约 0.5B bootstrap LLM 随 `harboros-beacon.deb` 进入 ISO 并提供基础自然语言入口；OpenAI-compatible endpoint 只作为高级外接配置，不自动复用用户 `127.0.0.1:11434`。
 - 当前模型路线保持 local-first；云端 fallback 只进入 `semantic.router` 与 `retrieval.answer`，并要求 endpoint redaction、attempt audit 和 policy gate。
 - Hugging Face 模型下载走 mirror-aware download job：Harbor Assistant 输入 mirror 优先，其次 `HF_ENDPOINT`，最后默认 `https://hf-mirror.com`。
 
@@ -251,7 +251,7 @@ P0:
 2. Keep the v2.0 seam frozen: no v1.5/v2.0 runtime dual stack, no `/api/tasks` active fallback, no public `args.resume_token`.
 3. Promote RC2 toward a GA candidate from merged mainline code only.
 4. Land the Runtime Manager Candle-first cutover plan: default Candle runtime `enabled/idle`, no default user-Ollama/`11434` dependency, and healthz separates runtime alive from model loaded.
-5. Add the ISO bootstrap LLM lane: bundle a ~0.5B Qwen-class model for IM / WebUI natural-language parsing and setup guidance, lazy-load it, and avoid presenting it as the full answer/RAG model.
+5. Add the HarborBeacon deb / ISO bootstrap LLM lane: bundle a ~0.5B Qwen-class model for IM / WebUI natural-language parsing and setup guidance, lazy-load it, and avoid presenting it as the full answer/RAG model.
 
 P1:
 

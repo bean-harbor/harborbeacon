@@ -551,8 +551,8 @@ HARBOR_MEDIA_TOOLS_SHA256=<archive-sha256>
 
 ## 11. 可选 AI / 多模态依赖
 
-基础 ISO 不强制内置大模型、VLM 或 ASR 包，但默认应内置 Harbor-managed
-Candle runtime 和一个约 0.5B 的 bootstrap LLM，用于 IM / WebUI 自然语言入口、
+基础 ISO 不强制内置大模型、VLM 或 ASR 包，但默认应通过 HarborBeacon deb
+内置 Harbor-managed Candle runtime 和一个约 0.5B 的 bootstrap LLM，用于 IM / WebUI 自然语言入口、
 意图分类、参数抽取和配置引导。该模型不作为高质量长问答、RAG 最终答案、
 复杂推理或多模态模型来宣传。
 
@@ -571,6 +571,12 @@ scope: semantic_router / assistant_input_parser / setup guidance
 ```text
 <writable-root>/model-store/runtimes/harbor-candle/bootstrap-llm
 ```
+
+打包归属：
+
+- `harboros-beacon.deb` 直接内置 bootstrap LLM 到 `/mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/bootstrap-llm`，避免在 ISO rootfs 内同时保留 `/usr/share` 源副本和 model-store 目标副本。
+- `debian/postinst` 只负责创建 runtime/cache 目录和写入 Candle-first 默认 env，不额外复制模型文件。
+- scale-build / ISO 不单独下载模型，只消费新版 HarborBeacon deb。
 
 Harbor 不写入用户 Ollama 模型库，也不自动扫描、启动、停止或迁移用户的
 `127.0.0.1:11434`。
@@ -623,8 +629,7 @@ yolov8n.pt
 如果 ISO 离线交付，建议提前 vendor：
 
 - HarborGate Rust binary。
-- HarborBeacon Rust release binaries。
-- Harbor Candle runtime 与 bootstrap LLM model directory。
+- HarborBeacon Rust release binary、`harboros-beacon.deb` postinst、以及 deb 内置的 bootstrap LLM model directory。
 - HarborNAS WebUI production dist。
 - `yolov8n.pt`，如果启用 YOLO。
 - VLM model directory，如果启用内部 VLM backend。
