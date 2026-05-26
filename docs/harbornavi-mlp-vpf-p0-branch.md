@@ -119,6 +119,10 @@ The first RISC-V build report should record:
 - dependency failures, especially TLS, native C dependencies, linker, Candle,
   and `reqwest` issues.
 
+Initial builder precheck:
+
+- `docs/harbornavi-k3-riscv-precheck-2026-05-27.md`
+
 ## Next Implementation Step
 
 After this branch document lands, implement the first code slice in HarborBeacon:
