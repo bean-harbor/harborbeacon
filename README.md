@@ -60,6 +60,7 @@ Useful flags:
 - HarborBeacon-Contract-E2E-Test-Plan-v1.md
 - HarborBeacon-CI-Contract-Pipeline-Checklist-v1.md
 - HarborBeacon-GitHub-Actions-Workflow-Draft-v1.md
+- docs/harbornavi-mlp-vpf-p0-branch.md
 
 ## V2 Additions
 
@@ -71,6 +72,7 @@ Useful flags:
 - `HarborBeacon-Contract-E2E-Test-Plan-v1.md`: end-to-end validation plan across planner + execution contracts, including environment matrix, fallback checks, drift checks, and release exit criteria.
 - `HarborBeacon-CI-Contract-Pipeline-Checklist-v1.md`: CI job checklist that maps all contract governance to merge, nightly, and pre-release pipeline stages.
 - `HarborBeacon-GitHub-Actions-Workflow-Draft-v1.md`: initial GitHub Actions workflow draft mapping contract governance into concrete PR, nightly, and release workflows.
+- `docs/harbornavi-mlp-vpf-p0-branch.md`: HarborNavi K3 MLP/VPF branch purpose, boundaries, merge gates, and RISC-V build lane.
 
 ## HarborBeacon — IM 接入与用户交互层
 
