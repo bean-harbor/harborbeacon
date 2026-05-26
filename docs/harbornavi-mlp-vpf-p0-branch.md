@@ -7,6 +7,8 @@
 - Created on: 2026-05-27
 - Owning lane: `harbor-framework`
 - Architecture owner: `harbor-architect`
+- Current code guard commit:
+  `5ce91a3 Add HarborNavi MLP VPF privacy guards`
 
 This branch is the HarborBeacon implementation lane for HarborNavi model
 lifecycle and visual privacy policy work. It is not a fork of HarborNavi and
@@ -123,14 +125,43 @@ Initial builder precheck:
 
 - `docs/harbornavi-k3-riscv-precheck-2026-05-27.md`
 
+## Implemented P0 Guard Slice
+
+Commit `5ce91a3` implements the first HarborNavi MLP/VPF code slice:
+
+- `runtime::privacy` defines `RedactionManifest`, VLM redaction context
+  validation, fail-closed error reasons, and cloud payload scanning.
+- `run_vlm_summary_with_context` allows cloud VLM only with a valid VPF
+  manifest, `cloud_safe=true`, `metadata_stripped=true`, distinct
+  source/redacted artifact ids, and a payload scan pass.
+- The legacy `run_vlm_summary_with_state` path remains available but cannot
+  silently choose cloud VLM because it has no redaction context.
+- Cloud VLM reads the redacted artifact path from context and keeps local image
+  paths out of cloud diagnostics.
+- `semantic.router` / NSP and `retrieval.embed` are fixed local-only at
+  endpoint resolution time; cloud endpoints are not selectable for those
+  routes.
+- LLM cloud fallback remains available for approved text routes and records
+  redacted audit policy markers without exposing API keys.
+
+Validation completed:
+
+```text
+local: cargo test --lib privacy
+local: cargo test --lib model_center -- --test-threads=1
+.197: cargo test --lib privacy --quiet
+.197: cargo test --lib model_center -- --test-threads=1
+.197: CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc \
+        cargo build --target riscv64gc-unknown-linux-gnu --bin harbor-model-api
+```
+
 ## Next Implementation Step
 
-After this branch document lands, implement the first code slice in HarborBeacon:
+After the policy gate is reviewed, implement the real VPF engine behind the same
+guard:
 
-- MLP route policy profile for HarborNavi K3.
-- `RedactionManifest` type and validation helpers.
-- VLM cloud fail-closed guard that requires a valid VPF manifest.
-- Cloud payload scanner tests.
-
-Do not add the real `deface`/CenterFace ONNX runtime until the policy gate is
-green.
+- local face/head/license plate/OCR detector selection;
+- redacted artifact generation and manifest persistence;
+- integration from `camera.analyze` / snapshot artifacts into
+  `run_vlm_summary_with_context`;
+- fixture coverage for fail-closed redaction errors and cloud payload scans.

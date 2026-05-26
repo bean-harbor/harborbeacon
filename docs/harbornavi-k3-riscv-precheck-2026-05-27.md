@@ -6,10 +6,11 @@
 - Host access: SSH succeeded through the local target registry credentials.
 - Purpose: verify whether the existing HarborBeacon builder is ready to produce
   K3 RISC-V binaries for `harbornavi/mlp-vpf-p0`.
-- Result: blocked. Rust is installed, but the RISC-V Rust target and GNU linker
-  are not installed yet.
+- Result: passed after installing the RISC-V Rust target and GNU cross linker.
+  The first probe was blocked because those tools were missing; the follow-up
+  setup and smoke build completed on the same builder.
 
-## Observed Builder State
+## Initial Builder State
 
 ```text
 host=harbor-innovations-System-Product-Name
@@ -25,7 +26,7 @@ find it as a normal git checkout. A separate git checkout-like path exists under
 `~/src/HarborBeacon.github-20260424-060344`. The K3 build lane should use a
 fresh or intentionally selected checkout when the actual smoke build starts.
 
-## Required Before Build Smoke
+## Setup Applied
 
 ```bash
 rustup target add riscv64gc-unknown-linux-gnu
@@ -33,22 +34,67 @@ sudo apt-get update
 sudo apt-get install -y gcc-riscv64-linux-gnu g++-riscv64-linux-gnu libc6-dev-riscv64-cross
 ```
 
-Cargo target configuration:
-
-```toml
-[target.riscv64gc-unknown-linux-gnu]
-linker = "riscv64-linux-gnu-gcc"
-```
-
-## Blocked Smoke Command
-
-This command was not run because the target and linker were missing:
+Cargo target configuration for this smoke was provided through an environment
+variable, not committed repo config:
 
 ```bash
-cargo build --target riscv64gc-unknown-linux-gnu --bin harbor-model-api
+export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc
 ```
 
-## Next Step
+## Follow-Up Builder State
 
-Prepare `.197` with the RISC-V Rust target and GNU cross toolchain, then rerun
-the smoke from a known HarborBeacon checkout of `harbornavi/mlp-vpf-p0`.
+Fresh checkout path:
+
+```text
+/home/harbor-innovations/src/HarborBeacon-harbornavi-mlp-vpf-p0
+```
+
+Verified branch head:
+
+```text
+5ce91a3 Add HarborNavi MLP VPF privacy guards
+```
+
+Toolchain:
+
+```text
+rustc=rustc 1.95.0 (59807616e 2026-04-14)
+cargo=cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+installed_targets=riscv64gc-unknown-linux-gnu,x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
+riscv64-linux-gnu-gcc=riscv64-linux-gnu-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+```
+
+## Smoke Results
+
+Host policy tests:
+
+```bash
+cargo test --lib privacy --quiet
+cargo test --lib model_center -- --test-threads=1
+```
+
+Result:
+
+```text
+privacy: 5 passed
+model_center: 17 passed
+```
+
+RISC-V build command:
+
+```bash
+CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc \
+  cargo build --target riscv64gc-unknown-linux-gnu --bin harbor-model-api
+```
+
+Result:
+
+```text
+target/riscv64gc-unknown-linux-gnu/debug/harbor-model-api:
+ELF 64-bit LSB pie executable, UCB RISC-V, RVC, double-float ABI,
+dynamically linked, interpreter /lib/ld-linux-riscv64-lp64d.so.1,
+for GNU/Linux 4.15.0, with debug_info, not stripped
+```
+
+No TLS, native C dependency, Candle, `reqwest`, or linker blocker appeared in
+this smoke build.
