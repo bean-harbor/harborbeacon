@@ -13,24 +13,31 @@
 - Added `runtime::vision_event` with `LocalVisionEvent`, `SnapshotArtifact`, JSONL ingest, audit projection, HA/MQTT-ready payload projection, and sensitive text rejection.
 - Added `POST /api/vision/events` to the local admin API.
 - Added `harbornavi-k3-local-vision-smoke` for fixture, HTTP snapshot, and RTSP snapshot smoke tests.
+- Added repo-owned short-command YOLOv8 analyzer helper for K3 P0 CPU fallback:
+  - Default provider: `CPUExecutionProvider`.
+  - Explicit optional provider: `SpaceMITExecutionProvider`, still blocked by the TCM issue below.
+  - Output feeds `person_detected`, `pet_detected`, `vehicle_detected`, or `motion_like_scene` `LocalVisionEvent` generation.
 - Added `scripts/build_harbornavi_k3_deb.sh` to build a `riscv64` K3 Debian package containing:
   - `/usr/bin/harboros-beacon`
   - `/usr/bin/harbornavi-k3-local-vision-smoke`
+  - `/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py`
   - `harboros-beacon.service`
 
 ## Local And Builder Verification
 
 - Local Windows checks:
-  - `cargo test --lib vision_event`: 4 passed.
+  - `cargo test --lib vision_event`: 6 passed.
   - `cargo test --lib model_center -- --test-threads=1`: 13 passed.
+  - `python -m py_compile scripts\harbornavi_k3_yolov8_analyzer.py`: passed.
   - `cargo run --bin harbornavi-k3-local-vision-smoke -- --fixture --no-post --output-dir target\local-vision-smoke-precommit`: passed.
   - `cargo build --bin harboros-beacon --bin harbornavi-k3-local-vision-smoke`: passed.
 - `.197` builder:
   - Rust: `rustc 1.95.0`, `cargo 1.95.0`.
   - Target: `riscv64gc-unknown-linux-gnu`.
   - Linker: `riscv64-linux-gnu-gcc 13.3.0`.
-  - `cargo test --lib vision_event`: 4 passed.
+  - `cargo test --lib vision_event`: 6 passed.
   - `cargo test --lib model_center -- --test-threads=1`: 13 passed.
+  - `python3 -m py_compile scripts/harbornavi_k3_yolov8_analyzer.py`: passed.
   - Fixture smoke without posting: passed.
 
 ## Package
@@ -42,6 +49,14 @@
 - Size: `10560884` bytes
 - SHA256: `c466cf29392f5afd29b9e33fa9e4198e44a91648eb9bd940562b2f2d687f9154`
 - ELF: RISC-V 64-bit PIE, double-float ABI, dynamic linker `/lib/ld-linux-riscv64-lp64d.so.1`.
+- Productized YOLO CPU fallback package:
+  - Package: `harboros-beacon_harbornavi-p0-local-vision-yolo-r2-20260527+riscv64_riscv64.deb`
+  - Version: `0.1.0+harbornavi.p0.localvision.yolo.r2.20260527.riscv64`
+  - Architecture: `riscv64`
+  - Dependencies: `libc6, openssl, ca-certificates, python3, python3-opencv, python3-spacemit-ort`
+  - Size: `10621898` bytes
+  - SHA256: `e4b6bbc8b02fa772415b619f19276d63c9a840ba02a1923ac00be5e54222296c`
+  - Contents include `/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py`.
 
 ## K3 Preflight And Deploy
 
@@ -54,7 +69,9 @@
 - Dependencies present: `openssl`, `ca-certificates`, `ffmpeg`, `ffprobe`, `curl`, `systemctl`.
 - Install path: copied the package to `/tmp/harbornavi-p0/` and installed with `dpkg -i`.
 - Backup path: `/tmp/harbornavi-p0/backup-local-vision-v2-20260527-105426`.
-- Installed package: `harboros-beacon 0.1.0+harbornavi.p0.localvision.20260527.riscv64`.
+- Installed package: `harboros-beacon 0.1.0+harbornavi.p0.localvision.yolo.r2.20260527.riscv64`.
+- YOLO model path: `/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx`, sha256 `d4bf61db2a0925a0126052212479ff5044b621b12c6793420e085d36ae6b5438`.
+- YOLO label path: `/var/lib/harboros-beacon/models/label.txt`, sha256 `bd17f1ee35d5f3c862a4894605855abbb9dda4b0621fdb0ac4c2c8c7bb7e730a`.
 - Service: `harboros-beacon.service` active and enabled.
 - Health: `http://127.0.0.1:4174/healthz` returned HTTP `200`.
 
@@ -143,11 +160,40 @@
 - HarborBeacon event store lines after run: `149`.
 - Report size: `263 KiB`; snapshot evidence directory size: `3.8 MiB`.
 
+## 30 Minute Productized YOLO CPU Event Run
+
+- Command shape:
+  - `harbornavi-k3-local-vision-smoke --camera-id cam-rtsp-192-168-3-231 --rtsp-url <redacted> --duration-seconds 1800 --interval-seconds 10`
+- Analyzer: `/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py`.
+- Provider: `CPUExecutionProvider`.
+- Model: `/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx`.
+- Output directory: `/tmp/harbornavi-p0/local-vision-yolo-r2-30min`.
+- Total runs: `133`.
+- Passed: `133`.
+- Failed: `0`.
+- Average total latency: `3702 ms`.
+- P50 total latency: `3719 ms`.
+- P95 total latency: `3741 ms`.
+- Max total latency: `4046 ms`.
+- Under 2 seconds: `0 / 133`.
+- Under 5 seconds: `133 / 133`.
+- Average detector command latency: `1316 ms`.
+- P50 detector command latency: `1313 ms`.
+- P95 detector command latency: `1328 ms`.
+- Average ingest latency: `4 ms`.
+- P50 capture latency: `2400 ms`.
+- P95 capture latency: `2413 ms`.
+- Event types: `motion_like_scene=133`.
+- Detection count: `4` total detections across the run, all `refrigerator` labels from the current test scene.
+- HarborBeacon event store lines after run: `284`.
+- Report size: `311 KiB`; stderr size: `0`.
+
 ## Runtime And Safety Checks
 
 - `harboros-beacon.service`: active after the 30 minute run.
 - `/healthz`: HTTP `200` after the 30 minute run.
 - HarborBeacon RSS after the run: about `10500 KiB`.
+- HarborBeacon RSS after the productized YOLO run: about `10388 KiB`.
 - Instantaneous `vmstat` after the run: CPU idle recovered to about `100%`.
 - Thermal samples after the run: `59-62 C`.
 - `dmesg` scan for `oom|panic|segfault|tcm|killed process`: `0`.
@@ -162,6 +208,12 @@
   - `authorization: bearer`: `0`
   - `sk-`: `0`
   - camera password marker: `0`
+- Productized YOLO run scans:
+  - Smoke report secret scan: `rtsp://=0`, HA token patterns `0`, API key patterns `0`, upload URL signature patterns `0`.
+  - Event store secret scan: `rtsp://=0`, HA token patterns `0`, API key patterns `0`, upload URL signature patterns `0`.
+  - Event store local snapshot path scan: `0`; smoke report intentionally keeps local evidence snapshot paths for test traceability.
+  - `journalctl -u harboros-beacon.service` scan during the run printed no panic/OOM/secret lines.
+  - `dmesg` scan printed no OOM/panic/segfault/killed-process/TCM lines from this run.
 
 ## Conclusion
 
@@ -169,7 +221,8 @@
 - Pass: The single-camera path meets the P0 acceptable latency line of `<5s`.
 - Miss: It does not meet the target latency line of `<2s`; observed average is about `2.36s`.
 - Pass: Official YOLOv8n INT8 detection recipe exists and the model runs correctly with ONNX CPU provider on K3.
-- Pass: CPU detector latency is small relative to RTSP capture latency in the current P0 path.
+- Pass: The productized short-command YOLO CPU fallback also meets the P0 acceptable latency line of `<5s`, with `133/133` successful events and average total latency about `3.70s`.
+- Tradeoff: short-command analyzer isolation is stable but adds about `1.32s` wall-clock detector command latency per frame. A resident sidecar is the next latency lever if P1 needs margin before SpaceMIT EP is fixed.
 - Blocker: `SpaceMITExecutionProvider` is not usable on this K3 image yet because `spine_tcm` reports unavailable/fake TCM and the provider aborts on TCM buffer acquisition; reboot did not clear the condition.
 - Gap: `package` is not a COCO label. P0 can map `person`, `cat/dog`, and `vehicle` directly; package needs a proxy label or a later custom detector.
-- Next decision: keep K3 on the main route for the local event pipeline. For the next implementation slice, wire YOLOv8 CPU provider as the measured fallback detector, and in parallel ask SpacemiT/Bianbu for the K3 TCM/SpaceMIT EP fix so the accelerated path can be re-tested.
+- Next decision: keep K3 on the main route for the local event pipeline. The next implementation slice should either wire HA/MQTT consumption of the `LocalVisionEvent` payload, or convert the YOLO analyzer into a resident sidecar if lower latency is required before the SpaceMIT EP fix arrives.
