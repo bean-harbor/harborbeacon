@@ -2,8 +2,8 @@ Package: harboros-beacon
 Version: VERSION_PLACEHOLDER
 Section: utils
 Priority: optional
-Architecture: amd64
-Depends: libc6
+Architecture: ARCH_PLACEHOLDER
+Depends: libc6, openssl, ca-certificates
 Maintainer: Harborinno Ltd.
 Description: HarborNAS Beacon Service
   Background service for the HarborNAS Beacon feature.
