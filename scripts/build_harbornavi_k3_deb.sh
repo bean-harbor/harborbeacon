@@ -43,18 +43,23 @@ rm -rf "$build_root"
 mkdir -p "$pkg_dir/DEBIAN"
 mkdir -p "$pkg_dir/usr/bin"
 mkdir -p "$pkg_dir/etc/systemd/system"
+mkdir -p "$pkg_dir/usr/lib/harboros-beacon"
 mkdir -p "$pkg_dir/usr/share/doc/harboros-beacon"
 
 cp "target/${target}/release/harboros-beacon" "$pkg_dir/usr/bin/harboros-beacon"
 cp "target/${target}/release/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke"
 chmod 0755 "$pkg_dir/usr/bin/harboros-beacon" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke"
+cp scripts/harbornavi_k3_yolov8_analyzer.py "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
+chmod 0755 "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
 
 cp debian/harboros-beacon.service "$pkg_dir/etc/systemd/system/harboros-beacon.service"
 
 sed \
   -e "s/VERSION_PLACEHOLDER/${debian_version}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" \
-  debian/control > "$pkg_dir/DEBIAN/control"
+  debian/control \
+  | sed 's/^Depends: .*/Depends: libc6, openssl, ca-certificates, python3, python3-opencv, python3-spacemit-ort/' \
+  > "$pkg_dir/DEBIAN/control"
 printf 'X-HarborNavi-Version: %s\n' "$release_label" >> "$pkg_dir/DEBIAN/control"
 
 cp debian/postinst "$pkg_dir/DEBIAN/postinst"
@@ -67,6 +72,9 @@ release_label=${release_label}
 debian_version=${debian_version}
 rust_target=${target}
 deb_arch=${deb_arch}
+analyzer=/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py
+default_model=/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx
+default_labels=/var/lib/harboros-beacon/models/label.txt
 EOF
 
 mkdir -p "$out_dir"

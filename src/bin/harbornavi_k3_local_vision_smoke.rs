@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harborbeacon_local_agent::runtime::vision_event::{
-    analyze_snapshot_file, LocalSnapshotAnalysisInput, LocalVisionEvent,
+    analyze_snapshot_file, LocalSnapshotAnalysisInput, LocalVisionAnalyzerResult, LocalVisionEvent,
 };
 use reqwest::blocking::Client;
 use serde::Serialize;
@@ -23,6 +23,10 @@ struct Cli {
     no_post: bool,
     fixture: bool,
     ffmpeg: String,
+    analyzer_command: Option<String>,
+    model_path: String,
+    label_path: String,
+    provider: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,8 +48,12 @@ struct SmokeRun {
     event: Option<LocalVisionEvent>,
     ingest_http_status: Option<u16>,
     capture_ms: u64,
+    detector_ms: Option<u64>,
     analyze_ms: u64,
+    event_ingest_ms: Option<u64>,
     total_ms: u64,
+    provider: Option<String>,
+    detection_count: Option<usize>,
     error: Option<String>,
 }
 
@@ -55,9 +63,13 @@ struct SmokeSummary {
     passed: usize,
     failed: usize,
     average_total_ms: u64,
+    average_detector_ms: u64,
+    average_event_ingest_ms: u64,
     max_total_ms: u64,
     under_2s: usize,
     under_5s: usize,
+    detection_runs: usize,
+    detection_count: usize,
 }
 
 fn main() {
@@ -124,11 +136,45 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
             event: None,
             ingest_http_status: None,
             capture_ms,
+            detector_ms: None,
             analyze_ms: 0,
+            event_ingest_ms: None,
             total_ms: total_started.elapsed().as_millis() as u64,
+            provider: None,
+            detection_count: None,
             error: Some(error),
         };
     }
+
+    let analyzer_result = match run_analyzer(cli, &snapshot_path) {
+        Ok(result) => result,
+        Err(error) => {
+            return SmokeRun {
+                iteration,
+                ok: false,
+                snapshot_path: Some(snapshot_path.to_string_lossy().to_string()),
+                event: None,
+                ingest_http_status: None,
+                capture_ms,
+                detector_ms: None,
+                analyze_ms: 0,
+                event_ingest_ms: None,
+                total_ms: total_started.elapsed().as_millis() as u64,
+                provider: None,
+                detection_count: None,
+                error: Some(sanitize_sensitive(&error)),
+            };
+        }
+    };
+    let detector_ms = analyzer_result
+        .as_ref()
+        .and_then(|result| result.latency_ms);
+    let provider = analyzer_result
+        .as_ref()
+        .and_then(|result| result.provider.clone());
+    let detection_count = analyzer_result
+        .as_ref()
+        .map(|result| result.detections.len());
 
     let analyze_started = Instant::now();
     let analyzer = if runtime_probe["official_status"] == json!("missing") {
@@ -141,9 +187,11 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
         snapshot_path: snapshot_path.clone(),
         analyzer: Some(analyzer.to_string()),
         latency_ms: None,
+        analyzer_result,
         metrics: json!({
             "runtime_probe": runtime_probe,
             "capture_ms": capture_ms,
+            "detector_ms": detector_ms,
             "smoke_iteration": iteration,
         }),
     });
@@ -161,8 +209,12 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
                 event: None,
                 ingest_http_status: None,
                 capture_ms,
+                detector_ms,
                 analyze_ms,
+                event_ingest_ms: None,
                 total_ms: total_started.elapsed().as_millis() as u64,
+                provider,
+                detection_count,
                 error: Some(sanitize_sensitive(&error)),
             };
         }
@@ -172,8 +224,15 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
     let ingest_http_status = if cli.no_post {
         None
     } else {
+        let ingest_started = Instant::now();
         match post_event(&cli.beacon_url, &event) {
-            Ok(status) => Some(status),
+            Ok(status) => {
+                let event_ingest_ms = ingest_started.elapsed().as_millis() as u64;
+                event.metrics.as_object_mut().map(|map| {
+                    map.insert("event_ingest_ms".to_string(), json!(event_ingest_ms));
+                });
+                Some(status)
+            }
             Err(error) => {
                 return SmokeRun {
                     iteration,
@@ -182,13 +241,18 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
                     event: Some(event),
                     ingest_http_status: None,
                     capture_ms,
+                    detector_ms,
                     analyze_ms,
+                    event_ingest_ms: Some(ingest_started.elapsed().as_millis() as u64),
                     total_ms: total_started.elapsed().as_millis() as u64,
+                    provider,
+                    detection_count,
                     error: Some(sanitize_sensitive(&error)),
                 };
             }
         }
     };
+    let event_ingest_ms = event.metrics.get("event_ingest_ms").and_then(Value::as_u64);
     let ok = ingest_http_status
         .map(|status| status == 200)
         .unwrap_or(true);
@@ -199,8 +263,12 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
         event: Some(event),
         ingest_http_status,
         capture_ms,
+        detector_ms,
         analyze_ms,
+        event_ingest_ms,
         total_ms: total_started.elapsed().as_millis() as u64,
+        provider,
+        detection_count,
         error: if ok {
             None
         } else {
@@ -275,6 +343,61 @@ fn capture_snapshot(cli: &Cli, snapshot_path: &Path) -> Result<(), String> {
         return Err("ffmpeg created an empty snapshot".to_string());
     }
     Ok(())
+}
+
+fn run_analyzer(
+    cli: &Cli,
+    snapshot_path: &Path,
+) -> Result<Option<LocalVisionAnalyzerResult>, String> {
+    let Some(command) = cli.analyzer_command.as_deref() else {
+        return Ok(None);
+    };
+    if !Path::new(command).exists() {
+        return Err(format!("analyzer command not found: {command}"));
+    }
+    if !Path::new(&cli.model_path).exists() {
+        return Err(format!("analyzer model not found: {}", cli.model_path));
+    }
+    if !Path::new(&cli.label_path).exists() {
+        return Err(format!("analyzer label file not found: {}", cli.label_path));
+    }
+    let started = Instant::now();
+    let output = Command::new(command)
+        .arg("--image")
+        .arg(snapshot_path)
+        .arg("--model")
+        .arg(&cli.model_path)
+        .arg("--label")
+        .arg(&cli.label_path)
+        .arg("--provider")
+        .arg(&cli.provider)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("failed to launch analyzer: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!(
+            "analyzer failed status={:?}: {} {}",
+            output.status.code(),
+            sanitize_sensitive(stdout.trim()),
+            sanitize_sensitive(stderr.trim())
+        ));
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("failed to parse analyzer JSON: {error}; stdout={stdout}"))?;
+    if value.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Err(format!(
+            "analyzer returned ok=false: {}",
+            sanitize_sensitive(&stdout)
+        ));
+    }
+    let mut result: LocalVisionAnalyzerResult = serde_json::from_value(value)
+        .map_err(|error| format!("failed to decode analyzer result: {error}"))?;
+    if result.latency_ms.is_none() {
+        result.latency_ms = Some(started.elapsed().as_millis() as u64);
+    }
+    Ok(Some(result))
 }
 
 fn post_event(beacon_url: &str, event: &LocalVisionEvent) -> Result<u16, String> {
@@ -353,6 +476,18 @@ fn summarize_runs(runs: &[SmokeRun]) -> SmokeSummary {
     let passed = runs.iter().filter(|run| run.ok).count();
     let failed = total.saturating_sub(passed);
     let sum_total = runs.iter().map(|run| run.total_ms).sum::<u64>();
+    let detector_values = runs
+        .iter()
+        .filter_map(|run| run.detector_ms)
+        .collect::<Vec<_>>();
+    let event_ingest_values = runs
+        .iter()
+        .filter_map(|run| run.event_ingest_ms)
+        .collect::<Vec<_>>();
+    let detection_count = runs
+        .iter()
+        .filter_map(|run| run.detection_count)
+        .sum::<usize>();
     SmokeSummary {
         total,
         passed,
@@ -362,9 +497,21 @@ fn summarize_runs(runs: &[SmokeRun]) -> SmokeSummary {
         } else {
             sum_total / total as u64
         },
+        average_detector_ms: average_u64(&detector_values),
+        average_event_ingest_ms: average_u64(&event_ingest_values),
         max_total_ms: runs.iter().map(|run| run.total_ms).max().unwrap_or(0),
         under_2s: runs.iter().filter(|run| run.total_ms < 2000).count(),
         under_5s: runs.iter().filter(|run| run.total_ms < 5000).count(),
+        detection_runs: detector_values.len(),
+        detection_count,
+    }
+}
+
+fn average_u64(values: &[u64]) -> u64 {
+    if values.is_empty() {
+        0
+    } else {
+        values.iter().sum::<u64>() / values.len() as u64
     }
 }
 
@@ -390,6 +537,15 @@ fn epoch_millis() -> u128 {
         .unwrap_or_default()
 }
 
+fn default_analyzer_command() -> Option<String> {
+    let installed = "/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py";
+    if Path::new(installed).exists() {
+        Some(installed.to_string())
+    } else {
+        None
+    }
+}
+
 impl Cli {
     fn parse() -> Self {
         let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -404,6 +560,16 @@ impl Cli {
             no_post: false,
             fixture: false,
             ffmpeg: std::env::var("HARBOR_FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string()),
+            analyzer_command: std::env::var("HARBOR_K3_YOLO_ANALYZER")
+                .ok()
+                .or_else(default_analyzer_command),
+            model_path: std::env::var("HARBOR_K3_YOLO_MODEL").unwrap_or_else(|_| {
+                "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx".to_string()
+            }),
+            label_path: std::env::var("HARBOR_K3_YOLO_LABELS")
+                .unwrap_or_else(|_| "/var/lib/harboros-beacon/models/label.txt".to_string()),
+            provider: std::env::var("HARBOR_K3_YOLO_PROVIDER")
+                .unwrap_or_else(|_| "cpu".to_string()),
         };
         let mut index = 0usize;
         while index < args.len() {
@@ -426,6 +592,18 @@ impl Cli {
                         parse_u64(&take_value(&args, &mut index, "--interval-seconds"))
                 }
                 "--ffmpeg" => cli.ffmpeg = take_value(&args, &mut index, "--ffmpeg"),
+                "--analyzer-command" => {
+                    cli.analyzer_command = Some(take_value(&args, &mut index, "--analyzer-command"))
+                }
+                "--model-path" => cli.model_path = take_value(&args, &mut index, "--model-path"),
+                "--label-path" => cli.label_path = take_value(&args, &mut index, "--label-path"),
+                "--provider" => {
+                    cli.provider = take_value(&args, &mut index, "--provider");
+                    if cli.provider != "cpu" && cli.provider != "spacemit" {
+                        fail("--provider must be cpu or spacemit");
+                    }
+                }
+                "--disable-analyzer" => cli.analyzer_command = None,
                 "--no-post" => cli.no_post = true,
                 "--fixture" => cli.fixture = true,
                 "--help" | "-h" => {
@@ -435,6 +613,9 @@ impl Cli {
                 other => fail(&format!("unknown argument {other}")),
             }
             index += 1;
+        }
+        if cli.provider != "cpu" && cli.provider != "spacemit" {
+            fail("--provider must be cpu or spacemit");
         }
         cli
     }
@@ -456,7 +637,7 @@ fn parse_u64(value: &str) -> u64 {
 
 fn print_usage() {
     println!(
-        "Usage: harbornavi-k3-local-vision-smoke [--camera-id ID] [--rtsp-url URL | --snapshot-url URL | --fixture] [--duration-seconds N] [--interval-seconds N] [--beacon-url URL] [--output-dir PATH] [--no-post]"
+        "Usage: harbornavi-k3-local-vision-smoke [--camera-id ID] [--rtsp-url URL | --snapshot-url URL | --fixture] [--duration-seconds N] [--interval-seconds N] [--beacon-url URL] [--output-dir PATH] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--disable-analyzer] [--no-post]"
     );
 }
 
