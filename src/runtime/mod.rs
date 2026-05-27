@@ -13,6 +13,7 @@ pub mod media;
 pub mod media_tools;
 pub mod model_center;
 pub mod node_runtime;
+pub mod privacy;
 pub mod registry;
 pub mod remote_view;
 pub mod task_api;

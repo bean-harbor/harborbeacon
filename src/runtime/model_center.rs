@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::connectors::ai_provider::{
     EmbeddingRequest, OpenAiCompatibleConfig, OpenAiCompatibleEmbeddingClient,
@@ -22,6 +22,9 @@ use crate::control_plane::models::{
 };
 use crate::runtime::admin_console::{
     default_model_endpoints, sanitize_model_center_state, AdminConsoleState, AdminModelCenterState,
+};
+use crate::runtime::privacy::{
+    scan_cloud_payload_text, validate_cloud_vlm_redaction, ImageRedactionContext,
 };
 
 pub const ADMIN_STATE_PATH_ENV: &str = "HARBOR_ADMIN_STATE_PATH";
@@ -79,6 +82,11 @@ pub struct VlmSummaryExecution {
     pub text: String,
     #[serde(default)]
     pub details: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VlmSummaryContext {
+    pub redaction: Option<ImageRedactionContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -326,7 +334,16 @@ pub fn run_vlm_summary_with_state(
     image_path: &Path,
     state: &AdminModelCenterState,
 ) -> VlmSummaryExecution {
-    let Some(endpoint) = resolve_endpoint(state, ModelKind::Vlm, VLM_POLICY_ID) else {
+    run_vlm_summary_with_context(image_path, state, &VlmSummaryContext::default())
+}
+
+pub fn run_vlm_summary_with_context(
+    image_path: &Path,
+    state: &AdminModelCenterState,
+    context: &VlmSummaryContext,
+) -> VlmSummaryExecution {
+    let candidates = resolve_endpoint_candidates(state, ModelKind::Vlm, VLM_POLICY_ID);
+    if candidates.is_empty() {
         return VlmSummaryExecution {
             available: false,
             status: "disabled".to_string(),
@@ -338,6 +355,58 @@ pub fn run_vlm_summary_with_state(
         };
     };
 
+    let mut last_privacy_error = None;
+    for endpoint in candidates {
+        if endpoint.endpoint_kind == ModelEndpointKind::Cloud {
+            let redaction = match validate_cloud_vlm_redaction(context.redaction.as_ref()) {
+                Ok(redaction) => redaction,
+                Err(error) => {
+                    last_privacy_error = Some(error);
+                    continue;
+                }
+            };
+            return run_vlm_summary_on_endpoint(
+                &redaction.redacted_image_path,
+                &endpoint,
+                json!({
+                    "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                    "redaction_profile": redaction.manifest.profile.clone(),
+                    "redacted_artifact_id": redaction.manifest.redacted_artifact_id.clone(),
+                    "cloud_safe": redaction.manifest.cloud_safe,
+                    "metadata_stripped": redaction.manifest.metadata_stripped,
+                }),
+            );
+        }
+
+        return run_vlm_summary_on_endpoint(
+            image_path,
+            &endpoint,
+            json!({
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+            }),
+        );
+    }
+
+    let error = last_privacy_error.expect("privacy error when cloud candidates were skipped");
+    VlmSummaryExecution {
+        available: false,
+        status: "blocked".to_string(),
+        summary: format!("Cloud VLM blocked by privacy guard: {error}"),
+        provider_key: String::new(),
+        model_endpoint_id: None,
+        text: String::new(),
+        details: json!({
+            "privacy_guard": error.to_json(),
+            "route_policy_id": VLM_POLICY_ID,
+        }),
+    }
+}
+
+fn run_vlm_summary_on_endpoint(
+    image_path: &Path,
+    endpoint: &ModelEndpoint,
+    base_details: Value,
+) -> VlmSummaryExecution {
     if let Some(mock_text) = metadata_string(&endpoint.metadata, "mock_text") {
         return VlmSummaryExecution {
             available: !mock_text.trim().is_empty(),
@@ -346,9 +415,7 @@ pub fn run_vlm_summary_with_state(
             provider_key: endpoint.provider_key.clone(),
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
             text: mock_text,
-            details: json!({
-                "endpoint_kind": endpoint.endpoint_kind.as_str(),
-            }),
+            details: base_details,
         };
     }
 
@@ -366,9 +433,7 @@ pub fn run_vlm_summary_with_state(
             provider_key: endpoint.provider_key.clone(),
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
             text: String::new(),
-            details: json!({
-                "endpoint_kind": endpoint.endpoint_kind.as_str(),
-            }),
+            details: base_details,
         };
     }
 
@@ -380,9 +445,7 @@ pub fn run_vlm_summary_with_state(
             provider_key: endpoint.provider_key.clone(),
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
             text: String::new(),
-            details: json!({
-                "endpoint_kind": endpoint.endpoint_kind.as_str(),
-            }),
+            details: base_details,
         };
     };
 
@@ -396,9 +459,7 @@ pub fn run_vlm_summary_with_state(
                 provider_key: endpoint.provider_key.clone(),
                 model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
                 text: String::new(),
-                details: json!({
-                    "image_path": image_path.to_string_lossy(),
-                }),
+                details: vlm_diagnostic_details(endpoint, image_path, base_details.clone()),
             };
         }
     };
@@ -409,6 +470,27 @@ pub fn run_vlm_summary_with_state(
                 .to_string(),
         )
     });
+    if endpoint.endpoint_kind == ModelEndpointKind::Cloud {
+        if let Some(prompt) = prompt.as_deref() {
+            if let Err(error) = scan_cloud_payload_text(prompt) {
+                return VlmSummaryExecution {
+                    available: false,
+                    status: "blocked".to_string(),
+                    summary: format!("Cloud VLM prompt blocked by privacy guard: {error}"),
+                    provider_key: endpoint.provider_key.clone(),
+                    model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+                    text: String::new(),
+                    details: merge_details(
+                        base_details.clone(),
+                        json!({
+                            "privacy_guard": error.to_json(),
+                            "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                        }),
+                    ),
+                };
+            }
+        }
+    }
 
     let client = match OpenAiCompatibleVisionClient::new(config) {
         Ok(client) => client,
@@ -420,9 +502,7 @@ pub fn run_vlm_summary_with_state(
                 provider_key: endpoint.provider_key.clone(),
                 model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
                 text: String::new(),
-                details: json!({
-                    "image_path": image_path.to_string_lossy(),
-                }),
+                details: vlm_diagnostic_details(endpoint, image_path, base_details.clone()),
             };
         }
     };
@@ -440,9 +520,13 @@ pub fn run_vlm_summary_with_state(
             provider_key: endpoint.provider_key.clone(),
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
             text: response.summary,
-            details: json!({
-                "raw_response": response.raw_response,
-            }),
+            details: merge_details(
+                base_details.clone(),
+                json!({
+                    "raw_response": response.raw_response,
+                    "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                }),
+            ),
         },
         Err(error) => VlmSummaryExecution {
             available: false,
@@ -451,11 +535,43 @@ pub fn run_vlm_summary_with_state(
             provider_key: endpoint.provider_key.clone(),
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
             text: String::new(),
-            details: json!({
-                "image_path": image_path.to_string_lossy(),
-            }),
+            details: vlm_diagnostic_details(endpoint, image_path, base_details),
         },
     }
+}
+
+fn vlm_diagnostic_details(
+    endpoint: &ModelEndpoint,
+    image_path: &Path,
+    base_details: Value,
+) -> Value {
+    if endpoint.endpoint_kind == ModelEndpointKind::Cloud {
+        return merge_details(
+            base_details,
+            json!({
+                "cloud_payload_image_source": "redacted_artifact",
+            }),
+        );
+    }
+    merge_details(
+        base_details,
+        json!({
+            "image_path": image_path.to_string_lossy(),
+        }),
+    )
+}
+
+fn merge_details(base_details: Value, extra_details: Value) -> Value {
+    let mut merged = match base_details {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+    if let Value::Object(extra) = extra_details {
+        for (key, value) in extra {
+            merged.insert(key, value);
+        }
+    }
+    Value::Object(merged)
 }
 
 pub fn run_llm_text(prompt: &str) -> LlmTextExecution {
@@ -598,6 +714,10 @@ fn merge_llm_execution_details(
             "selected_endpoint_kind".to_string(),
             json!(selected_endpoint_kind),
         );
+    }
+    if selected_endpoint_kind.eq_ignore_ascii_case("cloud") {
+        details.insert("privacy_transform".to_string(), json!("redacted_text"));
+        details.insert("audit_prompt_storage".to_string(), json!("redacted"));
     }
     result.details = Value::Object(details);
 }
@@ -925,9 +1045,12 @@ fn resolve_endpoint_candidates(
                 "cloud".to_string(),
             ]
         });
-    let cloud_allowed = policy
-        .map(|policy| policy.privacy_level != PrivacyLevel::StrictLocal)
-        .unwrap_or(true);
+    let route_is_local_only =
+        matches!(route_policy_id, EMBED_POLICY_ID | SEMANTIC_ROUTER_POLICY_ID);
+    let cloud_allowed = !route_is_local_only
+        && policy
+            .map(|policy| policy.privacy_level != PrivacyLevel::StrictLocal)
+            .unwrap_or(true);
 
     let mut candidates = state
         .endpoints
@@ -1627,23 +1750,26 @@ fn secret_present(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
     use std::sync::Mutex;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tiny_http::{Header, Method, Response, Server};
 
     use super::{
         clear_local_runtime_projection_cache, connectivity_url, redact_model_endpoint,
         run_embedding_with_state, run_llm_text_with_state, run_llm_text_with_state_and_options,
-        run_vlm_summary_with_state, test_model_endpoint, LlmTextOptions,
+        run_vlm_summary_with_context, run_vlm_summary_with_state, test_model_endpoint,
+        LlmTextOptions, VlmSummaryContext,
     };
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
         PrivacyLevel,
     };
     use crate::runtime::admin_console::AdminModelCenterState;
+    use crate::runtime::privacy::{ImageRedactionContext, RedactionManifest};
 
     static MODEL_RUNTIME_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1752,6 +1878,112 @@ mod tests {
     }
 
     #[test]
+    fn cloud_vlm_requires_vpf_manifest() {
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "vlm-cloud".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Vlm,
+                endpoint_kind: ModelEndpointKind::Cloud,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "vision-cloud".to_string(),
+                capability_tags: vec!["vlm".to_string(), "cloud_fallback".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "mock_text": "redacted cloud caption",
+                }),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "retrieval.vision_summary".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "multimodal".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+            ..AdminModelCenterState::default()
+        };
+
+        let result = run_vlm_summary_with_state(Path::new("source.jpg"), &state);
+
+        assert!(!result.available);
+        assert_eq!(result.status, "blocked");
+        assert_eq!(
+            result.details["privacy_guard"]["code"],
+            json!("vpf_manifest_required")
+        );
+    }
+
+    #[test]
+    fn cloud_vlm_uses_redacted_artifact_when_manifest_is_valid() {
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "vlm-cloud".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Vlm,
+                endpoint_kind: ModelEndpointKind::Cloud,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "vision-cloud".to_string(),
+                capability_tags: vec!["vlm".to_string(), "cloud_fallback".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "mock_text": "redacted cloud caption",
+                }),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "retrieval.vision_summary".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "multimodal".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+            ..AdminModelCenterState::default()
+        };
+        let context = VlmSummaryContext {
+            redaction: Some(ImageRedactionContext {
+                source_image_path: Path::new("source.jpg").to_path_buf(),
+                redacted_image_path: Path::new("redacted.jpg").to_path_buf(),
+                target_capability: "vlm.cloud".to_string(),
+                manifest: RedactionManifest {
+                    source_artifact_id: "artifact-source".to_string(),
+                    redacted_artifact_id: "artifact-redacted".to_string(),
+                    engine: "deface-centerface".to_string(),
+                    profile: "cloud_vlm_default".to_string(),
+                    created_at: "2026-05-27T00:00:00Z".to_string(),
+                    image_sha256: "abc123".to_string(),
+                    detections: Vec::new(),
+                    bbox_expansion: 1.5,
+                    metadata_stripped: true,
+                    cloud_safe: true,
+                },
+            }),
+        };
+
+        let result = run_vlm_summary_with_context(Path::new("source.jpg"), &state, &context);
+
+        assert!(result.available);
+        assert_eq!(result.text, "redacted cloud caption");
+        assert_eq!(
+            result.details["redacted_artifact_id"],
+            json!("artifact-redacted")
+        );
+        assert_eq!(result.details["cloud_safe"], json!(true));
+    }
+
+    #[test]
     fn run_embedding_supports_mock_dimensions_and_overrides() {
         let state = AdminModelCenterState {
             endpoints: vec![ModelEndpoint {
@@ -1794,6 +2026,46 @@ mod tests {
         let generated = run_embedding_with_state("整理计划", &state);
         assert!(generated.available);
         assert_eq!(generated.vector.len(), 4);
+    }
+
+    #[test]
+    fn embedding_route_does_not_select_cloud_endpoint() {
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "embed-cloud".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Embedder,
+                endpoint_kind: ModelEndpointKind::Cloud,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "cloud-embed".to_string(),
+                capability_tags: vec!["embeddings".to_string(), "cloud_fallback".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "mock_embedding_dimensions": 4,
+                }),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "retrieval.embed".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+            ..AdminModelCenterState::default()
+        };
+
+        let result = run_embedding_with_state("增量入库", &state);
+
+        assert!(!result.available);
+        assert_eq!(result.status, "disabled");
+        assert_eq!(result.model_endpoint_id, None);
     }
 
     #[test]
@@ -2088,7 +2360,7 @@ mod tests {
     }
 
     #[test]
-    fn run_llm_text_with_state_falls_back_from_local_to_cloud_for_router() {
+    fn semantic_router_does_not_fall_back_to_cloud_for_nsp() {
         let state = AdminModelCenterState {
             endpoints: vec![
                 ModelEndpoint {
@@ -2155,18 +2427,61 @@ mod tests {
             },
         );
 
-        assert!(result.available);
-        assert_eq!(result.text, "rag_answer");
+        assert!(!result.available);
+        assert_eq!(result.status, "degraded");
         assert_eq!(
             result.model_endpoint_id.as_deref(),
-            Some("llm-cloud-siliconflow")
+            Some("llm-local-openai-compatible")
         );
         assert_eq!(result.details["route_policy_id"], json!("semantic.router"));
-        assert_eq!(result.details["fallback_used"], json!(true));
         assert_eq!(
             result.details["attempted_endpoints"],
-            json!(["llm-local-openai-compatible", "llm-cloud-siliconflow"])
+            json!(["llm-local-openai-compatible"])
         );
+    }
+
+    #[test]
+    fn llm_cloud_fallback_records_redacted_audit_policy() {
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "llm-cloud-siliconflow".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Llm,
+                endpoint_kind: ModelEndpointKind::Cloud,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
+                capability_tags: vec!["chat".to_string(), "cloud_fallback".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "base_url": "https://api.siliconflow.cn/v1",
+                    "api_key": "configured",
+                    "mock_text": "cloud_answer",
+                }),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "retrieval.answer".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+            ..AdminModelCenterState::default()
+        };
+
+        let result = run_llm_text_with_state("summarize safely", &state);
+
+        assert!(result.available);
+        assert_eq!(result.details["selected_endpoint_kind"], json!("cloud"));
+        assert_eq!(result.details["privacy_transform"], json!("redacted_text"));
+        assert_eq!(result.details["audit_prompt_storage"], json!("redacted"));
+        assert_eq!(result.details["api_key"], Value::Null);
     }
 
     #[test]
