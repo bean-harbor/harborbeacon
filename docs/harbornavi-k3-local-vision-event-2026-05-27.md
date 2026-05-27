@@ -64,8 +64,50 @@
 - Runtime command found: `/usr/bin/onnxruntime_perf_test`.
 - `onnx_test_runner` help lists `spacemit` as an execution provider.
 - Headers include `spine_vision_engine.h`.
-- No bundled detection model was found under the probed system paths.
-- Conclusion: official runtime candidate exists, but an official person/pet/package detection model recipe is still missing. Current P0 smoke therefore records `present_unverified` and uses CPU snapshot fallback for the event loop.
+- Official Bianbu AI Demo Zoo recipe was found after the initial local probe:
+  - Repository: `https://gitee.com/bianbu/spacemit-demo.git`
+  - Candidate: `examples/CV/yolov8`
+  - Model: `yolov8n_192x320.q.onnx`
+  - Runtime API: `providers=["SpaceMITExecutionProvider"]`
+  - Postprocess: YOLOv8 DFL, confidence filter, per-class NMS, COCO labels.
+- No bundled detection model was installed locally by default; the recipe downloads model/data from `archive.spacemit.com`.
+- Conclusion: the official detection recipe exists, but K3 acceleration still needs a TCM runtime fix before the SpaceMIT EP path can be counted as the accelerated baseline.
+
+## Official YOLOv8 Recipe Probe
+
+- Workspace: `/home/harbor/harbornavi-p0/official-yolov8`.
+- Dependency added on K3: `python3-opencv`.
+- Python runtime:
+  - `onnxruntime 1.24.2+spacemit.a1`
+  - `python3-spacemit-ort 2.0.2+rc5`
+  - `cv2 4.10.0`
+  - Available providers: `SpaceMITExecutionProvider`, `CPUExecutionProvider`
+- Downloaded official assets:
+  - `yolov8n_192x320.q.onnx`, size about `1.9 MiB`, sha256 `d4bf61db2a0925a0126052212479ff5044b621b12c6793420e085d36ae6b5438`
+  - `yolov8n_320x320.q.onnx`, size about `1.9 MiB`, sha256 `fcfd8d16a5e6a4b03c438d5b634c1c1f7d2449ab60eb3d328759aae4ae715b8e`
+  - COCO `label.txt`, sha256 `bd17f1ee35d5f3c862a4894605855abbb9dda4b0621fdb0ac4c2c8c7bb7e730a`
+- SpaceMIT EP result:
+  - Official Python demo and a minimal single-thread ONNX session both abort.
+  - Error: `mmap tcm block: Invalid argument` and `tcm buffer acquire failed for core id 0/1`.
+  - `spine_tcm` query reports version `0.2.0`, `available=0`, `blk_size=393216`, `blk_num=8`, `is_fake_tcm=1`, and block physical addresses as `0`.
+  - Clearing `/dev/shm/tcm_sync_standalone` did not resolve the issue.
+- CPU provider result:
+  - Minimal zero-input run succeeded.
+  - Model load: about `225-239 ms`.
+  - Single inference on zero input: about `86 ms`, RSS about `59 MiB`.
+- Detection quality smoke on CPU:
+  - Official test image detected three `person` objects, total `45.59 ms`.
+  - Real K3 camera snapshot detected one `refrigerator`, total `42.62 ms`.
+- Offline CPU detector pass over the 147 snapshots captured in the 30 minute run:
+  - Snapshot count: `147`.
+  - Failures: `0`.
+  - Average detector latency: `41.55 ms`.
+  - P50: `41.52 ms`.
+  - P95: `41.68 ms`.
+  - Max: `44.50 ms`.
+  - RSS: about `185 MiB`.
+  - Top detections: `refrigerator` in 143 images, `person` in 2 images, `bottle` in 1 image.
+  - Evidence: `/tmp/harbornavi-p0/yolov8-cpu-147-snapshot-summary.json`.
 
 ## Camera Input
 
@@ -123,5 +165,8 @@
 - Pass: K3 can run the deployed HarborBeacon service, ingest local vision events, pull a real RTSP camera snapshot directly, and sustain a 30 minute single-camera local event loop without crashes, OOM, TCM errors, or secret leakage in the report.
 - Pass: The single-camera path meets the P0 acceptable latency line of `<5s`.
 - Miss: It does not meet the target latency line of `<2s`; observed average is about `2.36s`.
-- Gap: This is not yet a real semantic detector for `person / pet / vehicle / package`. The current analyzer is a CPU snapshot fallback that emits `motion_like_scene`.
-- Next decision: keep K3 on the main route for the local event pipeline, but the next P0 slice must replace the fallback analyzer with an official SpacemiT/Bianbu ONNX detection recipe or a measured CPU detector baseline, then rerun the same 30 minute gate.
+- Pass: Official YOLOv8n INT8 detection recipe exists and the model runs correctly with ONNX CPU provider on K3.
+- Pass: CPU detector latency is small relative to RTSP capture latency in the current P0 path.
+- Blocker: `SpaceMITExecutionProvider` is not usable on this K3 image yet because `spine_tcm` reports unavailable/fake TCM and the provider aborts on TCM buffer acquisition.
+- Gap: `package` is not a COCO label. P0 can map `person`, `cat/dog`, and `vehicle` directly; package needs a proxy label or a later custom detector.
+- Next decision: keep K3 on the main route for the local event pipeline. For the next implementation slice, wire YOLOv8 CPU provider as the measured fallback detector, and in parallel ask SpacemiT/Bianbu for the K3 TCM/SpaceMIT EP fix so the accelerated path can be re-tested.
