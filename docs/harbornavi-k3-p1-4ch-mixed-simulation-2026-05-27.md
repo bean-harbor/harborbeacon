@@ -48,3 +48,12 @@ Local verification completed:
 - Fixture multi-camera smoke with two in-process fixture cameras: passed.
 
 K3 deployment and live four-channel evidence are recorded in the HarborNavi P1 report.
+
+## Live K3 Result
+
+- Package sha256: `78f942572784f2cd96190b138414a51639f9c9ce23307b35d2b49e5fa43d3ca1`.
+- Single-camera baseline: `45/45`, p95 `3746ms`.
+- Four-channel mixed run: `504/504`, aggregate p95 `4976ms`, classification `pass`.
+- HarborCloud pings during the run: `4/4` `succeeded/pong`.
+- Metadata-only event published and read back: `lve_ed400a473e9046dfae59dd6389c67223`.
+- Secret scan: no RTSP URL, camera credential, HA token, API key, private key, upload URL, or local snapshot path matches in reports/events/journals.
