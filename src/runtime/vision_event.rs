@@ -72,6 +72,14 @@ pub struct LocalVisionAnalyzerResult {
     #[serde(default)]
     pub latency_ms: Option<u64>,
     #[serde(default)]
+    pub command_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub preprocess_ms: Option<u64>,
+    #[serde(default)]
+    pub inference_ms: Option<u64>,
+    #[serde(default)]
+    pub postprocess_ms: Option<u64>,
+    #[serde(default)]
     pub model_sha256: Option<String>,
 }
 
@@ -165,6 +173,22 @@ pub fn analyze_snapshot_file(
             map.insert("detected_labels".to_string(), json!(result.labels));
             map.insert("detector_provider".to_string(), json!(result.provider));
             map.insert("detector_latency_ms".to_string(), json!(result.latency_ms));
+            map.insert(
+                "detector_command_latency_ms".to_string(),
+                json!(result.command_latency_ms),
+            );
+            map.insert(
+                "detector_preprocess_ms".to_string(),
+                json!(result.preprocess_ms),
+            );
+            map.insert(
+                "detector_inference_ms".to_string(),
+                json!(result.inference_ms),
+            );
+            map.insert(
+                "detector_postprocess_ms".to_string(),
+                json!(result.postprocess_ms),
+            );
             map.insert("model_sha256".to_string(), json!(result.model_sha256));
         }
     }
@@ -565,6 +589,10 @@ mod tests {
                 analyzer: Some("spacemit-yolov8n-192x320-short-command".to_string()),
                 provider: Some("CPUExecutionProvider".to_string()),
                 latency_ms: Some(41),
+                command_latency_ms: Some(120),
+                preprocess_ms: Some(1),
+                inference_ms: Some(2),
+                postprocess_ms: Some(3),
                 model_sha256: Some("abc".to_string()),
             }),
             metrics: json!({}),
@@ -579,6 +607,7 @@ mod tests {
             event.metrics["detector_provider"],
             json!("CPUExecutionProvider")
         );
+        assert_eq!(event.metrics["detector_command_latency_ms"], json!(120));
         let _ = fs::remove_dir_all(dir);
     }
 

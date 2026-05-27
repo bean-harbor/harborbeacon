@@ -168,7 +168,7 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
     };
     let detector_ms = analyzer_result
         .as_ref()
-        .and_then(|result| result.latency_ms);
+        .and_then(|result| result.command_latency_ms.or(result.latency_ms));
     let provider = analyzer_result
         .as_ref()
         .and_then(|result| result.provider.clone());
@@ -394,8 +394,9 @@ fn run_analyzer(
     }
     let mut result: LocalVisionAnalyzerResult = serde_json::from_value(value)
         .map_err(|error| format!("failed to decode analyzer result: {error}"))?;
+    result.command_latency_ms = Some(started.elapsed().as_millis() as u64);
     if result.latency_ms.is_none() {
-        result.latency_ms = Some(started.elapsed().as_millis() as u64);
+        result.latency_ms = result.command_latency_ms;
     }
     Ok(Some(result))
 }
