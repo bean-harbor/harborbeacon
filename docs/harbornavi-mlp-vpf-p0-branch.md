@@ -9,6 +9,8 @@
 - Architecture owner: `harbor-architect`
 - Current code guard commit:
   `5ce91a3 Add HarborNavi MLP VPF privacy guards`
+- Current K3 package/deployment commit:
+  `b7fcfd5 Add HarborNavi K3 riscv64 package path`
 
 This branch is the HarborBeacon implementation lane for HarborNavi model
 lifecycle and visual privacy policy work. It is not a fork of HarborNavi and
@@ -26,9 +28,10 @@ Implement the HarborNavi P0 rules for:
 - Local-only execution for NSP, Embedding, HA service execution, camera control,
   HarborOS commands, and device control.
 
-The first code increment should implement policy, manifest, audit, and
-fail-closed guards. It should not attempt the full ONNX image-redaction engine
-or K3 deployment in the same step.
+The first code increment implements policy, manifest, audit, and fail-closed
+guards. The follow-up K3 package increment proves those guards can run as the
+real `harboros-beacon.service` on K3. The full ONNX image-redaction engine is
+still a separate follow-up.
 
 ## Boundary Rules
 
@@ -125,6 +128,10 @@ Initial builder precheck:
 
 - `docs/harbornavi-k3-riscv-precheck-2026-05-27.md`
 
+First K3 service deployment:
+
+- `docs/harbornavi-k3-deployment-2026-05-27.md`
+
 ## Implemented P0 Guard Slice
 
 Commit `5ce91a3` implements the first HarborNavi MLP/VPF code slice:
@@ -149,10 +156,18 @@ Validation completed:
 ```text
 local: cargo test --lib privacy
 local: cargo test --lib model_center -- --test-threads=1
+local: cargo run --bin harbornavi-k3-guard-smoke
 .197: cargo test --lib privacy --quiet
 .197: cargo test --lib model_center -- --test-threads=1
 .197: CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc \
         cargo build --target riscv64gc-unknown-linux-gnu --bin harbor-model-api
+.197: scripts/build_harbornavi_k3_deb.sh produced
+      harboros-beacon_harbornavi-p0-20260527+riscv64_riscv64.deb
+K3: dpkg -i installed the riscv64 package
+K3: harboros-beacon.service active on 127.0.0.1:4174
+K3: /healthz returned HTTP 200
+K3: /usr/bin/harbornavi-k3-guard-smoke ok=true
+K3: journal/dmesg runtime and secret scans returned 0 matches
 ```
 
 ## Next Implementation Step

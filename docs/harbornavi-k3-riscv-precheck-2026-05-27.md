@@ -98,3 +98,19 @@ for GNU/Linux 4.15.0, with debug_info, not stripped
 
 No TLS, native C dependency, Candle, `reqwest`, or linker blocker appeared in
 this smoke build.
+
+## Follow-Up Package Deployment
+
+The same builder lane later produced a real K3 Debian package from commit
+`b7fcfd5`:
+
+```text
+harboros-beacon_harbornavi-p0-20260527+riscv64_riscv64.deb
+sha256=125915fb243b9e0b555f457b5712441c5f746c60d8ec76c55426b69a9af7ef83
+architecture=riscv64
+```
+
+The package was installed on the K3 Bianbu board and verified as a systemd
+service. Deployment evidence is recorded in:
+
+- `docs/harbornavi-k3-deployment-2026-05-27.md`
