@@ -91,6 +91,8 @@
   - Error: `mmap tcm block: Invalid argument` and `tcm buffer acquire failed for core id 0/1`.
   - `spine_tcm` query reports version `0.2.0`, `available=0`, `blk_size=393216`, `blk_num=8`, `is_fake_tcm=1`, and block physical addresses as `0`.
   - Clearing `/dev/shm/tcm_sync_standalone` did not resolve the issue.
+  - Reboot validation: after reboot, `harboros-beacon.service` returned to `active`, `/healthz` returned HTTP `200`, but the same minimal `SpaceMITExecutionProvider` YOLOv8 session still aborted with status `134` and the same TCM acquire error.
+  - Diagnostic note: `/usr/bin/spacemit-tcm-smi` did not return within the SSH timeout window on this image; a follow-up reboot restored normal SSH/service health.
 - CPU provider result:
   - Minimal zero-input run succeeded.
   - Model load: about `225-239 ms`.
@@ -150,6 +152,7 @@
 - Thermal samples after the run: `59-62 C`.
 - `dmesg` scan for `oom|panic|segfault|tcm|killed process`: `0`.
 - `journalctl -u harboros-beacon.service` scan for panic/OOM/secret patterns: `0`.
+- Reboot recovery check after the SpaceMIT EP probe: SSH returned, `harboros-beacon.service` was `active`, and `/healthz` returned HTTP `200`.
 - Report scan:
   - `rtsp://`: `0`
   - `ha_token`: `0`
@@ -167,6 +170,6 @@
 - Miss: It does not meet the target latency line of `<2s`; observed average is about `2.36s`.
 - Pass: Official YOLOv8n INT8 detection recipe exists and the model runs correctly with ONNX CPU provider on K3.
 - Pass: CPU detector latency is small relative to RTSP capture latency in the current P0 path.
-- Blocker: `SpaceMITExecutionProvider` is not usable on this K3 image yet because `spine_tcm` reports unavailable/fake TCM and the provider aborts on TCM buffer acquisition.
+- Blocker: `SpaceMITExecutionProvider` is not usable on this K3 image yet because `spine_tcm` reports unavailable/fake TCM and the provider aborts on TCM buffer acquisition; reboot did not clear the condition.
 - Gap: `package` is not a COCO label. P0 can map `person`, `cat/dog`, and `vehicle` directly; package needs a proxy label or a later custom detector.
 - Next decision: keep K3 on the main route for the local event pipeline. For the next implementation slice, wire YOLOv8 CPU provider as the measured fallback detector, and in parallel ask SpacemiT/Bianbu for the K3 TCM/SpaceMIT EP fix so the accelerated path can be re-tested.
