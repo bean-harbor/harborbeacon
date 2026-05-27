@@ -1,0 +1,33 @@
+{
+  "schema": "harbornavi.k3.multiVisionSmoke.v1",
+  "durationSeconds": 1800,
+  "intervalSeconds": 10,
+  "beaconUrl": "http://127.0.0.1:4174",
+  "outputDir": "/tmp/harbornavi-p1/4ch-mixed-simulation",
+  "analyzerCommand": "/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py",
+  "modelPath": "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx",
+  "labelPath": "/var/lib/harboros-beacon/models/label.txt",
+  "provider": "cpu",
+  "cameras": [
+    {
+      "cameraId": "cam-real-231",
+      "kind": "real",
+      "rtspUrl": "rtsp://<user>:<password>@192.168.3.231:554/stream2"
+    },
+    {
+      "cameraId": "cam-sim-1",
+      "kind": "replay",
+      "rtspUrl": "rtsp://192.168.3.82:8554/p1-sim-1"
+    },
+    {
+      "cameraId": "cam-sim-2",
+      "kind": "replay",
+      "rtspUrl": "rtsp://192.168.3.82:8554/p1-sim-2"
+    },
+    {
+      "cameraId": "cam-sim-3",
+      "kind": "replay",
+      "rtspUrl": "rtsp://192.168.3.82:8554/p1-sim-3"
+    }
+  ]
+}

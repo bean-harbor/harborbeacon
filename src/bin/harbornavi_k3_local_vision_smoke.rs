@@ -27,6 +27,7 @@ struct Cli {
     model_path: String,
     label_path: String,
     provider: String,
+    redact_paths: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,7 +153,7 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
             return SmokeRun {
                 iteration,
                 ok: false,
-                snapshot_path: Some(snapshot_path.to_string_lossy().to_string()),
+                snapshot_path: report_snapshot_path(cli, &snapshot_path),
                 event: None,
                 ingest_http_status: None,
                 capture_ms,
@@ -205,7 +206,7 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
             return SmokeRun {
                 iteration,
                 ok: false,
-                snapshot_path: Some(snapshot_path.to_string_lossy().to_string()),
+                snapshot_path: report_snapshot_path(cli, &snapshot_path),
                 event: None,
                 ingest_http_status: None,
                 capture_ms,
@@ -237,7 +238,7 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
                 return SmokeRun {
                     iteration,
                     ok: false,
-                    snapshot_path: Some(snapshot_path.to_string_lossy().to_string()),
+                    snapshot_path: report_snapshot_path(cli, &snapshot_path),
                     event: Some(event),
                     ingest_http_status: None,
                     capture_ms,
@@ -259,7 +260,7 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
     SmokeRun {
         iteration,
         ok,
-        snapshot_path: Some(snapshot_path.to_string_lossy().to_string()),
+        snapshot_path: report_snapshot_path(cli, &snapshot_path),
         event: Some(event),
         ingest_http_status,
         capture_ms,
@@ -516,6 +517,14 @@ fn average_u64(values: &[u64]) -> u64 {
     }
 }
 
+fn report_snapshot_path(cli: &Cli, snapshot_path: &Path) -> Option<String> {
+    if cli.redact_paths {
+        Some("[redacted-local-path]".to_string())
+    } else {
+        Some(snapshot_path.to_string_lossy().to_string())
+    }
+}
+
 fn sanitize_sensitive(value: &str) -> String {
     let mut output = String::new();
     for token in value.split_whitespace() {
@@ -571,6 +580,7 @@ impl Cli {
                 .unwrap_or_else(|_| "/var/lib/harboros-beacon/models/label.txt".to_string()),
             provider: std::env::var("HARBOR_K3_YOLO_PROVIDER")
                 .unwrap_or_else(|_| "cpu".to_string()),
+            redact_paths: false,
         };
         let mut index = 0usize;
         while index < args.len() {
@@ -607,6 +617,7 @@ impl Cli {
                 "--disable-analyzer" => cli.analyzer_command = None,
                 "--no-post" => cli.no_post = true,
                 "--fixture" => cli.fixture = true,
+                "--redact-paths" => cli.redact_paths = true,
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -638,7 +649,7 @@ fn parse_u64(value: &str) -> u64 {
 
 fn print_usage() {
     println!(
-        "Usage: harbornavi-k3-local-vision-smoke [--camera-id ID] [--rtsp-url URL | --snapshot-url URL | --fixture] [--duration-seconds N] [--interval-seconds N] [--beacon-url URL] [--output-dir PATH] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--disable-analyzer] [--no-post]"
+        "Usage: harbornavi-k3-local-vision-smoke [--camera-id ID] [--rtsp-url URL | --snapshot-url URL | --fixture] [--duration-seconds N] [--interval-seconds N] [--beacon-url URL] [--output-dir PATH] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--disable-analyzer] [--no-post] [--redact-paths]"
     );
 }
 
