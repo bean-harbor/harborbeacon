@@ -18,3 +18,4 @@ pub mod remote_view;
 pub mod task_api;
 pub mod task_session;
 pub mod topology;
+pub mod vision_event;
