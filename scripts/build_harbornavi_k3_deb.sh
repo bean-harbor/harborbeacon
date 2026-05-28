@@ -7,8 +7,8 @@ cd "$repo_root"
 target="${RUST_TARGET:-riscv64gc-unknown-linux-gnu}"
 deb_arch="${DEB_ARCH:-riscv64}"
 date_stamp="${HARBORNAVI_BUILD_DATE:-$(date +%Y%m%d)}"
-release_label="${RELEASE_VERSION:-harbornavi-p0-local-vision-${date_stamp}+riscv64}"
-debian_version="${DEBIAN_VERSION:-0.1.0+harbornavi.p0.localvision.${date_stamp}.riscv64}"
+release_label="${RELEASE_VERSION:-harbornavi-p1-capture-opt-${date_stamp}+riscv64}"
+debian_version="${DEBIAN_VERSION:-0.1.0+harbornavi.p1.captureopt.${date_stamp}.riscv64}"
 out_dir="${OUT_DIR:-${repo_root}/dist/harbornavi-k3-debs}"
 build_root="${repo_root}/target/harbornavi-k3-deb"
 pkg_name="harboros-beacon_${release_label}_${deb_arch}"
@@ -38,6 +38,7 @@ export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_RISCV64GC
 
 cargo build --release --target "$target" --bin harboros-beacon
 cargo build --release --target "$target" --bin harbornavi-k3-local-vision-smoke
+cargo build --release --target "$target" --bin harbornavi-k3-multi-vision-smoke
 
 rm -rf "$build_root"
 mkdir -p "$pkg_dir/DEBIAN"
@@ -48,7 +49,8 @@ mkdir -p "$pkg_dir/usr/share/doc/harboros-beacon"
 
 cp "target/${target}/release/harboros-beacon" "$pkg_dir/usr/bin/harboros-beacon"
 cp "target/${target}/release/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke"
-chmod 0755 "$pkg_dir/usr/bin/harboros-beacon" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke"
+cp "target/${target}/release/harbornavi-k3-multi-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-multi-vision-smoke"
+chmod 0755 "$pkg_dir/usr/bin/harboros-beacon" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-multi-vision-smoke"
 cp scripts/harbornavi_k3_yolov8_analyzer.py "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
 chmod 0755 "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
 
@@ -73,8 +75,14 @@ debian_version=${debian_version}
 rust_target=${target}
 deb_arch=${deb_arch}
 analyzer=/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py
+single_runner=/usr/bin/harbornavi-k3-local-vision-smoke
+multi_runner=/usr/bin/harbornavi-k3-multi-vision-smoke
 default_model=/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx
 default_labels=/var/lib/harboros-beacon/models/label.txt
+capture_modes=oneshot_ffmpeg,persistent_ffmpeg,local_restream
+fixed_rate_scheduler=enabled
+default_four_channel_phase_offsets=0ms,2500ms,5000ms,7500ms
+persistent_capture_root=/run/harbornavi/capture
 EOF
 
 mkdir -p "$out_dir"
