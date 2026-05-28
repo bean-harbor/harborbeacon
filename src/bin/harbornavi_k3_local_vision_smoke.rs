@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,14 +15,20 @@ use serde_json::{json, Value};
 struct Cli {
     camera_id: String,
     rtsp_url: Option<String>,
+    source_secret_ref: Option<String>,
     snapshot_url: Option<String>,
     beacon_url: String,
     output_dir: PathBuf,
     duration_seconds: u64,
     interval_seconds: u64,
+    phase_offset_ms: u64,
     no_post: bool,
     fixture: bool,
     ffmpeg: String,
+    capture_mode: CaptureMode,
+    capture_root: PathBuf,
+    max_frame_age_ms: u64,
+    decode_backend: String,
     analyzer_command: Option<String>,
     model_path: String,
     label_path: String,
@@ -30,10 +36,44 @@ struct Cli {
     redact_paths: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum CaptureMode {
+    OneshotFfmpeg,
+    PersistentFfmpeg,
+    LocalRestream,
+}
+
+#[derive(Debug, Clone)]
+struct CaptureResult {
+    capture_ms: u64,
+    capture_read_ms: Option<u64>,
+    frame_age_ms: Option<u64>,
+    stream_uptime_ms: Option<u64>,
+    reconnect_count: u64,
+    decode_backend: String,
+}
+
+struct PersistentCaptureWorker {
+    camera_id: String,
+    ffmpeg: String,
+    rtsp_url: String,
+    latest_path: PathBuf,
+    metadata_path: PathBuf,
+    child: Option<Child>,
+    started_at: Instant,
+    reconnect_count: u64,
+    max_frame_age_ms: u64,
+    decode_backend: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SmokeReport {
     ok: bool,
     camera_id: String,
+    capture_mode: String,
+    scheduler: String,
+    phase_offset_ms: u64,
+    max_frame_age_ms: u64,
     runtime_probe: Value,
     duration_seconds: u64,
     interval_seconds: u64,
@@ -53,6 +93,12 @@ struct SmokeRun {
     analyze_ms: u64,
     event_ingest_ms: Option<u64>,
     total_ms: u64,
+    capture_mode: String,
+    capture_read_ms: Option<u64>,
+    frame_age_ms: Option<u64>,
+    stream_uptime_ms: Option<u64>,
+    reconnect_count: u64,
+    decode_backend: String,
     provider: Option<String>,
     detection_count: Option<usize>,
     error: Option<String>,
@@ -66,6 +112,10 @@ struct SmokeSummary {
     average_total_ms: u64,
     average_detector_ms: u64,
     average_event_ingest_ms: u64,
+    average_capture_read_ms: u64,
+    average_frame_age_ms: u64,
+    p95_capture_read_ms: u64,
+    p95_frame_age_ms: u64,
     max_total_ms: u64,
     under_2s: usize,
     under_5s: usize,
@@ -83,22 +133,50 @@ fn main() {
     }
 
     let runtime_probe = probe_official_vision_runtime();
+    let mut capture_worker = match create_capture_worker(&cli) {
+        Ok(worker) => worker,
+        Err(error) => fail(&error),
+    };
     let start = Instant::now();
+    let end = if cli.duration_seconds == 0 {
+        None
+    } else {
+        Some(start + Duration::from_secs(cli.duration_seconds))
+    };
+    let mut next_deadline = start + Duration::from_millis(cli.phase_offset_ms);
+    let interval = Duration::from_secs(cli.interval_seconds.max(1));
     let mut runs = Vec::new();
     let mut iteration = 0usize;
     loop {
+        if let Some(end) = end {
+            if next_deadline >= end {
+                break;
+            }
+            sleep_until(next_deadline);
+        } else if cli.phase_offset_ms > 0 {
+            sleep_until(next_deadline);
+        }
         iteration += 1;
-        runs.push(run_once(&cli, iteration, &runtime_probe));
-        if cli.duration_seconds == 0 || start.elapsed().as_secs() >= cli.duration_seconds {
+        runs.push(run_once(
+            &cli,
+            iteration,
+            &runtime_probe,
+            capture_worker.as_mut(),
+        ));
+        if end.is_none() {
             break;
         }
-        thread::sleep(Duration::from_secs(cli.interval_seconds.max(1)));
+        next_deadline += interval;
     }
 
     let summary = summarize_runs(&runs);
     let report = SmokeReport {
         ok: summary.failed == 0,
         camera_id: cli.camera_id,
+        capture_mode: cli.capture_mode.as_str().to_string(),
+        scheduler: "fixed-rate".to_string(),
+        phase_offset_ms: cli.phase_offset_ms,
+        max_frame_age_ms: cli.max_frame_age_ms,
         runtime_probe,
         duration_seconds: cli.duration_seconds,
         interval_seconds: cli.interval_seconds,
@@ -121,15 +199,48 @@ fn main() {
     }
 }
 
-fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
+fn run_once(
+    cli: &Cli,
+    iteration: usize,
+    runtime_probe: &Value,
+    capture_worker: Option<&mut PersistentCaptureWorker>,
+) -> SmokeRun {
     let total_started = Instant::now();
     let snapshot_path =
         cli.output_dir
             .join(format!("snapshot-{:04}-{}.jpg", iteration, epoch_millis()));
-    let capture_started = Instant::now();
-    let capture = capture_snapshot(cli, &snapshot_path);
-    let capture_ms = capture_started.elapsed().as_millis() as u64;
-    if let Err(error) = capture {
+    let capture = capture_snapshot(cli, &snapshot_path, capture_worker);
+    let capture_result = match capture {
+        Ok(result) => result,
+        Err(error) => {
+            let capture_ms = total_started.elapsed().as_millis() as u64;
+            return SmokeRun {
+                iteration,
+                ok: false,
+                snapshot_path: None,
+                event: None,
+                ingest_http_status: None,
+                capture_ms,
+                detector_ms: None,
+                analyze_ms: 0,
+                event_ingest_ms: None,
+                total_ms: total_started.elapsed().as_millis() as u64,
+                capture_mode: cli.capture_mode.as_str().to_string(),
+                capture_read_ms: None,
+                frame_age_ms: None,
+                stream_uptime_ms: None,
+                reconnect_count: 0,
+                decode_backend: cli.decode_backend.clone(),
+                provider: None,
+                detection_count: None,
+                error: Some(error),
+            };
+        }
+    };
+    let capture_ms = capture_result.capture_ms;
+    let capture_mode = cli.capture_mode.as_str().to_string();
+    let decode_backend = capture_result.decode_backend.clone();
+    if let Err(error) = validate_snapshot_file(&snapshot_path) {
         return SmokeRun {
             iteration,
             ok: false,
@@ -141,6 +252,12 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
             analyze_ms: 0,
             event_ingest_ms: None,
             total_ms: total_started.elapsed().as_millis() as u64,
+            capture_mode,
+            capture_read_ms: capture_result.capture_read_ms,
+            frame_age_ms: capture_result.frame_age_ms,
+            stream_uptime_ms: capture_result.stream_uptime_ms,
+            reconnect_count: capture_result.reconnect_count,
+            decode_backend,
             provider: None,
             detection_count: None,
             error: Some(error),
@@ -161,6 +278,12 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
                 analyze_ms: 0,
                 event_ingest_ms: None,
                 total_ms: total_started.elapsed().as_millis() as u64,
+                capture_mode,
+                capture_read_ms: capture_result.capture_read_ms,
+                frame_age_ms: capture_result.frame_age_ms,
+                stream_uptime_ms: capture_result.stream_uptime_ms,
+                reconnect_count: capture_result.reconnect_count,
+                decode_backend,
                 provider: None,
                 detection_count: None,
                 error: Some(sanitize_sensitive(&error)),
@@ -192,6 +315,14 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
         metrics: json!({
             "runtime_probe": runtime_probe,
             "capture_ms": capture_ms,
+            "capture_mode": capture_mode.clone(),
+            "capture_read_ms": capture_result.capture_read_ms,
+            "frame_age_ms": capture_result.frame_age_ms,
+            "stream_uptime_ms": capture_result.stream_uptime_ms,
+            "reconnect_count": capture_result.reconnect_count,
+            "decode_backend": decode_backend.clone(),
+            "scheduler": "fixed-rate",
+            "phase_offset_ms": cli.phase_offset_ms,
             "detector_ms": detector_ms,
             "smoke_iteration": iteration,
         }),
@@ -214,6 +345,12 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
                 analyze_ms,
                 event_ingest_ms: None,
                 total_ms: total_started.elapsed().as_millis() as u64,
+                capture_mode,
+                capture_read_ms: capture_result.capture_read_ms,
+                frame_age_ms: capture_result.frame_age_ms,
+                stream_uptime_ms: capture_result.stream_uptime_ms,
+                reconnect_count: capture_result.reconnect_count,
+                decode_backend,
                 provider,
                 detection_count,
                 error: Some(sanitize_sensitive(&error)),
@@ -246,6 +383,12 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
                     analyze_ms,
                     event_ingest_ms: Some(ingest_started.elapsed().as_millis() as u64),
                     total_ms: total_started.elapsed().as_millis() as u64,
+                    capture_mode,
+                    capture_read_ms: capture_result.capture_read_ms,
+                    frame_age_ms: capture_result.frame_age_ms,
+                    stream_uptime_ms: capture_result.stream_uptime_ms,
+                    reconnect_count: capture_result.reconnect_count,
+                    decode_backend,
                     provider,
                     detection_count,
                     error: Some(sanitize_sensitive(&error)),
@@ -268,6 +411,12 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
         analyze_ms,
         event_ingest_ms,
         total_ms: total_started.elapsed().as_millis() as u64,
+        capture_mode,
+        capture_read_ms: capture_result.capture_read_ms,
+        frame_age_ms: capture_result.frame_age_ms,
+        stream_uptime_ms: capture_result.stream_uptime_ms,
+        reconnect_count: capture_result.reconnect_count,
+        decode_backend,
         provider,
         detection_count,
         error: if ok {
@@ -278,13 +427,60 @@ fn run_once(cli: &Cli, iteration: usize, runtime_probe: &Value) -> SmokeRun {
     }
 }
 
-fn capture_snapshot(cli: &Cli, snapshot_path: &Path) -> Result<(), String> {
+fn create_capture_worker(cli: &Cli) -> Result<Option<PersistentCaptureWorker>, String> {
+    if cli.capture_mode != CaptureMode::PersistentFfmpeg {
+        return Ok(None);
+    }
+    if cli.fixture || cli.snapshot_url.is_some() {
+        return Err(
+            "persistent_ffmpeg capture mode requires an RTSP source, not fixture or snapshot URL"
+                .to_string(),
+        );
+    }
+    let rtsp_url = resolve_rtsp_url(cli)?;
+    let capture_dir = cli.capture_root.join(safe_component(&cli.camera_id));
+    fs::create_dir_all(&capture_dir).map_err(|error| {
+        format!(
+            "failed to create capture worker dir {}: {error}",
+            capture_dir.display()
+        )
+    })?;
+    let mut worker = PersistentCaptureWorker {
+        camera_id: cli.camera_id.clone(),
+        ffmpeg: cli.ffmpeg.clone(),
+        rtsp_url,
+        latest_path: capture_dir.join("latest.jpg"),
+        metadata_path: capture_dir.join("latest.json"),
+        child: None,
+        started_at: Instant::now(),
+        reconnect_count: 0,
+        max_frame_age_ms: cli.max_frame_age_ms,
+        decode_backend: cli.decode_backend.clone(),
+    };
+    worker.ensure_running()?;
+    Ok(Some(worker))
+}
+
+fn capture_snapshot(
+    cli: &Cli,
+    snapshot_path: &Path,
+    capture_worker: Option<&mut PersistentCaptureWorker>,
+) -> Result<CaptureResult, String> {
+    let started = Instant::now();
     if cli.fixture {
-        return fs::write(
+        fs::write(
             snapshot_path,
             [0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0xff, 0xd9],
         )
-        .map_err(|error| format!("failed to write fixture snapshot: {error}"));
+        .map_err(|error| format!("failed to write fixture snapshot: {error}"))?;
+        return Ok(CaptureResult {
+            capture_ms: started.elapsed().as_millis() as u64,
+            capture_read_ms: Some(started.elapsed().as_millis() as u64),
+            frame_age_ms: Some(0),
+            stream_uptime_ms: None,
+            reconnect_count: 0,
+            decode_backend: "fixture".to_string(),
+        });
     }
     if let Some(url) = cli.snapshot_url.as_deref() {
         let bytes = Client::builder()
@@ -308,14 +504,24 @@ fn capture_snapshot(cli: &Cli, snapshot_path: &Path) -> Result<(), String> {
             })?
             .bytes()
             .map_err(|error| format!("failed to read snapshot bytes: {error}"))?;
-        return fs::write(snapshot_path, bytes)
-            .map_err(|error| format!("failed to write snapshot: {error}"));
+        fs::write(snapshot_path, bytes)
+            .map_err(|error| format!("failed to write snapshot: {error}"))?;
+        return Ok(CaptureResult {
+            capture_ms: started.elapsed().as_millis() as u64,
+            capture_read_ms: Some(started.elapsed().as_millis() as u64),
+            frame_age_ms: Some(0),
+            stream_uptime_ms: None,
+            reconnect_count: 0,
+            decode_backend: "http_snapshot".to_string(),
+        });
     }
-    let Some(rtsp_url) = cli.rtsp_url.as_deref() else {
-        return Err(
-            "missing snapshot source; pass --rtsp-url, --snapshot-url, or --fixture".to_string(),
-        );
-    };
+    if cli.capture_mode == CaptureMode::PersistentFfmpeg {
+        let Some(worker) = capture_worker else {
+            return Err("persistent capture worker was not initialized".to_string());
+        };
+        return worker.copy_latest_to(snapshot_path);
+    }
+    let rtsp_url = resolve_rtsp_url(cli)?;
     let output = Command::new(&cli.ffmpeg)
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -324,7 +530,7 @@ fn capture_snapshot(cli: &Cli, snapshot_path: &Path) -> Result<(), String> {
         .arg("tcp")
         .arg("-y")
         .arg("-i")
-        .arg(rtsp_url)
+        .arg(&rtsp_url)
         .arg("-frames:v")
         .arg("1")
         .arg(snapshot_path)
@@ -338,6 +544,18 @@ fn capture_snapshot(cli: &Cli, snapshot_path: &Path) -> Result<(), String> {
             sanitize_sensitive(stderr.trim())
         ));
     }
+    validate_snapshot_file(snapshot_path)?;
+    Ok(CaptureResult {
+        capture_ms: started.elapsed().as_millis() as u64,
+        capture_read_ms: Some(started.elapsed().as_millis() as u64),
+        frame_age_ms: None,
+        stream_uptime_ms: None,
+        reconnect_count: 0,
+        decode_backend: cli.decode_backend.clone(),
+    })
+}
+
+fn validate_snapshot_file(snapshot_path: &Path) -> Result<(), String> {
     let metadata = fs::metadata(snapshot_path)
         .map_err(|error| format!("ffmpeg did not create snapshot: {error}"))?;
     if metadata.len() == 0 {
@@ -473,6 +691,205 @@ fn command_available(command: &str) -> bool {
         .unwrap_or(false)
 }
 
+impl PersistentCaptureWorker {
+    fn ensure_running(&mut self) -> Result<(), String> {
+        let mut restart = self.child.is_none();
+        if let Some(child) = self.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    restart = true;
+                    self.child = None;
+                    self.reconnect_count = self.reconnect_count.saturating_add(1);
+                }
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    restart = true;
+                    self.child = None;
+                    self.reconnect_count = self.reconnect_count.saturating_add(1);
+                    eprintln!(
+                        "capture worker status check failed for {}: {}",
+                        self.camera_id,
+                        sanitize_sensitive(&error.to_string())
+                    );
+                }
+            }
+        }
+        if restart {
+            let child = Command::new(&self.ffmpeg)
+                .arg("-hide_banner")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-rtsp_transport")
+                .arg("tcp")
+                .arg("-y")
+                .arg("-i")
+                .arg(&self.rtsp_url)
+                .arg("-an")
+                .arg("-vf")
+                .arg("fps=1")
+                .arg("-q:v")
+                .arg("4")
+                .arg("-update")
+                .arg("1")
+                .arg(&self.latest_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|error| {
+                    format!(
+                        "failed to launch persistent ffmpeg capture worker: {}",
+                        sanitize_sensitive(&error.to_string())
+                    )
+                })?;
+            self.started_at = Instant::now();
+            self.child = Some(child);
+        }
+        Ok(())
+    }
+
+    fn copy_latest_to(&mut self, snapshot_path: &Path) -> Result<CaptureResult, String> {
+        let started = Instant::now();
+        self.ensure_running()?;
+        let (frame_age_ms, byte_size) = self.wait_for_fresh_frame()?;
+        let copy_started = Instant::now();
+        fs::copy(&self.latest_path, snapshot_path).map_err(|error| {
+            format!(
+                "failed to copy persistent capture frame to snapshot: {}",
+                sanitize_sensitive(&error.to_string())
+            )
+        })?;
+        let capture_read_ms = copy_started.elapsed().as_millis() as u64;
+        let stream_uptime_ms = self.started_at.elapsed().as_millis() as u64;
+        self.write_latest_metadata(frame_age_ms, byte_size, stream_uptime_ms)?;
+        Ok(CaptureResult {
+            capture_ms: started.elapsed().as_millis() as u64,
+            capture_read_ms: Some(capture_read_ms),
+            frame_age_ms: Some(frame_age_ms),
+            stream_uptime_ms: Some(stream_uptime_ms),
+            reconnect_count: self.reconnect_count,
+            decode_backend: self.decode_backend.clone(),
+        })
+    }
+
+    fn wait_for_fresh_frame(&mut self) -> Result<(u64, u64), String> {
+        let wait_started = Instant::now();
+        loop {
+            self.ensure_running()?;
+            if let Ok(metadata) = fs::metadata(&self.latest_path) {
+                if metadata.len() > 0 {
+                    if let Ok(modified) = metadata.modified() {
+                        let frame_age_ms = SystemTime::now()
+                            .duration_since(modified)
+                            .map(|duration| duration.as_millis() as u64)
+                            .unwrap_or(0);
+                        if frame_age_ms <= self.max_frame_age_ms {
+                            return Ok((frame_age_ms, metadata.len()));
+                        }
+                    }
+                }
+            }
+            if wait_started.elapsed() > Duration::from_secs(12) {
+                return Err(format!(
+                    "persistent capture did not produce a fresh frame within 12s for {}",
+                    self.camera_id
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn write_latest_metadata(
+        &self,
+        frame_age_ms: u64,
+        byte_size: u64,
+        stream_uptime_ms: u64,
+    ) -> Result<(), String> {
+        let payload = json!({
+            "schema": "harbornavi.k3.capture.latestFrame.v1",
+            "camera_id": &self.camera_id,
+            "updated_at_ms": epoch_millis(),
+            "byte_size": byte_size,
+            "frame_age_ms": frame_age_ms,
+            "stream_uptime_ms": stream_uptime_ms,
+            "reconnect_count": self.reconnect_count,
+            "decode_backend": &self.decode_backend,
+        });
+        let text = serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("failed to serialize capture metadata: {error}"))?;
+        fs::write(&self.metadata_path, text).map_err(|error| {
+            format!(
+                "failed to write capture metadata {}: {error}",
+                self.metadata_path.display()
+            )
+        })
+    }
+}
+
+impl Drop for PersistentCaptureWorker {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl CaptureMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "oneshot_ffmpeg" => Ok(Self::OneshotFfmpeg),
+            "persistent_ffmpeg" => Ok(Self::PersistentFfmpeg),
+            "local_restream" => Ok(Self::LocalRestream),
+            other => Err(format!(
+                "capture mode must be oneshot_ffmpeg, persistent_ffmpeg, or local_restream; got {other}"
+            )),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::OneshotFfmpeg => "oneshot_ffmpeg",
+            Self::PersistentFfmpeg => "persistent_ffmpeg",
+            Self::LocalRestream => "local_restream",
+        }
+    }
+}
+
+fn resolve_rtsp_url(cli: &Cli) -> Result<String, String> {
+    if let Some(url) = cli.rtsp_url.as_deref() {
+        return Ok(url.to_string());
+    }
+    if let Some(reference) = cli.source_secret_ref.as_deref() {
+        let env_name = reference.strip_prefix("env:").unwrap_or(reference);
+        return std::env::var(env_name).map_err(|_| {
+            format!("missing RTSP source secret in environment reference {env_name}")
+        });
+    }
+    Err("missing snapshot source; pass --rtsp-url, --source-secret-ref, --snapshot-url, or --fixture"
+        .to_string())
+}
+
+fn safe_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+}
+
+fn sleep_until(deadline: Instant) {
+    let now = Instant::now();
+    if deadline > now {
+        thread::sleep(deadline - now);
+    }
+}
+
 fn summarize_runs(runs: &[SmokeRun]) -> SmokeSummary {
     let total = runs.len();
     let passed = runs.iter().filter(|run| run.ok).count();
@@ -485,6 +902,14 @@ fn summarize_runs(runs: &[SmokeRun]) -> SmokeSummary {
     let event_ingest_values = runs
         .iter()
         .filter_map(|run| run.event_ingest_ms)
+        .collect::<Vec<_>>();
+    let capture_read_values = runs
+        .iter()
+        .filter_map(|run| run.capture_read_ms)
+        .collect::<Vec<_>>();
+    let frame_age_values = runs
+        .iter()
+        .filter_map(|run| run.frame_age_ms)
         .collect::<Vec<_>>();
     let detection_count = runs
         .iter()
@@ -501,6 +926,10 @@ fn summarize_runs(runs: &[SmokeRun]) -> SmokeSummary {
         },
         average_detector_ms: average_u64(&detector_values),
         average_event_ingest_ms: average_u64(&event_ingest_values),
+        average_capture_read_ms: average_u64(&capture_read_values),
+        average_frame_age_ms: average_u64(&frame_age_values),
+        p95_capture_read_ms: p95(&capture_read_values),
+        p95_frame_age_ms: p95(&frame_age_values),
         max_total_ms: runs.iter().map(|run| run.total_ms).max().unwrap_or(0),
         under_2s: runs.iter().filter(|run| run.total_ms < 2000).count(),
         under_5s: runs.iter().filter(|run| run.total_ms < 5000).count(),
@@ -515,6 +944,16 @@ fn average_u64(values: &[u64]) -> u64 {
     } else {
         values.iter().sum::<u64>() / values.len() as u64
     }
+}
+
+fn p95(values: &[u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+    sorted[index.min(sorted.len() - 1)]
 }
 
 fn report_snapshot_path(cli: &Cli, snapshot_path: &Path) -> Option<String> {
@@ -562,14 +1001,26 @@ impl Cli {
         let mut cli = Self {
             camera_id: "k3-local-camera".to_string(),
             rtsp_url: None,
+            source_secret_ref: None,
             snapshot_url: None,
             beacon_url: "http://127.0.0.1:4174".to_string(),
             output_dir: PathBuf::from("/tmp/harbornavi-p0/local-vision-event"),
             duration_seconds: 0,
             interval_seconds: 10,
+            phase_offset_ms: 0,
             no_post: false,
             fixture: false,
             ffmpeg: std::env::var("HARBOR_FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string()),
+            capture_mode: CaptureMode::OneshotFfmpeg,
+            capture_root: std::env::var("HARBORNAVI_CAPTURE_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/run/harbornavi/capture")),
+            max_frame_age_ms: std::env::var("HARBORNAVI_MAX_FRAME_AGE_MS")
+                .ok()
+                .map(|value| parse_u64(&value))
+                .unwrap_or(2500),
+            decode_backend: std::env::var("HARBORNAVI_DECODE_BACKEND")
+                .unwrap_or_else(|_| "ffmpeg_sw".to_string()),
             analyzer_command: std::env::var("HARBOR_K3_YOLO_ANALYZER")
                 .ok()
                 .or_else(default_analyzer_command),
@@ -587,6 +1038,10 @@ impl Cli {
             match args[index].as_str() {
                 "--camera-id" => cli.camera_id = take_value(&args, &mut index, "--camera-id"),
                 "--rtsp-url" => cli.rtsp_url = Some(take_value(&args, &mut index, "--rtsp-url")),
+                "--source-secret-ref" => {
+                    cli.source_secret_ref =
+                        Some(take_value(&args, &mut index, "--source-secret-ref"))
+                }
                 "--snapshot-url" => {
                     cli.snapshot_url = Some(take_value(&args, &mut index, "--snapshot-url"))
                 }
@@ -602,7 +1057,27 @@ impl Cli {
                     cli.interval_seconds =
                         parse_u64(&take_value(&args, &mut index, "--interval-seconds"))
                 }
+                "--phase-offset-ms" => {
+                    cli.phase_offset_ms =
+                        parse_u64(&take_value(&args, &mut index, "--phase-offset-ms"))
+                }
                 "--ffmpeg" => cli.ffmpeg = take_value(&args, &mut index, "--ffmpeg"),
+                "--capture-mode" => {
+                    cli.capture_mode =
+                        CaptureMode::parse(&take_value(&args, &mut index, "--capture-mode"))
+                            .unwrap_or_else(|error| fail(&error));
+                }
+                "--capture-root" => {
+                    cli.capture_root =
+                        PathBuf::from(take_value(&args, &mut index, "--capture-root"))
+                }
+                "--max-frame-age-ms" => {
+                    cli.max_frame_age_ms =
+                        parse_u64(&take_value(&args, &mut index, "--max-frame-age-ms"))
+                }
+                "--decode-backend" => {
+                    cli.decode_backend = take_value(&args, &mut index, "--decode-backend")
+                }
                 "--analyzer-command" => {
                     cli.analyzer_command = Some(take_value(&args, &mut index, "--analyzer-command"))
                 }
@@ -629,6 +1104,12 @@ impl Cli {
         if cli.provider != "cpu" && cli.provider != "spacemit" {
             fail("--provider must be cpu or spacemit");
         }
+        if cli.capture_mode == CaptureMode::PersistentFfmpeg && cli.decode_backend == "ffmpeg_sw" {
+            cli.decode_backend = "ffmpeg_sw_persistent".to_string();
+        }
+        if cli.capture_mode == CaptureMode::LocalRestream && cli.decode_backend == "ffmpeg_sw" {
+            cli.decode_backend = "ffmpeg_sw_local_restream".to_string();
+        }
         cli
     }
 }
@@ -649,7 +1130,7 @@ fn parse_u64(value: &str) -> u64 {
 
 fn print_usage() {
     println!(
-        "Usage: harbornavi-k3-local-vision-smoke [--camera-id ID] [--rtsp-url URL | --snapshot-url URL | --fixture] [--duration-seconds N] [--interval-seconds N] [--beacon-url URL] [--output-dir PATH] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--disable-analyzer] [--no-post] [--redact-paths]"
+        "Usage: harbornavi-k3-local-vision-smoke [--camera-id ID] [--rtsp-url URL | --source-secret-ref env:VAR | --snapshot-url URL | --fixture] [--duration-seconds N] [--interval-seconds N] [--phase-offset-ms N] [--capture-mode oneshot_ffmpeg|persistent_ffmpeg|local_restream] [--capture-root PATH] [--max-frame-age-ms N] [--decode-backend NAME] [--beacon-url URL] [--output-dir PATH] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--disable-analyzer] [--no-post] [--redact-paths]"
     );
 }
 

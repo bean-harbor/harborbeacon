@@ -7,8 +7,8 @@ cd "$repo_root"
 target="${RUST_TARGET:-riscv64gc-unknown-linux-gnu}"
 deb_arch="${DEB_ARCH:-riscv64}"
 date_stamp="${HARBORNAVI_BUILD_DATE:-$(date +%Y%m%d)}"
-release_label="${RELEASE_VERSION:-harbornavi-p1-4ch-mixed-${date_stamp}+riscv64}"
-debian_version="${DEBIAN_VERSION:-0.1.0+harbornavi.p1.4chmixed.${date_stamp}.riscv64}"
+release_label="${RELEASE_VERSION:-harbornavi-p1-capture-opt-${date_stamp}+riscv64}"
+debian_version="${DEBIAN_VERSION:-0.1.0+harbornavi.p1.captureopt.${date_stamp}.riscv64}"
 out_dir="${OUT_DIR:-${repo_root}/dist/harbornavi-k3-debs}"
 build_root="${repo_root}/target/harbornavi-k3-deb"
 pkg_name="harboros-beacon_${release_label}_${deb_arch}"
@@ -79,6 +79,10 @@ single_runner=/usr/bin/harbornavi-k3-local-vision-smoke
 multi_runner=/usr/bin/harbornavi-k3-multi-vision-smoke
 default_model=/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx
 default_labels=/var/lib/harboros-beacon/models/label.txt
+capture_modes=oneshot_ffmpeg,persistent_ffmpeg,local_restream
+fixed_rate_scheduler=enabled
+default_four_channel_phase_offsets=0ms,2500ms,5000ms,7500ms
+persistent_capture_root=/run/harbornavi/capture
 EOF
 
 mkdir -p "$out_dir"

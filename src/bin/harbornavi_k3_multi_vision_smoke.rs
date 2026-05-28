@@ -34,6 +34,7 @@ struct CameraManifest {
     label_path: Option<String>,
     provider: Option<String>,
     no_post: Option<bool>,
+    capture: Option<CaptureSettings>,
     cameras: Vec<CameraSource>,
 }
 
@@ -47,6 +48,45 @@ struct CameraSource {
     fixture: Option<bool>,
     duration_seconds: Option<u64>,
     interval_seconds: Option<u64>,
+    #[serde(default, alias = "source_secret_ref")]
+    source_secret_ref: Option<String>,
+    #[serde(default, alias = "capture_mode")]
+    capture_mode: Option<String>,
+    #[serde(default, alias = "phase_offset_ms")]
+    phase_offset_ms: Option<u64>,
+    #[serde(default, alias = "max_frame_age_ms")]
+    max_frame_age_ms: Option<u64>,
+    #[serde(default, alias = "capture_root")]
+    capture_root: Option<PathBuf>,
+    #[serde(default, alias = "decode_backend")]
+    decode_backend: Option<String>,
+    capture: Option<CaptureSettings>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureSettings {
+    mode: Option<String>,
+    #[serde(default, alias = "phase_offset_ms")]
+    phase_offset_ms: Option<u64>,
+    #[serde(default, alias = "max_frame_age_ms")]
+    max_frame_age_ms: Option<u64>,
+    #[serde(default, alias = "source_secret_ref")]
+    source_secret_ref: Option<String>,
+    #[serde(default, alias = "capture_root")]
+    capture_root: Option<PathBuf>,
+    #[serde(default, alias = "decode_backend")]
+    decode_backend: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedCapture {
+    mode: String,
+    phase_offset_ms: u64,
+    max_frame_age_ms: u64,
+    source_secret_ref: Option<String>,
+    capture_root: Option<PathBuf>,
+    decode_backend: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +102,7 @@ struct ResolvedConfig {
     provider: String,
     no_post: bool,
     local_smoke_bin: String,
+    capture: CaptureSettings,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,6 +114,7 @@ struct MultiVisionReport {
     duration_seconds: u64,
     interval_seconds: u64,
     target_p95_ms: u64,
+    scheduler: String,
     output_scope: String,
     source_mix: SourceMix,
     aggregate: AggregateSummary,
@@ -96,6 +138,8 @@ struct SourceMix {
 struct CameraReport {
     camera_id: String,
     source_kind: String,
+    capture_mode: String,
+    phase_offset_ms: u64,
     ok: bool,
     child_exit_code: Option<i32>,
     total: usize,
@@ -107,6 +151,13 @@ struct CameraReport {
     max_total_ms: u64,
     average_capture_ms: u64,
     p95_capture_ms: u64,
+    average_capture_read_ms: u64,
+    p95_capture_read_ms: u64,
+    average_frame_age_ms: u64,
+    p95_frame_age_ms: u64,
+    max_stream_uptime_ms: u64,
+    reconnect_count: u64,
+    decode_backend: Option<String>,
     average_detector_ms: u64,
     p95_detector_ms: u64,
     average_event_ingest_ms: u64,
@@ -126,6 +177,8 @@ struct AggregateSummary {
     p95_total_ms: u64,
     max_total_ms: u64,
     p95_capture_ms: u64,
+    p95_capture_read_ms: u64,
+    p95_frame_age_ms: u64,
     p95_detector_ms: u64,
     p95_event_ingest_ms: u64,
 }
@@ -134,6 +187,8 @@ struct AggregateSummary {
 struct SingleSmokeReport {
     ok: bool,
     camera_id: String,
+    #[serde(default)]
+    capture_mode: Option<String>,
     runs: Vec<SingleSmokeRun>,
     summary: SingleSmokeSummary,
 }
@@ -142,6 +197,18 @@ struct SingleSmokeReport {
 struct SingleSmokeRun {
     ok: bool,
     capture_ms: u64,
+    #[serde(default)]
+    capture_mode: Option<String>,
+    #[serde(default)]
+    capture_read_ms: Option<u64>,
+    #[serde(default)]
+    frame_age_ms: Option<u64>,
+    #[serde(default)]
+    stream_uptime_ms: Option<u64>,
+    #[serde(default)]
+    reconnect_count: Option<u64>,
+    #[serde(default)]
+    decode_backend: Option<String>,
     detector_ms: Option<u64>,
     event_ingest_ms: Option<u64>,
     total_ms: u64,
@@ -174,13 +241,15 @@ fn main() {
         ));
     }
 
+    let camera_count = manifest.cameras.len();
     let handles = manifest
         .cameras
         .iter()
         .cloned()
-        .map(|camera| {
+        .enumerate()
+        .map(|(index, camera)| {
             let config = config.clone();
-            thread::spawn(move || run_camera(camera, config))
+            thread::spawn(move || run_camera(camera, config, index, camera_count))
         })
         .collect::<Vec<_>>();
 
@@ -212,6 +281,7 @@ fn main() {
         duration_seconds: config.duration_seconds,
         interval_seconds: config.interval_seconds,
         target_p95_ms: 5000,
+        scheduler: "fixed-rate-staggered".to_string(),
         output_scope: "[redacted-local-path]".to_string(),
         source_mix,
         aggregate,
@@ -236,8 +306,14 @@ fn main() {
     }
 }
 
-fn run_camera(camera: CameraSource, config: ResolvedConfig) -> CameraReport {
+fn run_camera(
+    camera: CameraSource,
+    config: ResolvedConfig,
+    camera_index: usize,
+    camera_count: usize,
+) -> CameraReport {
     let source_kind = camera.source_kind();
+    let capture = camera.resolved_capture(&config, camera_index, camera_count);
     let camera_output_dir = config.output_dir.join(&camera.camera_id);
     if let Err(error) = fs::create_dir_all(&camera_output_dir) {
         return CameraReport::system_error(
@@ -259,6 +335,12 @@ fn run_camera(camera: CameraSource, config: ResolvedConfig) -> CameraReport {
             .interval_seconds
             .unwrap_or(config.interval_seconds)
             .to_string(),
+        "--phase-offset-ms".to_string(),
+        capture.phase_offset_ms.to_string(),
+        "--capture-mode".to_string(),
+        capture.mode.clone(),
+        "--max-frame-age-ms".to_string(),
+        capture.max_frame_age_ms.to_string(),
         "--beacon-url".to_string(),
         config.beacon_url.clone(),
         "--output-dir".to_string(),
@@ -267,6 +349,14 @@ fn run_camera(camera: CameraSource, config: ResolvedConfig) -> CameraReport {
         config.provider.clone(),
         "--redact-paths".to_string(),
     ];
+    if let Some(capture_root) = capture.capture_root.as_ref() {
+        args.push("--capture-root".to_string());
+        args.push(capture_root.to_string_lossy().to_string());
+    }
+    if let Some(decode_backend) = capture.decode_backend.as_deref() {
+        args.push("--decode-backend".to_string());
+        args.push(decode_backend.to_string());
+    }
     if config.no_post {
         args.push("--no-post".to_string());
     }
@@ -284,6 +374,9 @@ fn run_camera(camera: CameraSource, config: ResolvedConfig) -> CameraReport {
     }
     if camera.fixture.unwrap_or(false) {
         args.push("--fixture".to_string());
+    } else if let Some(source_secret_ref) = capture.source_secret_ref.as_deref() {
+        args.push("--source-secret-ref".to_string());
+        args.push(source_secret_ref.to_string());
     } else if let Some(rtsp_url) = camera.rtsp_url.as_deref() {
         args.push("--rtsp-url".to_string());
         args.push(rtsp_url.to_string());
@@ -318,6 +411,7 @@ fn run_camera(camera: CameraSource, config: ResolvedConfig) -> CameraReport {
                     } else {
                         Some(sanitize_sensitive(&truncate(&stderr, 600)))
                     },
+                    &capture,
                 ),
                 Err(error) => CameraReport::system_error(
                     &camera.camera_id,
@@ -347,6 +441,7 @@ fn summarize_camera_report(
     exit_code: Option<i32>,
     report: &SingleSmokeReport,
     error: Option<String>,
+    capture: &ResolvedCapture,
 ) -> CameraReport {
     let total_values = report
         .runs
@@ -368,6 +463,34 @@ fn summarize_camera_report(
         .iter()
         .filter_map(|run| run.event_ingest_ms)
         .collect::<Vec<_>>();
+    let capture_read_values = report
+        .runs
+        .iter()
+        .filter_map(|run| run.capture_read_ms)
+        .collect::<Vec<_>>();
+    let frame_age_values = report
+        .runs
+        .iter()
+        .filter_map(|run| run.frame_age_ms)
+        .collect::<Vec<_>>();
+    let reconnect_count = report
+        .runs
+        .iter()
+        .filter_map(|run| run.reconnect_count)
+        .max()
+        .unwrap_or(0);
+    let max_stream_uptime_ms = report
+        .runs
+        .iter()
+        .filter_map(|run| run.stream_uptime_ms)
+        .max()
+        .unwrap_or(0);
+    let decode_backend = report
+        .runs
+        .iter()
+        .filter_map(|run| run.decode_backend.clone())
+        .next()
+        .or_else(|| capture.decode_backend.clone());
     let failed_runs = report.runs.iter().filter(|run| !run.ok).count();
     let total = report.summary.total.max(report.runs.len());
     let passed = report
@@ -383,6 +506,18 @@ fn summarize_camera_report(
             report.camera_id.clone()
         },
         source_kind: source_kind.to_string(),
+        capture_mode: report
+            .capture_mode
+            .clone()
+            .or_else(|| {
+                report
+                    .runs
+                    .iter()
+                    .filter_map(|run| run.capture_mode.clone())
+                    .next()
+            })
+            .unwrap_or_else(|| capture.mode.clone()),
+        phase_offset_ms: capture.phase_offset_ms,
         ok: report.ok && failed == 0 && error.is_none(),
         child_exit_code: exit_code,
         total,
@@ -394,6 +529,13 @@ fn summarize_camera_report(
         max_total_ms: report.summary.max_total_ms,
         average_capture_ms: average_u64(&capture_values),
         p95_capture_ms: p95(&capture_values),
+        average_capture_read_ms: average_u64(&capture_read_values),
+        p95_capture_read_ms: p95(&capture_read_values),
+        average_frame_age_ms: average_u64(&frame_age_values),
+        p95_frame_age_ms: p95(&frame_age_values),
+        max_stream_uptime_ms,
+        reconnect_count,
+        decode_backend,
         average_detector_ms: report.summary.average_detector_ms,
         p95_detector_ms: p95(&detector_values),
         average_event_ingest_ms: report.summary.average_event_ingest_ms,
@@ -428,6 +570,16 @@ fn summarize_aggregate(cameras: &[CameraReport]) -> AggregateSummary {
             .map(|camera| camera.p95_capture_ms)
             .max()
             .unwrap_or(0),
+        p95_capture_read_ms: cameras
+            .iter()
+            .map(|camera| camera.p95_capture_read_ms)
+            .max()
+            .unwrap_or(0),
+        p95_frame_age_ms: cameras
+            .iter()
+            .map(|camera| camera.p95_frame_age_ms)
+            .max()
+            .unwrap_or(0),
         p95_detector_ms: cameras
             .iter()
             .map(|camera| camera.p95_detector_ms)
@@ -460,7 +612,9 @@ fn classify_result(aggregate: &AggregateSummary, cameras: &[CameraReport]) -> St
         return "system-risk".to_string();
     }
     if aggregate.success_rate < 0.99 || aggregate.p95_total_ms >= 5000 {
-        if aggregate.p95_capture_ms >= 3000 && aggregate.p95_detector_ms < 1500 {
+        if (aggregate.p95_capture_ms >= 3000 || aggregate.p95_capture_read_ms >= 3000)
+            && aggregate.p95_detector_ms < 1500
+        {
             return "capture-bottleneck".to_string();
         }
         if aggregate.p95_detector_ms >= 3000 && aggregate.p95_capture_ms < 1500 {
@@ -518,6 +672,7 @@ fn resolve_config(cli: &Cli, manifest: &CameraManifest) -> ResolvedConfig {
         provider,
         no_post: cli.no_post || manifest.no_post.unwrap_or(false),
         local_smoke_bin: cli.local_smoke_bin.clone(),
+        capture: manifest.capture.clone().unwrap_or_default(),
     }
 }
 
@@ -613,13 +768,73 @@ fn default_local_smoke_bin() -> String {
 }
 
 impl CameraSource {
+    fn resolved_capture(
+        &self,
+        config: &ResolvedConfig,
+        camera_index: usize,
+        camera_count: usize,
+    ) -> ResolvedCapture {
+        let camera_capture = self.capture.as_ref();
+        let mode = self
+            .capture_mode
+            .clone()
+            .or_else(|| camera_capture.and_then(|capture| capture.mode.clone()))
+            .or_else(|| config.capture.mode.clone())
+            .unwrap_or_else(|| "oneshot_ffmpeg".to_string());
+        if !matches!(
+            mode.as_str(),
+            "oneshot_ffmpeg" | "persistent_ffmpeg" | "local_restream"
+        ) {
+            fail(&format!(
+                "camera {} capture mode must be oneshot_ffmpeg, persistent_ffmpeg, or local_restream",
+                self.camera_id
+            ));
+        }
+        let interval_ms = config.interval_seconds.max(1).saturating_mul(1000);
+        let auto_phase_ms = if camera_count > 1 {
+            interval_ms.saturating_mul(camera_index as u64) / camera_count as u64
+        } else {
+            0
+        };
+        let phase_offset_ms = self
+            .phase_offset_ms
+            .or_else(|| camera_capture.and_then(|capture| capture.phase_offset_ms))
+            .or_else(|| config.capture.phase_offset_ms)
+            .unwrap_or(auto_phase_ms);
+        let max_frame_age_ms = self
+            .max_frame_age_ms
+            .or_else(|| camera_capture.and_then(|capture| capture.max_frame_age_ms))
+            .or_else(|| config.capture.max_frame_age_ms)
+            .unwrap_or(2500);
+        ResolvedCapture {
+            mode,
+            phase_offset_ms,
+            max_frame_age_ms,
+            source_secret_ref: self
+                .source_secret_ref
+                .clone()
+                .or_else(|| camera_capture.and_then(|capture| capture.source_secret_ref.clone()))
+                .or_else(|| config.capture.source_secret_ref.clone()),
+            capture_root: self
+                .capture_root
+                .clone()
+                .or_else(|| camera_capture.and_then(|capture| capture.capture_root.clone()))
+                .or_else(|| config.capture.capture_root.clone()),
+            decode_backend: self
+                .decode_backend
+                .clone()
+                .or_else(|| camera_capture.and_then(|capture| capture.decode_backend.clone()))
+                .or_else(|| config.capture.decode_backend.clone()),
+        }
+    }
+
     fn source_kind(&self) -> String {
         if let Some(kind) = self.kind.as_deref() {
             return kind.to_string();
         }
         if self.fixture.unwrap_or(false) {
             "fixture".to_string()
-        } else if self.rtsp_url.is_some() {
+        } else if self.rtsp_url.is_some() || self.source_secret_ref.is_some() {
             "rtsp".to_string()
         } else if self.snapshot_url.is_some() {
             "snapshot".to_string()
@@ -634,6 +849,8 @@ impl CameraReport {
         Self {
             camera_id: camera_id.to_string(),
             source_kind: source_kind.to_string(),
+            capture_mode: "unknown".to_string(),
+            phase_offset_ms: 0,
             ok: false,
             child_exit_code: None,
             total: 0,
@@ -645,6 +862,13 @@ impl CameraReport {
             max_total_ms: 0,
             average_capture_ms: 0,
             p95_capture_ms: 0,
+            average_capture_read_ms: 0,
+            p95_capture_read_ms: 0,
+            average_frame_age_ms: 0,
+            p95_frame_age_ms: 0,
+            max_stream_uptime_ms: 0,
+            reconnect_count: 0,
+            decode_backend: None,
             average_detector_ms: 0,
             p95_detector_ms: 0,
             average_event_ingest_ms: 0,
@@ -778,16 +1002,67 @@ mod tests {
                 "durationSeconds": 30,
                 "intervalSeconds": 10,
                 "provider": "cpu",
+                "capture": {"mode": "persistent_ffmpeg", "maxFrameAgeMs": 2500},
                 "cameras": [
-                    {"cameraId": "cam-real", "kind": "real", "rtspUrl": "rtsp://example/redacted"},
-                    {"cameraId": "cam-sim", "kind": "replay", "fixture": true}
+                    {"cameraId": "cam-real", "kind": "real", "sourceSecretRef": "env:CAM_REAL_RTSP"},
+                    {"cameraId": "cam-sim", "kind": "replay", "fixture": true, "capture": {"mode": "oneshot_ffmpeg", "phaseOffsetMs": 2500}}
                 ]
             }"#,
         )
         .expect("manifest parses");
         assert_eq!(manifest.cameras.len(), 2);
         assert_eq!(manifest.cameras[0].camera_id, "cam-real");
+        assert_eq!(
+            manifest.cameras[0].source_secret_ref.as_deref(),
+            Some("env:CAM_REAL_RTSP")
+        );
         assert_eq!(manifest.cameras[1].source_kind(), "replay");
+        assert_eq!(
+            manifest.cameras[1]
+                .capture
+                .as_ref()
+                .and_then(|capture| capture.phase_offset_ms),
+            Some(2500)
+        );
+    }
+
+    #[test]
+    fn default_phase_offsets_stagger_four_cameras() {
+        let config = ResolvedConfig {
+            schema: "test".to_string(),
+            output_dir: PathBuf::from("/tmp/test"),
+            duration_seconds: 30,
+            interval_seconds: 10,
+            beacon_url: "http://127.0.0.1:4174".to_string(),
+            analyzer_command: None,
+            model_path: None,
+            label_path: None,
+            provider: "cpu".to_string(),
+            no_post: true,
+            local_smoke_bin: "harbornavi-k3-local-vision-smoke".to_string(),
+            capture: CaptureSettings::default(),
+        };
+        let camera = CameraSource {
+            camera_id: "cam-3".to_string(),
+            kind: None,
+            rtsp_url: Some("rtsp://example/redacted".to_string()),
+            snapshot_url: None,
+            fixture: None,
+            duration_seconds: None,
+            interval_seconds: None,
+            source_secret_ref: None,
+            capture_mode: None,
+            phase_offset_ms: None,
+            max_frame_age_ms: None,
+            capture_root: None,
+            decode_backend: None,
+            capture: None,
+        };
+
+        assert_eq!(camera.resolved_capture(&config, 0, 4).phase_offset_ms, 0);
+        assert_eq!(camera.resolved_capture(&config, 1, 4).phase_offset_ms, 2500);
+        assert_eq!(camera.resolved_capture(&config, 2, 4).phase_offset_ms, 5000);
+        assert_eq!(camera.resolved_capture(&config, 3, 4).phase_offset_ms, 7500);
     }
 
     #[test]
@@ -818,6 +1093,12 @@ mod tests {
                         "analyze_ms": 10,
                         "event_ingest_ms": 30,
                         "total_ms": 350,
+                        "capture_mode": "persistent_ffmpeg",
+                        "capture_read_ms": 12,
+                        "frame_age_ms": 400,
+                        "stream_uptime_ms": 2000,
+                        "reconnect_count": 0,
+                        "decode_backend": "ffmpeg_sw_persistent",
                         "provider": "cpu",
                         "detection_count": 1,
                         "error": null
@@ -841,6 +1122,8 @@ mod tests {
         .expect("child report parses");
         assert_eq!(report.camera_id, "cam-a");
         assert_eq!(report.runs[0].capture_ms, 100);
+        assert_eq!(report.runs[0].capture_read_ms, Some(12));
+        assert_eq!(report.runs[0].frame_age_ms, Some(400));
     }
 
     #[test]
@@ -853,6 +1136,8 @@ mod tests {
             p95_total_ms: 1200,
             max_total_ms: 2000,
             p95_capture_ms: 700,
+            p95_capture_read_ms: 120,
+            p95_frame_age_ms: 500,
             p95_detector_ms: 300,
             p95_event_ingest_ms: 50,
         };
