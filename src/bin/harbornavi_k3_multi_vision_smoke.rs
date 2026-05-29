@@ -19,6 +19,12 @@ struct Cli {
     provider: Option<String>,
     local_smoke_bin: String,
     no_post: bool,
+    vlm_enrich: bool,
+    vlm_api_base: Option<String>,
+    vlm_model: Option<String>,
+    vlm_api_key: Option<String>,
+    vlm_sample_every: Option<u64>,
+    vlm_max_samples: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,6 +40,15 @@ struct CameraManifest {
     label_path: Option<String>,
     provider: Option<String>,
     no_post: Option<bool>,
+    vlm_enrich: Option<bool>,
+    #[serde(default, alias = "vlm_api_base")]
+    vlm_api_base: Option<String>,
+    #[serde(default, alias = "vlm_model")]
+    vlm_model: Option<String>,
+    #[serde(default, alias = "vlm_sample_every")]
+    vlm_sample_every: Option<u64>,
+    #[serde(default, alias = "vlm_max_samples")]
+    vlm_max_samples: Option<u64>,
     capture: Option<CaptureSettings>,
     cameras: Vec<CameraSource>,
 }
@@ -61,6 +76,12 @@ struct CameraSource {
     #[serde(default, alias = "decode_backend")]
     decode_backend: Option<String>,
     capture: Option<CaptureSettings>,
+    #[serde(default, alias = "vlm_enrich")]
+    vlm_enrich: Option<bool>,
+    #[serde(default, alias = "vlm_sample_every")]
+    vlm_sample_every: Option<u64>,
+    #[serde(default, alias = "vlm_max_samples")]
+    vlm_max_samples: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -103,6 +124,12 @@ struct ResolvedConfig {
     no_post: bool,
     local_smoke_bin: String,
     capture: CaptureSettings,
+    vlm_enrich: bool,
+    vlm_api_base: Option<String>,
+    vlm_model: Option<String>,
+    vlm_api_key: Option<String>,
+    vlm_sample_every: Option<u64>,
+    vlm_max_samples: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,6 +191,9 @@ struct CameraReport {
     p95_event_ingest_ms: u64,
     detection_runs: usize,
     detection_count: usize,
+    vlm_total: usize,
+    vlm_passed: usize,
+    p95_vlm_ms: u64,
     error: Option<String>,
 }
 
@@ -181,6 +211,9 @@ struct AggregateSummary {
     p95_frame_age_ms: u64,
     p95_detector_ms: u64,
     p95_event_ingest_ms: u64,
+    vlm_total: usize,
+    vlm_passed: usize,
+    p95_vlm_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +244,10 @@ struct SingleSmokeRun {
     decode_backend: Option<String>,
     detector_ms: Option<u64>,
     event_ingest_ms: Option<u64>,
+    #[serde(default)]
+    vlm_status: Option<String>,
+    #[serde(default)]
+    vlm_ms: Option<u64>,
     total_ms: u64,
 }
 
@@ -225,6 +262,12 @@ struct SingleSmokeSummary {
     average_event_ingest_ms: u64,
     detection_runs: usize,
     detection_count: usize,
+    #[serde(default)]
+    vlm_total: usize,
+    #[serde(default)]
+    vlm_passed: usize,
+    #[serde(default)]
+    p95_vlm_ms: u64,
 }
 
 fn main() {
@@ -360,6 +403,34 @@ fn run_camera(
     if config.no_post {
         args.push("--no-post".to_string());
     }
+    let vlm_enrich = camera.vlm_enrich.unwrap_or(config.vlm_enrich);
+    if vlm_enrich {
+        args.push("--vlm-enrich".to_string());
+        if let Some(api_base) = config.vlm_api_base.as_deref() {
+            args.push("--vlm-api-base".to_string());
+            args.push(api_base.to_string());
+        }
+        if let Some(model) = config.vlm_model.as_deref() {
+            args.push("--vlm-model".to_string());
+            args.push(model.to_string());
+        }
+        if let Some(api_key) = config.vlm_api_key.as_deref() {
+            args.push("--vlm-api-key".to_string());
+            args.push(api_key.to_string());
+        }
+        let sample_every = camera
+            .vlm_sample_every
+            .or(config.vlm_sample_every)
+            .unwrap_or(30);
+        let max_samples = camera
+            .vlm_max_samples
+            .or(config.vlm_max_samples)
+            .unwrap_or(1);
+        args.push("--vlm-sample-every".to_string());
+        args.push(sample_every.to_string());
+        args.push("--vlm-max-samples".to_string());
+        args.push(max_samples.to_string());
+    }
     if let Some(command) = config.analyzer_command.as_deref() {
         args.push("--analyzer-command".to_string());
         args.push(command.to_string());
@@ -463,6 +534,25 @@ fn summarize_camera_report(
         .iter()
         .filter_map(|run| run.event_ingest_ms)
         .collect::<Vec<_>>();
+    let vlm_values = report
+        .runs
+        .iter()
+        .filter_map(|run| run.vlm_ms)
+        .collect::<Vec<_>>();
+    let vlm_total = report.summary.vlm_total.max(
+        report
+            .runs
+            .iter()
+            .filter(|run| run.vlm_status.is_some())
+            .count(),
+    );
+    let vlm_passed = report.summary.vlm_passed.max(
+        report
+            .runs
+            .iter()
+            .filter(|run| run.vlm_status.as_deref() == Some("active"))
+            .count(),
+    );
     let capture_read_values = report
         .runs
         .iter()
@@ -542,6 +632,9 @@ fn summarize_camera_report(
         p95_event_ingest_ms: p95(&ingest_values),
         detection_runs: report.summary.detection_runs,
         detection_count: report.summary.detection_count,
+        vlm_total,
+        vlm_passed,
+        p95_vlm_ms: report.summary.p95_vlm_ms.max(p95(&vlm_values)),
         error,
     }
 }
@@ -588,6 +681,13 @@ fn summarize_aggregate(cameras: &[CameraReport]) -> AggregateSummary {
         p95_event_ingest_ms: cameras
             .iter()
             .map(|camera| camera.p95_event_ingest_ms)
+            .max()
+            .unwrap_or(0),
+        vlm_total: cameras.iter().map(|camera| camera.vlm_total).sum(),
+        vlm_passed: cameras.iter().map(|camera| camera.vlm_passed).sum(),
+        p95_vlm_ms: cameras
+            .iter()
+            .map(|camera| camera.p95_vlm_ms)
             .max()
             .unwrap_or(0),
     }
@@ -673,6 +773,15 @@ fn resolve_config(cli: &Cli, manifest: &CameraManifest) -> ResolvedConfig {
         no_post: cli.no_post || manifest.no_post.unwrap_or(false),
         local_smoke_bin: cli.local_smoke_bin.clone(),
         capture: manifest.capture.clone().unwrap_or_default(),
+        vlm_enrich: cli.vlm_enrich || manifest.vlm_enrich.unwrap_or(false),
+        vlm_api_base: cli
+            .vlm_api_base
+            .clone()
+            .or_else(|| manifest.vlm_api_base.clone()),
+        vlm_model: cli.vlm_model.clone().or_else(|| manifest.vlm_model.clone()),
+        vlm_api_key: cli.vlm_api_key.clone(),
+        vlm_sample_every: cli.vlm_sample_every.or(manifest.vlm_sample_every),
+        vlm_max_samples: cli.vlm_max_samples.or(manifest.vlm_max_samples),
     }
 }
 
@@ -875,6 +984,9 @@ impl CameraReport {
             p95_event_ingest_ms: 0,
             detection_runs: 0,
             detection_count: 0,
+            vlm_total: 0,
+            vlm_passed: 0,
+            p95_vlm_ms: 0,
             error: Some(sanitize_sensitive(error)),
         }
     }
@@ -900,6 +1012,12 @@ impl Cli {
             provider: None,
             local_smoke_bin: default_local_smoke_bin(),
             no_post: false,
+            vlm_enrich: false,
+            vlm_api_base: None,
+            vlm_model: None,
+            vlm_api_key: std::env::var("HARBORNAVI_VLM_API_KEY").ok(),
+            vlm_sample_every: None,
+            vlm_max_samples: None,
         };
         let mut index = 0usize;
         while index < args.len() {
@@ -942,6 +1060,28 @@ impl Cli {
                 "--local-smoke-bin" => {
                     cli.local_smoke_bin = take_value(&args, &mut index, "--local-smoke-bin")
                 }
+                "--vlm-enrich" => cli.vlm_enrich = true,
+                "--vlm-api-base" => {
+                    cli.vlm_api_base = Some(take_value(&args, &mut index, "--vlm-api-base"))
+                }
+                "--vlm-model" => cli.vlm_model = Some(take_value(&args, &mut index, "--vlm-model")),
+                "--vlm-api-key" => {
+                    cli.vlm_api_key = Some(take_value(&args, &mut index, "--vlm-api-key"))
+                }
+                "--vlm-sample-every" => {
+                    cli.vlm_sample_every = Some(parse_u64(&take_value(
+                        &args,
+                        &mut index,
+                        "--vlm-sample-every",
+                    )))
+                }
+                "--vlm-max-samples" => {
+                    cli.vlm_max_samples = Some(parse_u64(&take_value(
+                        &args,
+                        &mut index,
+                        "--vlm-max-samples",
+                    )))
+                }
                 "--no-post" => cli.no_post = true,
                 "--help" | "-h" => {
                     print_usage();
@@ -974,7 +1114,7 @@ fn parse_u64(value: &str) -> u64 {
 
 fn print_usage() {
     println!(
-        "Usage: harbornavi-k3-multi-vision-smoke --camera-manifest cameras.json [--output-dir PATH] [--duration-seconds N] [--interval-seconds N] [--beacon-url URL] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--local-smoke-bin PATH] [--no-post]"
+        "Usage: harbornavi-k3-multi-vision-smoke --camera-manifest cameras.json [--output-dir PATH] [--duration-seconds N] [--interval-seconds N] [--beacon-url URL] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--local-smoke-bin PATH] [--vlm-enrich] [--vlm-api-base URL] [--vlm-model MODEL] [--vlm-sample-every N] [--vlm-max-samples N] [--no-post]"
     );
 }
 
@@ -1041,6 +1181,12 @@ mod tests {
             no_post: true,
             local_smoke_bin: "harbornavi-k3-local-vision-smoke".to_string(),
             capture: CaptureSettings::default(),
+            vlm_enrich: false,
+            vlm_api_base: None,
+            vlm_model: None,
+            vlm_api_key: None,
+            vlm_sample_every: None,
+            vlm_max_samples: None,
         };
         let camera = CameraSource {
             camera_id: "cam-3".to_string(),
@@ -1057,6 +1203,9 @@ mod tests {
             capture_root: None,
             decode_backend: None,
             capture: None,
+            vlm_enrich: None,
+            vlm_sample_every: None,
+            vlm_max_samples: None,
         };
 
         assert_eq!(camera.resolved_capture(&config, 0, 4).phase_offset_ms, 0);
@@ -1140,6 +1289,7 @@ mod tests {
             p95_frame_age_ms: 500,
             p95_detector_ms: 300,
             p95_event_ingest_ms: 50,
+            ..AggregateSummary::default()
         };
         assert_eq!(classify_result(&pass, &[]), "pass");
         let capture = AggregateSummary {

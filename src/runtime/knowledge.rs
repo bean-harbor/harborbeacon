@@ -667,7 +667,9 @@ fn knowledge_index_service(index_root: Option<&str>) -> Result<KnowledgeIndexSer
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }) else {
-        return Err("请先在 Harbor Assistant 配置 knowledge.index_root，再运行知识库检索。".to_string());
+        return Err(
+            "请先在 Harbor Assistant 配置 knowledge.index_root，再运行知识库检索。".to_string(),
+        );
     };
     KnowledgeIndexService::from_config(KnowledgeIndexConfig::new(PathBuf::from(index_root))?)
 }
@@ -838,7 +840,8 @@ fn resolve_roots(
 
     if roots.is_empty() {
         return Err(
-            "未找到可检索的已配置知识源目录；请先通过 Harbor Assistant 配置并确认目录存在。".to_string(),
+            "未找到可检索的已配置知识源目录；请先通过 Harbor Assistant 配置并确认目录存在。"
+                .to_string(),
         );
     }
 

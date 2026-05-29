@@ -82,7 +82,8 @@ use harborbeacon_local_agent::runtime::task_api::{
 };
 use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
 use harborbeacon_local_agent::runtime::vision_event::{
-    ingest_local_vision_event_default, LocalVisionEvent,
+    ingest_local_vision_event_default, list_recent_local_vision_events_default, LocalVisionEvent,
+    StoredLocalVisionEvent,
 };
 
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
@@ -477,6 +478,13 @@ struct ModelPoliciesResponse {
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 struct FeatureAvailabilityResponse {
     groups: Vec<FeatureAvailabilityGroup>,
+}
+
+#[derive(Debug, Serialize)]
+struct VisionEventsResponse {
+    generated_at: String,
+    limit: usize,
+    events: Vec<StoredLocalVisionEvent>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -1422,6 +1430,9 @@ impl AdminApi {
             Method::Get if path == "/api/feature-availability" => {
                 self.handle_feature_availability(&identity_hints).boxed()
             }
+            Method::Get if path == "/api/vision/events" => self
+                .handle_list_local_vision_events(&raw_url, &identity_hints)
+                .boxed(),
             Method::Post if path == "/api/vision/events" => self
                 .handle_ingest_local_vision_event(&mut request, &identity_hints)
                 .boxed(),
@@ -2742,6 +2753,28 @@ impl AdminApi {
         match ingest_local_vision_event_default(event) {
             Ok(stored) => ok_json(&stored),
             Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_list_local_vision_events(
+        &self,
+        raw_url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let limit = parse_query_param(raw_url, "limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(1, 50))
+            .unwrap_or(10);
+        match list_recent_local_vision_events_default(limit) {
+            Ok(events) => ok_json(&VisionEventsResponse {
+                generated_at: now_unix_string(),
+                limit,
+                events,
+            }),
+            Err(error) => error_json(StatusCode(500), &error),
         }
     }
 

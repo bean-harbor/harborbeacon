@@ -13501,7 +13501,10 @@ mod tests {
 
         assert_eq!(response.status, TaskStatus::Failed);
         assert_eq!(response.executor_used, "knowledge_search_service");
-        assert!(response.result.message.contains("未在 Harbor Assistant 启用"));
+        assert!(response
+            .result
+            .message
+            .contains("未在 Harbor Assistant 启用"));
         assert_eq!(response.result.data["status"], "degraded");
         assert_eq!(response.result.data["degraded"], true);
         assert_eq!(

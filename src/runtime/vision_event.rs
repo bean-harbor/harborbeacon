@@ -1,7 +1,7 @@
 //! Local vision event records for HarborNavi K3 viability testing.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,6 +43,43 @@ pub struct LocalVisionEvent {
     pub latency_ms: u64,
     #[serde(default)]
     pub metrics: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vlm: Option<LocalVisionEventVlmSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct LocalVisionEventVlmSummary {
+    pub status: String,
+    pub summary: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub derived_text: String,
+    #[serde(default)]
+    pub artifacts: Vec<LocalVisionEventArtifact>,
+    #[serde(default)]
+    pub ingest_metadata: Value,
+    #[serde(default)]
+    pub vlm_metrics: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct LocalVisionEventArtifact {
+    #[serde(default)]
+    pub artifact_id: Option<String>,
+    pub role: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub byte_size: Option<u64>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -216,6 +253,7 @@ pub fn analyze_snapshot_file(
         analyzer,
         latency_ms: input.latency_ms.unwrap_or_default(),
         metrics,
+        vlm: None,
     })
 }
 
@@ -261,8 +299,43 @@ pub fn ingest_local_vision_event(
     Ok(stored)
 }
 
+pub fn list_recent_local_vision_events_default(
+    limit: usize,
+) -> Result<Vec<StoredLocalVisionEvent>, String> {
+    list_recent_local_vision_events(&default_vision_event_store_path(), limit)
+}
+
+pub fn list_recent_local_vision_events(
+    store_path: &Path,
+    limit: usize,
+) -> Result<Vec<StoredLocalVisionEvent>, String> {
+    if !store_path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(store_path).map_err(|error| {
+        format!(
+            "failed to open vision event store {}: {error}",
+            store_path.display()
+        )
+    })?;
+    let mut events = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| format!("failed to read vision event store: {error}"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let event = serde_json::from_str::<StoredLocalVisionEvent>(trimmed)
+            .map_err(|error| format!("failed to parse stored local vision event: {error}"))?;
+        events.push(event);
+    }
+    events.reverse();
+    events.truncate(limit.max(1));
+    Ok(events)
+}
+
 pub fn build_ha_mqtt_payload(event: &LocalVisionEvent) -> Value {
-    json!({
+    let mut payload = json!({
         "event_id": event.event_id,
         "camera_id": event.camera_id,
         "event_type": event.event_type,
@@ -279,7 +352,20 @@ pub fn build_ha_mqtt_payload(event: &LocalVisionEvent) -> Value {
             "sha256": event.snapshot_artifact.sha256,
             "source": event.snapshot_artifact.source,
         },
-    })
+    });
+    if let Some(vlm) = event.vlm.as_ref() {
+        payload["vlm"] = json!({
+            "status": vlm.status,
+            "summary": vlm.summary,
+            "tags": vlm.tags,
+            "labels": vlm.labels,
+            "derived_text": vlm.derived_text,
+            "artifacts": vlm.artifacts,
+            "ingest_metadata": vlm.ingest_metadata,
+            "vlm_metrics": vlm.vlm_metrics,
+        });
+    }
+    payload
 }
 
 pub fn validate_local_vision_event(event: &LocalVisionEvent) -> Result<(), String> {
@@ -342,8 +428,93 @@ pub fn classify_local_vision_event(
     (event_type.to_string(), max_confidence, labels)
 }
 
+pub fn attach_vlm_summary_to_event(
+    mut event: LocalVisionEvent,
+    vlm: crate::runtime::model_center::VlmSummaryExecution,
+    elapsed_ms: u64,
+    mut extra_metrics: Value,
+) -> LocalVisionEvent {
+    if !extra_metrics.is_object() {
+        extra_metrics = json!({});
+    }
+    if let Some(map) = extra_metrics.as_object_mut() {
+        map.insert("elapsed_ms".to_string(), json!(elapsed_ms));
+        map.insert("provider_key".to_string(), json!(vlm.provider_key));
+        map.insert(
+            "model_endpoint_id".to_string(),
+            json!(vlm.model_endpoint_id),
+        );
+        map.insert("available".to_string(), json!(vlm.available));
+    }
+    let vlm_text = vlm.text.trim();
+    let available = vlm.available && !vlm_text.is_empty();
+    let status = if available {
+        "active"
+    } else if vlm.status.trim().is_empty() {
+        "degraded"
+    } else {
+        vlm.status.trim()
+    };
+    let summary = if available {
+        sanitize_model_text(vlm_text)
+    } else {
+        event.summary.clone()
+    };
+    let mut tags = vec!["vlm".to_string(), "sampled_event_frame".to_string()];
+    if !available {
+        tags.push("vlm_degraded".to_string());
+    }
+    push_unique_label(&mut tags, &event.event_type);
+    let mut labels = event.labels.clone();
+    push_unique_label(&mut labels, "vlm_summary");
+    if available {
+        push_unique_label(&mut labels, "visual_semantics");
+        event.summary = summary.clone();
+    } else {
+        push_unique_label(&mut labels, "vlm_degraded");
+    }
+    event.labels = labels.clone();
+    let artifact = LocalVisionEventArtifact {
+        artifact_id: event.snapshot_artifact.artifact_id.clone(),
+        role: "sampled_event_frame".to_string(),
+        mime_type: event.snapshot_artifact.mime_type.clone(),
+        byte_size: event.snapshot_artifact.byte_size,
+        sha256: event.snapshot_artifact.sha256.clone(),
+        source: event.snapshot_artifact.source.clone(),
+    };
+    let error = if available {
+        None
+    } else {
+        Some(sanitize_model_text(&vlm.summary))
+    };
+    let vlm_summary = LocalVisionEventVlmSummary {
+        status: status.to_string(),
+        summary: summary.clone(),
+        tags,
+        labels,
+        derived_text: if available { summary } else { String::new() },
+        artifacts: vec![artifact],
+        ingest_metadata: json!({
+            "source": "local_on_demand_vlm",
+            "trigger": "sampled_event_frame",
+            "event_id": event.event_id,
+            "camera_id": event.camera_id,
+            "frame_path_redacted": true,
+            "raw_response_stored": false,
+        }),
+        vlm_metrics: extra_metrics,
+        error,
+    };
+    if let Some(map) = event.metrics.as_object_mut() {
+        map.insert("vlm_status".to_string(), json!(vlm_summary.status.clone()));
+        map.insert("vlm_ms".to_string(), json!(elapsed_ms));
+    }
+    event.vlm = Some(vlm_summary);
+    event
+}
+
 fn build_audit_record(event: &LocalVisionEvent) -> Value {
-    json!({
+    let mut record = json!({
         "audit_kind": "local_vision_event.ingested",
         "event_id": event.event_id,
         "camera_id": event.camera_id,
@@ -354,7 +525,18 @@ fn build_audit_record(event: &LocalVisionEvent) -> Value {
         "latency_ms": event.latency_ms,
         "snapshot_artifact_id": event.snapshot_artifact.artifact_id,
         "snapshot_sha256": event.snapshot_artifact.sha256,
-    })
+    });
+    if let Some(vlm) = event.vlm.as_ref() {
+        record["vlm"] = json!({
+            "status": vlm.status,
+            "summary": vlm.summary,
+            "model_endpoint_id": vlm.vlm_metrics.get("model_endpoint_id"),
+            "provider_key": vlm.vlm_metrics.get("provider_key"),
+            "elapsed_ms": vlm.vlm_metrics.get("elapsed_ms"),
+            "frame_path_redacted": true,
+        });
+    }
+    record
 }
 
 fn summarize_local_vision_event(
@@ -447,6 +629,29 @@ fn reject_sensitive_text(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn sanitize_model_text(text: &str) -> String {
+    let mut sanitized = text.to_string();
+    for needle in [
+        "rtsp://",
+        "ha_token",
+        "home_assistant_token",
+        "camera_credential",
+        "rtsp_username",
+        "rtsp_password",
+        "api_key",
+        "authorization: bearer",
+        "bearer ",
+        "sk-",
+        "private key",
+        "x-amz-signature=",
+        "presigned",
+    ] {
+        sanitized = sanitized.replace(needle, "[redacted]");
+        sanitized = sanitized.replace(&needle.to_ascii_uppercase(), "[redacted]");
+    }
+    sanitized.chars().take(500).collect()
+}
+
 fn infer_image_mime_type(bytes: &[u8]) -> &'static str {
     if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
         "image/jpeg"
@@ -520,6 +725,52 @@ mod tests {
         assert!(stored.audit_record["audit_kind"] == json!("local_vision_event.ingested"));
         assert!(text.contains("local_vision_event.ingested"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_recent_events_returns_newest_first() {
+        let dir = std::env::temp_dir().join(format!("vision-event-list-{}", Uuid::new_v4()));
+        let store = dir.join("events.jsonl");
+        let mut first = sample_event();
+        first.event_id = "event-1".to_string();
+        let mut second = sample_event();
+        second.event_id = "event-2".to_string();
+
+        ingest_local_vision_event(&store, first).expect("ingest first");
+        ingest_local_vision_event(&store, second).expect("ingest second");
+
+        let events = list_recent_local_vision_events(&store, 1).expect("list events");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.event_id, "event-2");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn attach_vlm_summary_adds_structured_fields_without_path() {
+        let event = sample_event();
+        let event = attach_vlm_summary_to_event(
+            event,
+            crate::runtime::model_center::VlmSummaryExecution {
+                available: true,
+                status: "active".to_string(),
+                summary: "ok".to_string(),
+                provider_key: "openai_compatible".to_string(),
+                model_endpoint_id: Some("vlm-local-openai-compatible".to_string()),
+                text: "画面中有一辆蓝色巴士。".to_string(),
+                details: json!({"raw_response": "not persisted"}),
+            },
+            1961,
+            json!({"model_id": "qwen3_5vl_0.8b-text-q41.gguf"}),
+        );
+
+        let vlm = event.vlm.expect("vlm summary");
+        assert_eq!(vlm.status, "active");
+        assert!(vlm.derived_text.contains("蓝色巴士"));
+        assert_eq!(vlm.vlm_metrics["elapsed_ms"], json!(1961));
+        assert_eq!(vlm.ingest_metadata["frame_path_redacted"], json!(true));
+        let text = serde_json::to_string(&vlm).expect("serialize vlm");
+        assert!(!text.contains("/tmp/source.jpg"));
     }
 
     #[test]
@@ -642,6 +893,7 @@ mod tests {
             analyzer: "cpu-snapshot-fallback".to_string(),
             latency_ms: 100,
             metrics: json!({}),
+            vlm: None,
         }
     }
 }

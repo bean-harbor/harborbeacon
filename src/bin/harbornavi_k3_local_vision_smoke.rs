@@ -4,8 +4,14 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
+use harborbeacon_local_agent::connectors::ai_provider::{
+    OpenAiCompatibleConfig, OpenAiCompatibleVisionClient, VisionSummaryRequest,
+};
+use harborbeacon_local_agent::runtime::model_center::VlmSummaryExecution;
 use harborbeacon_local_agent::runtime::vision_event::{
-    analyze_snapshot_file, LocalSnapshotAnalysisInput, LocalVisionAnalyzerResult, LocalVisionEvent,
+    analyze_snapshot_file, attach_vlm_summary_to_event, LocalSnapshotAnalysisInput,
+    LocalVisionAnalyzerResult, LocalVisionEvent,
 };
 use reqwest::blocking::Client;
 use serde::Serialize;
@@ -34,6 +40,13 @@ struct Cli {
     label_path: String,
     provider: String,
     redact_paths: bool,
+    vlm_enrich: bool,
+    vlm_api_base: String,
+    vlm_model: String,
+    vlm_api_key: String,
+    vlm_prompt: String,
+    vlm_sample_every: u64,
+    vlm_max_samples: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +114,9 @@ struct SmokeRun {
     decode_backend: String,
     provider: Option<String>,
     detection_count: Option<usize>,
+    vlm_status: Option<String>,
+    vlm_ms: Option<u64>,
+    vlm_error: Option<String>,
     error: Option<String>,
 }
 
@@ -121,6 +137,11 @@ struct SmokeSummary {
     under_5s: usize,
     detection_runs: usize,
     detection_count: usize,
+    vlm_total: usize,
+    vlm_passed: usize,
+    vlm_degraded: usize,
+    average_vlm_ms: u64,
+    p95_vlm_ms: u64,
 }
 
 fn main() {
@@ -146,6 +167,7 @@ fn main() {
     let mut next_deadline = start + Duration::from_millis(cli.phase_offset_ms);
     let interval = Duration::from_secs(cli.interval_seconds.max(1));
     let mut runs = Vec::new();
+    let mut vlm_sample_count = 0usize;
     let mut iteration = 0usize;
     loop {
         if let Some(end) = end {
@@ -162,6 +184,7 @@ fn main() {
             iteration,
             &runtime_probe,
             capture_worker.as_mut(),
+            &mut vlm_sample_count,
         ));
         if end.is_none() {
             break;
@@ -204,6 +227,7 @@ fn run_once(
     iteration: usize,
     runtime_probe: &Value,
     capture_worker: Option<&mut PersistentCaptureWorker>,
+    vlm_sample_count: &mut usize,
 ) -> SmokeRun {
     let total_started = Instant::now();
     let snapshot_path =
@@ -233,6 +257,9 @@ fn run_once(
                 decode_backend: cli.decode_backend.clone(),
                 provider: None,
                 detection_count: None,
+                vlm_status: None,
+                vlm_ms: None,
+                vlm_error: None,
                 error: Some(error),
             };
         }
@@ -260,6 +287,9 @@ fn run_once(
             decode_backend,
             provider: None,
             detection_count: None,
+            vlm_status: None,
+            vlm_ms: None,
+            vlm_error: None,
             error: Some(error),
         };
     }
@@ -286,6 +316,9 @@ fn run_once(
                 decode_backend,
                 provider: None,
                 detection_count: None,
+                vlm_status: None,
+                vlm_ms: None,
+                vlm_error: None,
                 error: Some(sanitize_sensitive(&error)),
             };
         }
@@ -353,11 +386,43 @@ fn run_once(
                 decode_backend,
                 provider,
                 detection_count,
+                vlm_status: None,
+                vlm_ms: None,
+                vlm_error: None,
                 error: Some(sanitize_sensitive(&error)),
             };
         }
     };
     event.latency_ms = total_started.elapsed().as_millis() as u64;
+    let mut vlm_status = None;
+    let mut vlm_ms = None;
+    let mut vlm_error = None;
+    if should_run_vlm(cli, iteration, detection_count, *vlm_sample_count) {
+        *vlm_sample_count = vlm_sample_count.saturating_add(1);
+        let started = Instant::now();
+        let execution = run_vlm_summary_for_event(cli, &snapshot_path, &event);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        vlm_status = Some(execution.status.clone());
+        vlm_ms = Some(elapsed_ms);
+        if !execution.available {
+            vlm_error = Some(sanitize_sensitive(&execution.summary));
+        }
+        event = attach_vlm_summary_to_event(
+            event,
+            execution,
+            elapsed_ms,
+            json!({
+                "runtime_id": "local-openai-compatible-vlm",
+                "model_id": cli.vlm_model.clone(),
+                "sample_policy": {
+                    "sample_every": cli.vlm_sample_every,
+                    "max_samples": cli.vlm_max_samples,
+                    "sample_index": *vlm_sample_count,
+                }
+            }),
+        );
+        event.latency_ms = total_started.elapsed().as_millis() as u64;
+    }
 
     let ingest_http_status = if cli.no_post {
         None
@@ -391,6 +456,9 @@ fn run_once(
                     decode_backend,
                     provider,
                     detection_count,
+                    vlm_status,
+                    vlm_ms,
+                    vlm_error,
                     error: Some(sanitize_sensitive(&error)),
                 };
             }
@@ -419,12 +487,117 @@ fn run_once(
         decode_backend,
         provider,
         detection_count,
+        vlm_status,
+        vlm_ms,
+        vlm_error,
         error: if ok {
             None
         } else {
             Some("event ingest returned non-200 status".to_string())
         },
     }
+}
+
+fn should_run_vlm(
+    cli: &Cli,
+    iteration: usize,
+    detection_count: Option<usize>,
+    sample_count: usize,
+) -> bool {
+    if !cli.vlm_enrich || sample_count >= cli.vlm_max_samples {
+        return false;
+    }
+    if detection_count.unwrap_or(0) > 0 {
+        return true;
+    }
+    let every = cli.vlm_sample_every.max(1) as usize;
+    iteration == 1 || iteration % every == 0
+}
+
+fn run_vlm_summary_for_event(
+    cli: &Cli,
+    snapshot_path: &Path,
+    event: &LocalVisionEvent,
+) -> VlmSummaryExecution {
+    let image_data_url = match build_image_data_url(snapshot_path) {
+        Ok(value) => value,
+        Err(error) => {
+            return VlmSummaryExecution {
+                available: false,
+                status: "degraded".to_string(),
+                summary: sanitize_sensitive(&error),
+                provider_key: "openai_compatible".to_string(),
+                model_endpoint_id: Some("vlm-local-openai-compatible".to_string()),
+                text: String::new(),
+                details: json!({}),
+            };
+        }
+    };
+    let client = match OpenAiCompatibleVisionClient::new(OpenAiCompatibleConfig {
+        base_url: cli.vlm_api_base.trim_end_matches('/').to_string(),
+        api_key: cli.vlm_api_key.clone(),
+        model: cli.vlm_model.clone(),
+    }) {
+        Ok(client) => client,
+        Err(error) => {
+            return VlmSummaryExecution {
+                available: false,
+                status: "degraded".to_string(),
+                summary: sanitize_sensitive(&error),
+                provider_key: "openai_compatible".to_string(),
+                model_endpoint_id: Some("vlm-local-openai-compatible".to_string()),
+                text: String::new(),
+                details: json!({}),
+            };
+        }
+    };
+    let detection_summary = format!(
+        "event_type={} confidence={:.3} labels={} detector_summary={}",
+        event.event_type,
+        event.confidence,
+        event.labels.join(","),
+        event.summary
+    );
+    match client.describe_frame(&VisionSummaryRequest {
+        image_data_url,
+        detection_summary,
+        user_prompt: Some(cli.vlm_prompt.clone()),
+    }) {
+        Ok(response) => VlmSummaryExecution {
+            available: true,
+            status: "active".to_string(),
+            summary: "VLM summary extracted from sampled event frame.".to_string(),
+            provider_key: "openai_compatible".to_string(),
+            model_endpoint_id: Some("vlm-local-openai-compatible".to_string()),
+            text: response.summary,
+            details: json!({
+                "raw_response": response.raw_response,
+            }),
+        },
+        Err(error) => VlmSummaryExecution {
+            available: false,
+            status: "degraded".to_string(),
+            summary: sanitize_sensitive(&format!("VLM request failed: {error}")),
+            provider_key: "openai_compatible".to_string(),
+            model_endpoint_id: Some("vlm-local-openai-compatible".to_string()),
+            text: String::new(),
+            details: json!({}),
+        },
+    }
+}
+
+fn build_image_data_url(path: &Path) -> Result<String, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("failed to read sampled VLM frame: {error}"))?;
+    let mime = if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else {
+        return Err("sampled VLM frame is not JPEG or PNG".to_string());
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
 }
 
 fn create_capture_worker(cli: &Cli) -> Result<Option<PersistentCaptureWorker>, String> {
@@ -911,6 +1084,12 @@ fn summarize_runs(runs: &[SmokeRun]) -> SmokeSummary {
         .iter()
         .filter_map(|run| run.frame_age_ms)
         .collect::<Vec<_>>();
+    let vlm_values = runs.iter().filter_map(|run| run.vlm_ms).collect::<Vec<_>>();
+    let vlm_total = runs.iter().filter(|run| run.vlm_status.is_some()).count();
+    let vlm_passed = runs
+        .iter()
+        .filter(|run| run.vlm_status.as_deref() == Some("active"))
+        .count();
     let detection_count = runs
         .iter()
         .filter_map(|run| run.detection_count)
@@ -935,6 +1114,11 @@ fn summarize_runs(runs: &[SmokeRun]) -> SmokeSummary {
         under_5s: runs.iter().filter(|run| run.total_ms < 5000).count(),
         detection_runs: detector_values.len(),
         detection_count,
+        vlm_total,
+        vlm_passed,
+        vlm_degraded: vlm_total.saturating_sub(vlm_passed),
+        average_vlm_ms: average_u64(&vlm_values),
+        p95_vlm_ms: p95(&vlm_values),
     }
 }
 
@@ -1032,6 +1216,27 @@ impl Cli {
             provider: std::env::var("HARBOR_K3_YOLO_PROVIDER")
                 .unwrap_or_else(|_| "cpu".to_string()),
             redact_paths: false,
+            vlm_enrich: std::env::var("HARBORNAVI_VLM_ENRICH")
+                .ok()
+                .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
+            vlm_api_base: std::env::var("HARBORNAVI_VLM_API_BASE")
+                .unwrap_or_else(|_| "http://127.0.0.1:8080/v1".to_string()),
+            vlm_model: std::env::var("HARBORNAVI_VLM_MODEL")
+                .unwrap_or_else(|_| "qwen3_5vl_0.8b-text-q41.gguf".to_string()),
+            vlm_api_key: std::env::var("HARBORNAVI_VLM_API_KEY")
+                .unwrap_or_else(|_| "local".to_string()),
+            vlm_prompt: std::env::var("HARBORNAVI_VLM_PROMPT").unwrap_or_else(|_| {
+                "请根据这张家庭摄像头关键帧，用中文输出一句家庭事件摘要，重点说明是否有人、宠物、车辆或异常活动。".to_string()
+            }),
+            vlm_sample_every: std::env::var("HARBORNAVI_VLM_SAMPLE_EVERY")
+                .ok()
+                .map(|value| parse_u64(&value))
+                .unwrap_or(30),
+            vlm_max_samples: std::env::var("HARBORNAVI_VLM_MAX_SAMPLES")
+                .ok()
+                .map(|value| parse_u64(&value) as usize)
+                .unwrap_or(1),
         };
         let mut index = 0usize;
         while index < args.len() {
@@ -1093,6 +1298,21 @@ impl Cli {
                 "--no-post" => cli.no_post = true,
                 "--fixture" => cli.fixture = true,
                 "--redact-paths" => cli.redact_paths = true,
+                "--vlm-enrich" => cli.vlm_enrich = true,
+                "--vlm-api-base" => {
+                    cli.vlm_api_base = take_value(&args, &mut index, "--vlm-api-base")
+                }
+                "--vlm-model" => cli.vlm_model = take_value(&args, &mut index, "--vlm-model"),
+                "--vlm-api-key" => cli.vlm_api_key = take_value(&args, &mut index, "--vlm-api-key"),
+                "--vlm-prompt" => cli.vlm_prompt = take_value(&args, &mut index, "--vlm-prompt"),
+                "--vlm-sample-every" => {
+                    cli.vlm_sample_every =
+                        parse_u64(&take_value(&args, &mut index, "--vlm-sample-every"))
+                }
+                "--vlm-max-samples" => {
+                    cli.vlm_max_samples =
+                        parse_u64(&take_value(&args, &mut index, "--vlm-max-samples")) as usize
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -1130,7 +1350,7 @@ fn parse_u64(value: &str) -> u64 {
 
 fn print_usage() {
     println!(
-        "Usage: harbornavi-k3-local-vision-smoke [--camera-id ID] [--rtsp-url URL | --source-secret-ref env:VAR | --snapshot-url URL | --fixture] [--duration-seconds N] [--interval-seconds N] [--phase-offset-ms N] [--capture-mode oneshot_ffmpeg|persistent_ffmpeg|local_restream] [--capture-root PATH] [--max-frame-age-ms N] [--decode-backend NAME] [--beacon-url URL] [--output-dir PATH] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--disable-analyzer] [--no-post] [--redact-paths]"
+        "Usage: harbornavi-k3-local-vision-smoke [--camera-id ID] [--rtsp-url URL | --source-secret-ref env:VAR | --snapshot-url URL | --fixture] [--duration-seconds N] [--interval-seconds N] [--phase-offset-ms N] [--capture-mode oneshot_ffmpeg|persistent_ffmpeg|local_restream] [--capture-root PATH] [--max-frame-age-ms N] [--decode-backend NAME] [--beacon-url URL] [--output-dir PATH] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--disable-analyzer] [--vlm-enrich] [--vlm-api-base URL] [--vlm-model MODEL] [--vlm-sample-every N] [--vlm-max-samples N] [--no-post] [--redact-paths]"
     );
 }
 
