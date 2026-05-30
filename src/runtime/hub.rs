@@ -215,8 +215,7 @@ impl CameraHubService {
         }
         defaults = sanitize_defaults(defaults);
         let state = self.admin_store.save_defaults(defaults)?;
-        let scan_credentials =
-            rtsp_scan_credentials(&state.defaults, rtsp_username, rtsp_password);
+        let scan_credentials = rtsp_scan_credentials(&state.defaults, rtsp_username, rtsp_password);
 
         let protocols = resolve_discovery_protocols(&state.defaults.discovery);
         if protocols.iter().any(|p| {
@@ -412,7 +411,8 @@ impl CameraHubService {
                     .as_deref()
                     .is_some_and(looks_like_auth_error);
             let has_password = probe_request.password.is_some();
-            let can_register = probe.reachable && can_register_rtsp_scan_result(requires_auth, has_password);
+            let can_register =
+                probe.reachable && can_register_rtsp_scan_result(requires_auth, has_password);
 
             if can_register {
                 let stream_url = probe
@@ -458,7 +458,8 @@ impl CameraHubService {
                     rtsp_paths: path_candidates.clone(),
                 });
             } else {
-                let auth_note = "摄像头需要密码。请输入用户名/密码后重新扫描，或用“手动添加”接入。".to_string();
+                let auth_note =
+                    "摄像头需要密码。请输入用户名/密码后重新扫描，或用“手动添加”接入。".to_string();
                 results.push(HubScanResultItem {
                     candidate_id: probe_request.candidate_id.clone(),
                     device_id: existing.as_ref().map(|device| device.device_id.clone()),
@@ -885,9 +886,7 @@ fn rtsp_scan_credentials(
             .as_deref()
             .and_then(non_empty_opt)
             .or_else(|| non_empty_opt(&defaults.rtsp_username)),
-        password: password
-            .as_deref()
-            .and_then(non_empty_opt),
+        password: password.as_deref().and_then(non_empty_opt),
     }
 }
 
@@ -988,10 +987,10 @@ fn normalize_network(network: Ipv4Addr, prefix: u8) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::{
-        can_register_rtsp_scan_result, rtsp_scan_credentials, AdminDefaults,
         bridge_provider_status_from_gateway_response, build_mobile_setup_url,
-        effective_rtsp_path_candidates, humanize_probe_error, looks_like_auth_error, merge_camera,
-        normalize_camera_metadata, resolve_discovery_protocols,
+        can_register_rtsp_scan_result, effective_rtsp_path_candidates, humanize_probe_error,
+        looks_like_auth_error, merge_camera, normalize_camera_metadata,
+        resolve_discovery_protocols, rtsp_scan_credentials, AdminDefaults,
     };
     use crate::connectors::im_gateway::{GatewayPlatformCapabilities, GatewayPlatformStatus};
     use crate::runtime::registry::{CameraDevice, StreamTransport};
@@ -1041,7 +1040,10 @@ mod tests {
             Some("admin".to_string()),
             Some("fresh-secret".to_string()),
         );
-        assert_eq!(with_explicit_password.password.as_deref(), Some("fresh-secret"));
+        assert_eq!(
+            with_explicit_password.password.as_deref(),
+            Some("fresh-secret")
+        );
     }
 
     #[test]

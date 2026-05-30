@@ -49,6 +49,14 @@ name = "benchmark-local-model-backend"
 path = "src/bin/benchmark_local_model_backend.rs"
 
 [[bin]]
+name = "harbornavi-k3-local-vision-smoke"
+path = "src/bin/harbornavi_k3_local_vision_smoke.rs"
+
+[[bin]]
+name = "harbornavi-k3-multi-vision-smoke"
+path = "src/bin/harbornavi_k3_multi_vision_smoke.rs"
+
+[[bin]]
 name = "fibonacci"
 path = "src/bin/fibonacci.rs"
 

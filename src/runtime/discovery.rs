@@ -169,8 +169,8 @@ impl DiscoveryService {
                 let result = self.rtsp.probe(&probe_request)?;
                 probe_results.push(result.clone());
                 if can_promote_probe_result(&result, request) {
-                    if let Some(device) =
-                        result.into_camera_device(candidate, format!("cam-{}", candidate.candidate_id))
+                    if let Some(device) = result
+                        .into_camera_device(candidate, format!("cam-{}", candidate.candidate_id))
                     {
                         connected_snapshot
                             .upsert_camera_devices_preserving_platform_records(&[device]);
