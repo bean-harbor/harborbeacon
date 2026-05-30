@@ -39,6 +39,7 @@ export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_RISCV64GC
 cargo build --release --target "$target" --bin harboros-beacon
 cargo build --release --target "$target" --bin harbornavi-k3-local-vision-smoke
 cargo build --release --target "$target" --bin harbornavi-k3-multi-vision-smoke
+cargo build --release --target "$target" --bin harbornavi-ha-mqtt-event-contract-smoke
 
 rm -rf "$build_root"
 mkdir -p "$pkg_dir/DEBIAN"
@@ -50,7 +51,8 @@ mkdir -p "$pkg_dir/usr/share/doc/harboros-beacon"
 cp "target/${target}/release/harboros-beacon" "$pkg_dir/usr/bin/harboros-beacon"
 cp "target/${target}/release/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke"
 cp "target/${target}/release/harbornavi-k3-multi-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-multi-vision-smoke"
-chmod 0755 "$pkg_dir/usr/bin/harboros-beacon" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-multi-vision-smoke"
+cp "target/${target}/release/harbornavi-ha-mqtt-event-contract-smoke" "$pkg_dir/usr/bin/harbornavi-ha-mqtt-event-contract-smoke"
+chmod 0755 "$pkg_dir/usr/bin/harboros-beacon" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-multi-vision-smoke" "$pkg_dir/usr/bin/harbornavi-ha-mqtt-event-contract-smoke"
 cp scripts/harbornavi_k3_yolov8_analyzer.py "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
 chmod 0755 "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
 
@@ -77,6 +79,7 @@ deb_arch=${deb_arch}
 analyzer=/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py
 single_runner=/usr/bin/harbornavi-k3-local-vision-smoke
 multi_runner=/usr/bin/harbornavi-k3-multi-vision-smoke
+ha_mqtt_runner=/usr/bin/harbornavi-ha-mqtt-event-contract-smoke
 default_model=/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx
 default_labels=/var/lib/harboros-beacon/models/label.txt
 capture_modes=oneshot_ffmpeg,persistent_ffmpeg,local_restream
