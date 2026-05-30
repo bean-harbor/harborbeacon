@@ -140,6 +140,12 @@ pub struct LocalVisionNotificationIntent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LocalVisionHaMqttContract {
+    pub payload: Value,
+    pub audit_record: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LocalSnapshotAnalysisInput {
     pub camera_id: String,
     pub snapshot_path: PathBuf,
@@ -346,37 +352,69 @@ pub fn list_recent_local_vision_events(
 }
 
 pub fn build_ha_mqtt_payload(event: &LocalVisionEvent) -> Value {
-    let mut payload = json!({
+    json!({
         "event_id": event.event_id,
         "camera_id": event.camera_id,
         "event_type": event.event_type,
         "confidence": event.confidence,
         "labels": event.labels,
-        "summary": event.summary,
+        "summary": local_vision_automation_summary(event),
         "started_at": event.started_at,
         "latency_ms": event.latency_ms,
         "analyzer": event.analyzer,
-        "snapshot_artifact": {
-            "artifact_id": event.snapshot_artifact.artifact_id,
-            "mime_type": event.snapshot_artifact.mime_type,
-            "byte_size": event.snapshot_artifact.byte_size,
-            "sha256": event.snapshot_artifact.sha256,
-            "source": event.snapshot_artifact.source,
-        },
-    });
-    if let Some(vlm) = event.vlm.as_ref() {
-        payload["vlm"] = json!({
-            "status": vlm.status,
-            "summary": vlm.summary,
-            "tags": vlm.tags,
-            "labels": vlm.labels,
-            "derived_text": vlm.derived_text,
-            "artifacts": vlm.artifacts,
-            "ingest_metadata": vlm.ingest_metadata,
-            "vlm_metrics": vlm.vlm_metrics,
-        });
+        "vlm_status": local_vision_vlm_status(event),
+    })
+}
+
+pub fn build_local_vision_ha_mqtt_contract(
+    stored: &StoredLocalVisionEvent,
+) -> Result<LocalVisionHaMqttContract, String> {
+    validate_local_vision_event(&stored.event)?;
+    let payload = build_ha_mqtt_payload(&stored.event);
+    validate_ha_mqtt_payload(&payload)?;
+    Ok(LocalVisionHaMqttContract {
+        audit_record: build_local_vision_ha_mqtt_audit(stored, &payload),
+        payload,
+    })
+}
+
+pub fn validate_ha_mqtt_payload(payload: &Value) -> Result<(), String> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "HA/MQTT local vision payload must be a JSON object".to_string())?;
+    let required = [
+        "event_id",
+        "camera_id",
+        "event_type",
+        "confidence",
+        "labels",
+        "summary",
+        "started_at",
+        "analyzer",
+        "latency_ms",
+        "vlm_status",
+    ];
+    for key in required {
+        if !object.contains_key(key) {
+            return Err(format!("HA/MQTT local vision payload missing {key}"));
+        }
     }
-    payload
+    for key in object.keys() {
+        if !required.contains(&key.as_str()) {
+            return Err(format!(
+                "HA/MQTT local vision payload contains non-contract field {key}"
+            ));
+        }
+    }
+    if !matches!(
+        payload.get("event_type").and_then(Value::as_str),
+        Some("person_detected" | "pet_detected" | "vehicle_detected" | "motion_like_scene")
+    ) {
+        return Err("HA/MQTT local vision payload has unsupported event_type".to_string());
+    }
+    reject_sensitive_value(payload)?;
+    reject_local_path_value(payload)?;
+    Ok(())
 }
 
 pub fn build_local_vision_notification_intent(
@@ -495,6 +533,21 @@ fn build_local_vision_notification_audit(
     })
 }
 
+fn build_local_vision_ha_mqtt_audit(stored: &StoredLocalVisionEvent, payload: &Value) -> Value {
+    json!({
+        "audit_kind": "local_vision_event.ha_mqtt_payload_built",
+        "event_id": stored.event.event_id,
+        "camera_id": stored.event.camera_id,
+        "event_type": stored.event.event_type,
+        "classification": "p1_ha_mqtt_event_contract",
+        "metadata_only": true,
+        "secret_scan": "clean",
+        "raw_image_included": false,
+        "local_paths_included": false,
+        "payload_fields": payload.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+    })
+}
+
 fn local_vision_notification_title(event: &LocalVisionEvent) -> String {
     match event.event_type.as_str() {
         "person_detected" => "HarborNavi 人员事件".to_string(),
@@ -518,6 +571,10 @@ fn local_vision_notification_body(event: &LocalVisionEvent) -> String {
 }
 
 fn local_vision_notification_summary(event: &LocalVisionEvent) -> String {
+    local_vision_automation_summary(event)
+}
+
+fn local_vision_automation_summary(event: &LocalVisionEvent) -> String {
     if let Some(vlm) = event.vlm.as_ref() {
         if vlm.status == "active" && !vlm.summary.trim().is_empty() {
             return sanitize_model_text(vlm.summary.trim());
@@ -527,6 +584,21 @@ fn local_vision_notification_summary(event: &LocalVisionEvent) -> String {
         }
     }
     sanitize_model_text(event.summary.trim())
+}
+
+fn local_vision_vlm_status(event: &LocalVisionEvent) -> String {
+    event
+        .vlm
+        .as_ref()
+        .map(|vlm| {
+            let status = vlm.status.trim();
+            if status.is_empty() {
+                "degraded".to_string()
+            } else {
+                status.to_string()
+            }
+        })
+        .unwrap_or_else(|| "not_sampled".to_string())
 }
 
 fn local_vision_event_type_label(event_type: &str) -> &'static str {
@@ -937,8 +1009,10 @@ mod tests {
         let text = serde_json::to_string(&payload).expect("serialize payload");
 
         assert!(!text.contains("/tmp/source.jpg"));
+        assert!(payload.get("snapshot_artifact").is_none());
         assert_eq!(payload["camera_id"], json!("cam-1"));
-        assert_eq!(payload["snapshot_artifact"]["sha256"], json!("abc123"));
+        assert_eq!(payload["vlm_status"], json!("not_sampled"));
+        validate_ha_mqtt_payload(&payload).expect("valid HA/MQTT payload");
     }
 
     #[test]
@@ -1087,6 +1161,115 @@ mod tests {
         );
         assert_eq!(event.metrics["detector_command_latency_ms"], json!(120));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ha_mqtt_payload_supports_p1_event_types_as_metadata_only() {
+        for event_type in [
+            "person_detected",
+            "pet_detected",
+            "vehicle_detected",
+            "motion_like_scene",
+        ] {
+            let mut event = sample_event();
+            event.event_type = event_type.to_string();
+            event.summary = format!("summary for {event_type}");
+            let stored = sample_stored_event(event);
+
+            let contract = build_local_vision_ha_mqtt_contract(&stored).expect("HA/MQTT contract");
+            let payload = contract.payload;
+            let keys = payload
+                .as_object()
+                .expect("payload object")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+
+            assert_eq!(payload["event_type"], json!(event_type));
+            assert_eq!(payload["camera_id"], json!("cam-1"));
+            assert_eq!(payload["vlm_status"], json!("not_sampled"));
+            assert_eq!(keys.len(), 10);
+            assert!(payload.get("snapshot_artifact").is_none());
+            assert!(payload.get("vlm").is_none());
+            assert_eq!(
+                contract.audit_record["audit_kind"],
+                json!("local_vision_event.ha_mqtt_payload_built")
+            );
+            assert_eq!(contract.audit_record["metadata_only"], json!(true));
+        }
+    }
+
+    #[test]
+    fn ha_mqtt_payload_uses_active_vlm_summary_but_omits_vlm_artifacts() {
+        let mut event = sample_event();
+        event.vlm = Some(LocalVisionEventVlmSummary {
+            status: "active".to_string(),
+            summary: "画面中有人从门口经过。".to_string(),
+            tags: vec!["person".to_string()],
+            labels: vec!["person".to_string()],
+            derived_text: "画面中有人从门口经过。".to_string(),
+            artifacts: vec![LocalVisionEventArtifact {
+                artifact_id: Some("artifact-sensitive-frame".to_string()),
+                role: "sampled_event_frame".to_string(),
+                mime_type: Some("image/jpeg".to_string()),
+                byte_size: Some(123),
+                sha256: Some("abc".to_string()),
+                source: Some("k3-local-snapshot".to_string()),
+            }],
+            ingest_metadata: json!({"frame_path_redacted": true}),
+            vlm_metrics: json!({"elapsed_ms": 1800}),
+            error: None,
+        });
+
+        let payload = build_ha_mqtt_payload(&event);
+        let text = serde_json::to_string(&payload).expect("serialize payload");
+
+        assert_eq!(payload["summary"], json!("画面中有人从门口经过。"));
+        assert_eq!(payload["vlm_status"], json!("active"));
+        assert!(!text.contains("artifact-sensitive-frame"));
+        assert!(!text.contains("elapsed_ms"));
+        validate_ha_mqtt_payload(&payload).expect("valid HA/MQTT payload");
+    }
+
+    #[test]
+    fn ha_mqtt_payload_degraded_vlm_does_not_block_base_event() {
+        let mut event = sample_event();
+        event.event_type = "pet_detected".to_string();
+        event.summary = "K3 本地视觉检测到宠物活动。".to_string();
+        event.vlm = Some(LocalVisionEventVlmSummary {
+            status: "degraded".to_string(),
+            summary: "VLM unavailable".to_string(),
+            tags: Vec::new(),
+            labels: Vec::new(),
+            derived_text: String::new(),
+            artifacts: Vec::new(),
+            ingest_metadata: json!({}),
+            vlm_metrics: json!({}),
+            error: Some("timeout".to_string()),
+        });
+
+        let payload = build_ha_mqtt_payload(&event);
+
+        assert_eq!(payload["event_type"], json!("pet_detected"));
+        assert_eq!(payload["summary"], json!("K3 本地视觉检测到宠物活动。"));
+        assert_eq!(payload["vlm_status"], json!("degraded"));
+        validate_ha_mqtt_payload(&payload).expect("valid HA/MQTT payload");
+    }
+
+    #[test]
+    fn ha_mqtt_payload_rejects_non_contract_fields_and_sensitive_text() {
+        let mut payload = build_ha_mqtt_payload(&sample_event());
+        payload["debug_path"] = json!("/tmp/source.jpg");
+
+        let error = validate_ha_mqtt_payload(&payload).expect_err("extra field must fail");
+
+        assert!(error.contains("non-contract field"));
+
+        let mut payload = build_ha_mqtt_payload(&sample_event());
+        payload["summary"] = json!("camera rtsp://user:pass@192.168.3.231/stream2");
+
+        let error = validate_ha_mqtt_payload(&payload).expect_err("secret must fail");
+        assert!(error.contains("sensitive") || error.contains("URL credentials"));
     }
 
     #[test]
