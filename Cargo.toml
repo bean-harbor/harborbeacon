@@ -65,6 +65,10 @@ name = "harbornavi-ha-mqtt-event-contract-smoke"
 path = "src/bin/harbornavi_ha_mqtt_event_contract_smoke.rs"
 
 [[bin]]
+name = "harbornavi-family-summary-audit-smoke"
+path = "src/bin/harbornavi_family_summary_audit_smoke.rs"
+
+[[bin]]
 name = "fibonacci"
 path = "src/bin/fibonacci.rs"
 
