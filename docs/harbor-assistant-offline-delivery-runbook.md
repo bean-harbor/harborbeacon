@@ -1,6 +1,7 @@
 # HarborAssistant Offline Delivery Runbook
 
-Status: package-ready, live install blocked by target reachability.
+Status: package-ready; artifacts staged on `.82`; live deb install blocked by
+TrueNAS rootfs protection and active `/usr` system extensions.
 
 Artifact id: `harborassistant-live-solidify-20260529`
 Version: `20260529+harborassistant.live.solidify`
@@ -8,20 +9,58 @@ Builder output:
 `/home/harbor-innovations/artifacts/harborassistant-live-solidify-20260529/output`
 on build host `192.168.1.197`.
 
-## Current Blocker
+## Current Blockers
 
-HarborOS `.82` is not currently reachable from the builder path.
+### Builder path
 
-Observed from `.197` on 2026-05-30:
+HarborOS `.82` is reachable from the workstation, but it is still not reachable
+from the builder path. Workstation relay staging is possible, but `.197 -> .82`
+is not a valid direct deploy path yet.
+
+Observed from `.197` on 2026-05-30 at 20:27 CST:
 
 - route: `192.168.3.82 via 192.168.1.1 dev enp11s0 src 192.168.1.197`
-- ping: 3 sent, 0 received
+- ping: 2 sent, 0 received
 - TCP: `22`, `80`, `443`, `4174`, and `8787` all timed out
-- SSH jump channel from local -> `.197` -> `.82:22` timed out
+- HTTP `80` returned `000` from curl after timeout
 
-Do not install the solidified packages until at least SSH `22` is reachable
-from `.197` or another confirmed jump host. HTTP `80` should also be reachable
-before claiming WebUI live acceptance.
+### Package install guard
+
+The verified artifacts were staged on `.82` under:
+
+```text
+/var/tmp/harborassistant-live-solidify-20260529/
+```
+
+`sha256sum -c SHA256SUMS` passed on `.82` for all four artifacts. Rollback
+evidence was created before install under:
+
+```text
+/var/backups/harborassistant-live-solidify-20260529/20260530-203627/
+```
+
+The install did not modify packages because the first `dpkg -i` exited before
+unpacking:
+
+```text
+Package management tools are disabled on TrueNAS appliances.
+```
+
+On this target, `/usr/local/bin/dpkg` points to `pkg_mgmt_disabled`, root and
+`/usr` ZFS datasets are `readonly=on`, and `/usr` is overlaid by systemd-sysext
+extensions: `amd-xrt-npu`, `intel-bmg-firmware`, and `nvidia`. This matches the
+known `.82` package-management constraint recorded on 2026-05-12.
+
+Do not run `disable-rootfs-protection`, unmerge system extensions, chmod the
+real `dpkg`, or manually extract deb payloads as a normal HarborAssistant deploy
+step. Choose one of these before the next install attempt:
+
+- build a HarborOS ISO/update/boot-environment artifact that installs the debs
+  into the image;
+- schedule an explicit rootfs-protection maintenance step for `.82`, including
+  sysext impact and rollback;
+- keep the current live hotfix only as rollback evidence while the package path
+  is fixed upstream.
 
 ## Artifact Evidence
 
@@ -64,7 +103,7 @@ bash scripts/verify_harborassistant_offline_delivery.sh \
 
 This gate does not contact `.82`.
 
-## Install Sequence When `.82` Returns
+## Install Sequence When `.82` Is Package-Writable
 
 Use the target registry before any live action. Confirm the HarborOS target and
 credentials for the day, then transfer only the verified artifacts from `.197`
@@ -83,7 +122,16 @@ cd /var/tmp/harborassistant-live-solidify-20260529
 sha256sum -c SHA256SUMS
 dpkg-query -W harboros-beacon harboros-im-gate truenas-webui || true
 systemctl is-active nginx harboros-beacon.service harboros-im-gate.service || true
+findmnt -T / -o TARGET,SOURCE,FSTYPE,OPTIONS
+findmnt -T /usr -o TARGET,SOURCE,FSTYPE,OPTIONS
+systemd-sysext status || true
+command -v dpkg
+ls -l "$(command -v dpkg)" /usr/bin/dpkg
 ```
+
+Continue with `dpkg -i` only when the target is intentionally package-writable.
+If `command -v dpkg` resolves to `/usr/local/bin/dpkg -> pkg_mgmt_disabled`,
+stop and fix the delivery path instead of extracting debs by hand.
 
 Create rollback evidence before installing:
 
