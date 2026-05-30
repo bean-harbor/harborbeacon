@@ -8,26 +8,39 @@
   "modelPath": "/var/lib/harboros-beacon/models/yolov8n_192x320.q.onnx",
   "labelPath": "/var/lib/harboros-beacon/models/label.txt",
   "provider": "cpu",
+  "vlmEnrich": false,
+  "vlmApiBase": "http://127.0.0.1:8080/v1",
+  "vlmModel": "qwen3_5vl_0.8b-text-q41.gguf",
+  "vlmSampleEvery": 30,
+  "vlmMaxSamples": 3,
+  "capture": {
+    "mode": "persistent_ffmpeg",
+    "maxFrameAgeMs": 2500,
+    "decodeBackend": "ffmpeg_sw_persistent"
+  },
   "cameras": [
     {
       "cameraId": "cam-real-231",
       "kind": "real",
-      "rtspUrl": "rtsp://<user>:<password>@192.168.3.231:554/stream2"
+      "sourceSecretRef": "env:CAM_REAL_231_RTSP",
+      "vlmEnrich": true,
+      "vlmSampleEvery": 30,
+      "vlmMaxSamples": 3
     },
     {
       "cameraId": "cam-sim-1",
       "kind": "replay",
-      "rtspUrl": "rtsp://192.168.3.82:8554/p1-sim-1"
+      "sourceSecretRef": "env:CAM_SIM_1_RTSP"
     },
     {
       "cameraId": "cam-sim-2",
       "kind": "replay",
-      "rtspUrl": "rtsp://192.168.3.82:8554/p1-sim-2"
+      "sourceSecretRef": "env:CAM_SIM_2_RTSP"
     },
     {
       "cameraId": "cam-sim-3",
       "kind": "replay",
-      "rtspUrl": "rtsp://192.168.3.82:8554/p1-sim-3"
+      "sourceSecretRef": "env:CAM_SIM_3_RTSP"
     }
   ]
 }
