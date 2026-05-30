@@ -146,6 +146,26 @@ pub struct LocalVisionHaMqttContract {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FamilyEventSummary {
+    pub event_id: String,
+    pub camera_id: String,
+    pub event_type: String,
+    pub title: String,
+    pub summary: String,
+    pub confidence: f32,
+    pub labels: Vec<String>,
+    pub source: String,
+    pub vlm_status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LocalVisionFamilySummary {
+    pub summary: FamilyEventSummary,
+    pub audit_record: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LocalSnapshotAnalysisInput {
     pub camera_id: String,
     pub snapshot_path: PathBuf,
@@ -417,6 +437,60 @@ pub fn validate_ha_mqtt_payload(payload: &Value) -> Result<(), String> {
     Ok(())
 }
 
+pub fn build_local_vision_family_summary(
+    stored: &StoredLocalVisionEvent,
+) -> Result<LocalVisionFamilySummary, String> {
+    validate_local_vision_event(&stored.event)?;
+    let event = &stored.event;
+    let (source, summary_text) = local_vision_family_summary_text(event)?;
+    let summary = FamilyEventSummary {
+        event_id: event.event_id.clone(),
+        camera_id: event.camera_id.clone(),
+        event_type: event.event_type.clone(),
+        title: local_vision_family_title(&event.event_type),
+        summary: summary_text,
+        confidence: event.confidence,
+        labels: event.labels.clone(),
+        source: source.to_string(),
+        vlm_status: local_vision_vlm_status(event),
+        created_at: now_epoch_ms_string(),
+    };
+    validate_family_event_summary(&summary)?;
+    Ok(LocalVisionFamilySummary {
+        audit_record: build_local_vision_family_summary_audit(stored, &summary),
+        summary,
+    })
+}
+
+pub fn validate_family_event_summary(summary: &FamilyEventSummary) -> Result<(), String> {
+    if summary.event_id.trim().is_empty() {
+        return Err("family event summary requires event_id".to_string());
+    }
+    if summary.camera_id.trim().is_empty() {
+        return Err("family event summary requires camera_id".to_string());
+    }
+    if summary.event_type.trim().is_empty() {
+        return Err("family event summary requires event_type".to_string());
+    }
+    if summary.title.trim().is_empty() {
+        return Err("family event summary requires title".to_string());
+    }
+    if summary.summary.trim().is_empty() {
+        return Err("family event summary requires summary".to_string());
+    }
+    if !(0.0..=1.0).contains(&summary.confidence) {
+        return Err("family event summary confidence must be between 0 and 1".to_string());
+    }
+    if !matches!(summary.source.as_str(), "yolo" | "vlm" | "degraded") {
+        return Err("family event summary has unsupported source".to_string());
+    }
+    let payload = serde_json::to_value(summary)
+        .map_err(|error| format!("failed to inspect family event summary: {error}"))?;
+    reject_sensitive_value(&payload)?;
+    reject_local_path_value(&payload)?;
+    Ok(())
+}
+
 pub fn build_local_vision_notification_intent(
     stored: &StoredLocalVisionEvent,
     route_key: &str,
@@ -548,6 +622,25 @@ fn build_local_vision_ha_mqtt_audit(stored: &StoredLocalVisionEvent, payload: &V
     })
 }
 
+fn build_local_vision_family_summary_audit(
+    stored: &StoredLocalVisionEvent,
+    summary: &FamilyEventSummary,
+) -> Value {
+    json!({
+        "audit_kind": "local_vision_event.family_summary_built",
+        "event_id": stored.event.event_id,
+        "camera_id": stored.event.camera_id,
+        "event_type": stored.event.event_type,
+        "summary_source": summary.source,
+        "metadata_only": true,
+        "secret_scan": "clean",
+        "raw_image_included": false,
+        "local_paths_included": false,
+        "vlm_status": summary.vlm_status,
+        "classification": "p1_family_summary_audit",
+    })
+}
+
 fn local_vision_notification_title(event: &LocalVisionEvent) -> String {
     match event.event_type.as_str() {
         "person_detected" => "HarborNavi 人员事件".to_string(),
@@ -584,6 +677,34 @@ fn local_vision_automation_summary(event: &LocalVisionEvent) -> String {
         }
     }
     sanitize_model_text(event.summary.trim())
+}
+
+fn local_vision_family_summary_text(
+    event: &LocalVisionEvent,
+) -> Result<(&'static str, String), String> {
+    if let Some(vlm) = event.vlm.as_ref() {
+        if vlm.status == "active" && !vlm.summary.trim().is_empty() {
+            reject_sensitive_text(vlm.summary.trim())?;
+            reject_local_path_text(vlm.summary.trim())?;
+            return Ok(("vlm", sanitize_model_text(vlm.summary.trim())));
+        }
+        reject_sensitive_text(event.summary.trim())?;
+        reject_local_path_text(event.summary.trim())?;
+        return Ok(("degraded", sanitize_model_text(event.summary.trim())));
+    }
+    reject_sensitive_text(event.summary.trim())?;
+    reject_local_path_text(event.summary.trim())?;
+    Ok(("yolo", sanitize_model_text(event.summary.trim())))
+}
+
+fn local_vision_family_title(event_type: &str) -> String {
+    match event_type {
+        "person_detected" => "有人活动".to_string(),
+        "pet_detected" => "宠物活动".to_string(),
+        "vehicle_detected" => "车辆活动".to_string(),
+        "motion_like_scene" => "画面变化".to_string(),
+        _ => "家庭事件".to_string(),
+    }
 }
 
 fn local_vision_vlm_status(event: &LocalVisionEvent) -> String {
@@ -1269,6 +1390,114 @@ mod tests {
         payload["summary"] = json!("camera rtsp://user:pass@192.168.3.231/stream2");
 
         let error = validate_ha_mqtt_payload(&payload).expect_err("secret must fail");
+        assert!(error.contains("sensitive") || error.contains("URL credentials"));
+    }
+
+    #[test]
+    fn family_summary_supports_p1_event_types_as_chinese_metadata() {
+        let cases = [
+            ("person_detected", "有人活动"),
+            ("pet_detected", "宠物活动"),
+            ("vehicle_detected", "车辆活动"),
+            ("motion_like_scene", "画面变化"),
+        ];
+        for (event_type, title) in cases {
+            let mut event = sample_event();
+            event.event_type = event_type.to_string();
+            event.summary = format!("家庭可读摘要 {event_type}");
+            let stored = sample_stored_event(event);
+
+            let built = build_local_vision_family_summary(&stored).expect("family summary/audit");
+            let text = serde_json::to_string(&built).expect("serialize family summary");
+
+            assert_eq!(built.summary.event_type, event_type);
+            assert_eq!(built.summary.title, title);
+            assert_eq!(built.summary.source, "yolo");
+            assert_eq!(built.summary.vlm_status, "not_sampled");
+            assert!(built.summary.summary.contains("家庭可读摘要"));
+            assert_eq!(
+                built.audit_record["audit_kind"],
+                json!("local_vision_event.family_summary_built")
+            );
+            assert_eq!(built.audit_record["summary_source"], json!("yolo"));
+            assert_eq!(built.audit_record["metadata_only"], json!(true));
+            assert_eq!(built.audit_record["secret_scan"], json!("clean"));
+            assert!(!text.contains("/tmp/source.jpg"));
+            assert!(!text.contains("snapshot_artifact"));
+            validate_family_event_summary(&built.summary).expect("valid family summary");
+        }
+    }
+
+    #[test]
+    fn family_summary_prefers_active_vlm_summary() {
+        let mut event = sample_event();
+        event.event_type = "person_detected".to_string();
+        event.summary = "K3 本地视觉检测到人员活动。".to_string();
+        event.vlm = Some(LocalVisionEventVlmSummary {
+            status: "active".to_string(),
+            summary: "VLM 看到有人在门口停留。".to_string(),
+            tags: vec!["person".to_string()],
+            labels: vec!["person".to_string()],
+            derived_text: "VLM 看到有人在门口停留。".to_string(),
+            artifacts: Vec::new(),
+            ingest_metadata: json!({"frame_path_redacted": true}),
+            vlm_metrics: json!({"elapsed_ms": 1800}),
+            error: None,
+        });
+        let stored = sample_stored_event(event);
+
+        let built = build_local_vision_family_summary(&stored).expect("family summary/audit");
+
+        assert_eq!(built.summary.source, "vlm");
+        assert_eq!(built.summary.vlm_status, "active");
+        assert_eq!(built.summary.summary, "VLM 看到有人在门口停留。");
+        assert_eq!(built.audit_record["summary_source"], json!("vlm"));
+    }
+
+    #[test]
+    fn family_summary_degraded_vlm_falls_back_to_event_summary() {
+        let mut event = sample_event();
+        event.event_type = "pet_detected".to_string();
+        event.summary = "K3 本地视觉检测到宠物活动。".to_string();
+        event.vlm = Some(LocalVisionEventVlmSummary {
+            status: "degraded".to_string(),
+            summary: "VLM timeout".to_string(),
+            tags: Vec::new(),
+            labels: Vec::new(),
+            derived_text: String::new(),
+            artifacts: Vec::new(),
+            ingest_metadata: json!({}),
+            vlm_metrics: json!({}),
+            error: Some("timeout".to_string()),
+        });
+        let stored = sample_stored_event(event);
+
+        let built = build_local_vision_family_summary(&stored).expect("family summary/audit");
+
+        assert_eq!(built.summary.source, "degraded");
+        assert_eq!(built.summary.vlm_status, "degraded");
+        assert_eq!(built.summary.summary, "K3 本地视觉检测到宠物活动。");
+        assert_eq!(built.audit_record["summary_source"], json!("degraded"));
+    }
+
+    #[test]
+    fn family_summary_rejects_sensitive_or_local_path_text() {
+        let mut event = sample_event();
+        event.summary = "调试帧在 /tmp/source.jpg".to_string();
+        let stored = sample_stored_event(event);
+
+        let error =
+            build_local_vision_family_summary(&stored).expect_err("local path summary must fail");
+
+        assert!(error.contains("local path"));
+
+        let mut event = sample_event();
+        event.summary = "camera rtsp://user:pass@192.168.3.231/stream2".to_string();
+        let stored = sample_stored_event(event);
+
+        let error =
+            build_local_vision_family_summary(&stored).expect_err("sensitive summary must fail");
+
         assert!(error.contains("sensitive") || error.contains("URL credentials"));
     }
 
