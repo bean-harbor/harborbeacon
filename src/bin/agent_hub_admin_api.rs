@@ -46,10 +46,10 @@ use harborbeacon_local_agent::runtime::admin_console::{
     device_rtsp_credential_id, harboros_writable_root, normalize_delivery_surface,
     path_is_same_or_inside, user_default_delivery_surface, user_recent_interactive_surface,
     validate_knowledge_settings, AccountManagementSnapshot, AdminConsoleState, AdminConsoleStore,
-    AdminDefaults, AdminModelCenterState, BridgeProviderConfig, DeviceCredentialSecret,
-    DeviceEvidenceRecord, GatewayStatusSummary, HomeAssistantAdminState, HomeAssistantConfigUpdate,
-    KnowledgeIndexJobRecord, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
-    ModelRuntimeRecord, RagResourceProfile,
+    AdminDefaults, AdminModelCenterState, AutomationRuleReviewPayload, AutomationRuleReviewRecord,
+    BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord, GatewayStatusSummary,
+    HomeAssistantAdminState, HomeAssistantConfigUpdate, KnowledgeIndexJobRecord, KnowledgeSettings,
+    KnowledgeSourceRoot, ModelDownloadJobRecord, ModelRuntimeRecord, RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::discovery::RtspProbeRequest;
 use harborbeacon_local_agent::runtime::dvr::{
@@ -87,6 +87,8 @@ use harborbeacon_local_agent::runtime::vision_event::{
 };
 
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
+const SEMANTIC_ROUTER_ENDPOINT_ID: &str = "semantic-router-local-cpu";
+const SEMANTIC_ROUTER_BOOTSTRAP_MODEL_ID: &str = "Qwen/Qwen2.5-0.5B-Instruct";
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -386,6 +388,13 @@ struct HomeAssistantSyncResponse {
     status: HomeAssistantStatusResponse,
     entities: Vec<HomeAssistantEntity>,
     service_domains: Vec<HomeAssistantServiceDomain>,
+}
+
+#[derive(Debug, Serialize)]
+struct AutomationReviewsResponse {
+    generated_at: String,
+    pending_count: usize,
+    reviews: Vec<AutomationRuleReviewRecord>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1405,6 +1414,15 @@ impl AdminApi {
                 .boxed(),
             Method::Post if path == "/api/harboros/apps/home-assistant/install" => self
                 .handle_home_assistant_install(&mut request, &identity_hints)
+                .boxed(),
+            Method::Get if path == "/api/automation/reviews" => {
+                self.handle_automation_reviews(&identity_hints).boxed()
+            }
+            Method::Post if path == "/api/automation/reviews" => self
+                .handle_create_automation_review(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post if path.starts_with("/api/automation/reviews/") => self
+                .handle_update_automation_review(path.as_str(), &identity_hints)
                 .boxed(),
             Method::Get if path == "/api/models/endpoints" => {
                 self.handle_model_endpoints(&identity_hints).boxed()
@@ -2499,6 +2517,58 @@ impl AdminApi {
         }
     }
 
+    fn handle_automation_reviews(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.automation_reviews() {
+            Ok(reviews) => ok_json(&build_automation_reviews_response(reviews)),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_create_automation_review(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let payload: AutomationRuleReviewPayload = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        match self.admin_store.create_automation_review(payload) {
+            Ok(reviews) => ok_json(&build_automation_reviews_response(reviews)),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_update_automation_review(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let Some((review_id, status)) = parse_automation_review_action_path(path) else {
+            return error_json(StatusCode(404), "automation review route not found");
+        };
+        match self
+            .admin_store
+            .update_automation_review_status(&review_id, &status)
+        {
+            Ok(reviews) => ok_json(&build_automation_reviews_response(reviews)),
+            Err(error) if error.contains("not found") => error_json(StatusCode(404), &error),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
     fn handle_home_assistant_install_status(
         &self,
         hints: &AccessIdentityHints,
@@ -3057,6 +3127,12 @@ impl AdminApi {
             Some(capability_id) => capability_id,
             None => return error_json(StatusCode(400), "invalid model capability selection path"),
         };
+        if capability_id == "semantic_router" {
+            return error_json(
+                StatusCode(422),
+                "semantic_router is fixed to the bundled CPU Candle bootstrap runtime",
+            );
+        }
         let body: ModelCapabilitySelectionRequest = match read_json_body(request) {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
@@ -3079,6 +3155,12 @@ impl AdminApi {
         capability_id: &str,
         model_id: &str,
     ) -> Result<(), String> {
+        if capability_id.trim() == "semantic_router" {
+            return Err(
+                "semantic_router 已固定到内置 CPU Candle bootstrap runtime，不能选择其他模型"
+                    .to_string(),
+            );
+        }
         let Some(capability_model_kind) = model_kind_for_capability(capability_id) else {
             return Ok(());
         };
@@ -5230,6 +5312,23 @@ fn parse_notification_target_delete_path(path: &str) -> Option<String> {
     }
 }
 
+fn parse_automation_review_action_path(path: &str) -> Option<(String, String)> {
+    let trimmed = path.strip_prefix("/api/automation/reviews/")?.trim();
+    let (review_id, action) = trimmed.split_once('/')?;
+    if review_id.trim().is_empty() || action.contains('/') {
+        return None;
+    }
+    let status = match action {
+        "enable" => "active",
+        "pause" => "paused",
+        "discard" => "discarded",
+        _ => return None,
+    };
+    percent_decode_path_segment(review_id.trim())
+        .ok()
+        .map(|review_id| (review_id, status.to_string()))
+}
+
 fn parse_model_endpoint_path(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/models/endpoints/")?;
     if trimmed.trim().is_empty() || trimmed.ends_with("/test") {
@@ -6329,6 +6428,8 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/harboros/apps/home-assistant/status"
         || path == "/api/harboros/apps/home-assistant/install-plan"
         || path == "/api/harboros/apps/home-assistant/install"
+        || path == "/api/automation/reviews"
+        || path.starts_with("/api/automation/reviews/")
         || path == "/api/models/endpoints"
         || path == "/api/models/capabilities"
         || path == "/api/models/runtimes"
@@ -8799,6 +8900,20 @@ fn build_home_assistant_status_response(
     }
 }
 
+fn build_automation_reviews_response(
+    reviews: Vec<AutomationRuleReviewRecord>,
+) -> AutomationReviewsResponse {
+    let pending_count = reviews
+        .iter()
+        .filter(|review| matches!(review.status.as_str(), "draft" | "pending"))
+        .count();
+    AutomationReviewsResponse {
+        generated_at: now_unix_string(),
+        pending_count,
+        reviews,
+    }
+}
+
 fn home_assistant_client_from_state(
     state: &HomeAssistantAdminState,
 ) -> Result<HomeAssistantClient, String> {
@@ -9545,15 +9660,20 @@ fn build_model_capability_status(
     runtime: &LocalModelRuntimeProjection,
     runtime_bound: bool,
 ) -> ModelCapabilityStatus {
+    let fixed_semantic_router = capability_id == "semantic_router";
     let endpoint = select_model_endpoint(
         endpoints,
-        preferred_endpoint_id_for_model_kind(model_kind),
+        preferred_endpoint_id_for_capability(capability_id, model_kind),
         model_kind,
     );
-    let runtime_ready = model_capability_runtime_ready(model_kind, runtime, runtime_bound);
-    let selected_model_id = selected_model_id_for_capability(model_state, capability_id);
+    let selected_model_id = if fixed_semantic_router {
+        Some(SEMANTIC_ROUTER_BOOTSTRAP_MODEL_ID.to_string())
+    } else {
+        selected_model_id_for_capability(model_state, capability_id)
+    };
     let installable_models = catalog_models
         .iter()
+        .filter(|_| !fixed_semantic_router)
         .filter(|model| {
             model.installable
                 && catalog_model_matches_kind_or_capability(model, model_kind, capability_id)
@@ -9565,7 +9685,11 @@ fn build_model_capability_status(
         .iter()
         .filter(|model| {
             model.installed
-                && catalog_model_matches_kind_or_capability(model, model_kind, capability_id)
+                && if fixed_semantic_router {
+                    model.model_id == SEMANTIC_ROUTER_BOOTSTRAP_MODEL_ID
+                } else {
+                    catalog_model_matches_kind_or_capability(model, model_kind, capability_id)
+                }
         })
         .map(model_capability_installable_model)
         .collect::<Vec<_>>();
@@ -9573,6 +9697,9 @@ fn build_model_capability_status(
         &download_jobs
             .iter()
             .filter(|job| {
+                if fixed_semantic_router {
+                    return job.model_id == SEMANTIC_ROUTER_BOOTSTRAP_MODEL_ID;
+                }
                 job.metadata
                     .get("capability_id")
                     .and_then(Value::as_str)
@@ -9602,7 +9729,11 @@ fn build_model_capability_status(
         .or_else(|| {
             catalog_models.iter().find(|model| {
                 model.installed
-                    && catalog_model_matches_kind_or_capability(model, model_kind, capability_id)
+                    && if fixed_semantic_router {
+                        model.model_id == SEMANTIC_ROUTER_BOOTSTRAP_MODEL_ID
+                    } else {
+                        catalog_model_matches_kind_or_capability(model, model_kind, capability_id)
+                    }
             })
         });
     let selected_external_model =
@@ -9632,6 +9763,17 @@ fn build_model_capability_status(
         .map(|status| status.next_action.clone());
     let runtime_missing = required_runtime_profile.is_some() && !runtime_installed;
     let endpoint_ready = endpoint.is_some_and(|value| value.status == ModelEndpointStatus::Active);
+    let base_runtime_ready = model_capability_runtime_ready(model_kind, runtime, runtime_bound);
+    let runtime_ready = if fixed_semantic_router {
+        base_runtime_ready
+            && runtime
+                .backend_kind
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("candle"))
+            && installed_model.is_some()
+    } else {
+        base_runtime_ready
+    };
     let ready = if runtime_bound {
         runtime_ready
     } else {
@@ -9645,6 +9787,8 @@ fn build_model_capability_status(
         "downloading"
     } else if runtime_missing {
         "needs_runtime"
+    } else if fixed_semantic_router && endpoint.is_some() {
+        "degraded"
     } else if installed_model.is_some() {
         "installed_not_running"
     } else if runtime_installed {
@@ -9661,14 +9805,22 @@ fn build_model_capability_status(
         .then(|| {
             endpoint.map(|endpoint| ModelCapabilityCurrentModel {
                 model_endpoint_id: endpoint.model_endpoint_id.clone(),
-                model_name: runtime_model_name_for_kind(model_kind, runtime)
-                    .unwrap_or_else(|| endpoint.model_name.clone()),
+                model_name: if fixed_semantic_router {
+                    endpoint.model_name.clone()
+                } else {
+                    runtime_model_name_for_kind(model_kind, runtime)
+                        .unwrap_or_else(|| endpoint.model_name.clone())
+                },
                 provider_key: endpoint.provider_key.clone(),
                 status: endpoint.status.as_str().to_string(),
             })
         })
         .flatten();
-    let runtime_model_id = runtime_model_name_for_kind(model_kind, runtime);
+    let runtime_model_id = if fixed_semantic_router {
+        endpoint.map(|endpoint| endpoint.model_name.clone())
+    } else {
+        runtime_model_name_for_kind(model_kind, runtime)
+    };
     let policy = find_route_policy(route_policies, route_policy_id);
     let next_action = match status.as_str() {
         "ready" => "可以使用".to_string(),
@@ -9678,6 +9830,9 @@ fn build_model_capability_status(
             .unwrap_or_else(|| "安装 Harbor-managed runtime".to_string()),
         "installed_not_running" => "模型已安装，点击选择会自动切换并启动".to_string(),
         "unsupported" => "暂不支持该能力".to_string(),
+        "degraded" if fixed_semantic_router => runtime.error.clone().unwrap_or_else(|| {
+            "检查 Harbor-managed Candle CPU bootstrap runtime 或内置模型文件".to_string()
+        }),
         "degraded" => runtime
             .error
             .clone()
@@ -9690,6 +9845,11 @@ fn build_model_capability_status(
         format!("runtime_bound={runtime_bound}"),
         format!("runtime_ready={runtime_ready}"),
     ];
+    if fixed_semantic_router {
+        evidence.push("fixed_capability=semantic_router".to_string());
+        evidence.push("cpu_only=true".to_string());
+        evidence.push("fallback=none".to_string());
+    }
     if let Some(profile) = required_runtime_profile {
         evidence.push(format!("required_runtime_profile={profile}"));
     }
@@ -10229,6 +10389,13 @@ fn preferred_endpoint_id_for_model_kind(kind: ModelKind) -> &'static str {
         ModelKind::Asr => "asr-local",
         ModelKind::Detector => "detector-local",
         ModelKind::Embedder => "embed-local-openai-compatible",
+    }
+}
+
+fn preferred_endpoint_id_for_capability(capability_id: &str, kind: ModelKind) -> &'static str {
+    match capability_id.trim() {
+        "semantic_router" => SEMANTIC_ROUTER_ENDPOINT_ID,
+        _ => preferred_endpoint_id_for_model_kind(kind),
     }
 }
 
@@ -12168,6 +12335,7 @@ fn overlay_model_endpoints_with_runtime_truth(
             let mut overlayed = endpoint.clone();
             let original_status = overlayed.status;
             let mut projection_mismatch = false;
+            let fixed_semantic_router = overlayed.model_endpoint_id == SEMANTIC_ROUTER_ENDPOINT_ID;
 
             if let Some(default_endpoint) = builtin_defaults.get(&overlayed.model_endpoint_id) {
                 if is_builtin_local_openai_endpoint(default_endpoint) {
@@ -12276,9 +12444,20 @@ fn overlay_model_endpoints_with_runtime_truth(
                             ModelKind::Embedder => runtime.embedding_model.is_some(),
                             _ => false,
                         };
-                        if runtime.ready && runtime.backend_ready && runtime_model_available {
+                        let backend_allowed = !fixed_semantic_router
+                            || runtime
+                                .backend_kind
+                                .as_deref()
+                                .is_some_and(|kind| kind.eq_ignore_ascii_case("candle"));
+                        if runtime.ready
+                            && runtime.backend_ready
+                            && runtime_model_available
+                            && backend_allowed
+                        {
                             overlayed.status = ModelEndpointStatus::Active;
-                        } else if overlayed.status == ModelEndpointStatus::Active {
+                        } else if overlayed.status == ModelEndpointStatus::Active
+                            || fixed_semantic_router
+                        {
                             overlayed.status = ModelEndpointStatus::Degraded;
                         }
                     }
@@ -12774,20 +12953,24 @@ fn select_model_endpoint<'a>(
     preferred_id: &str,
     model_kind: ModelKind,
 ) -> Option<&'a ModelEndpoint> {
-    endpoints
+    let preferred = endpoints
         .iter()
-        .find(|endpoint| endpoint.model_endpoint_id == preferred_id)
-        .or_else(|| {
-            endpoints
-                .iter()
-                .filter(|endpoint| endpoint.model_kind == model_kind)
-                .min_by_key(|endpoint| {
-                    (
-                        model_endpoint_status_rank(endpoint.status),
-                        endpoint.model_endpoint_id.clone(),
-                    )
-                })
-        })
+        .find(|endpoint| endpoint.model_endpoint_id == preferred_id);
+    if preferred_id == SEMANTIC_ROUTER_ENDPOINT_ID {
+        return preferred;
+    }
+    preferred.or_else(|| {
+        endpoints
+            .iter()
+            .filter(|endpoint| endpoint.model_endpoint_id != SEMANTIC_ROUTER_ENDPOINT_ID)
+            .filter(|endpoint| endpoint.model_kind == model_kind)
+            .min_by_key(|endpoint| {
+                (
+                    model_endpoint_status_rank(endpoint.status),
+                    endpoint.model_endpoint_id.clone(),
+                )
+            })
+    })
 }
 
 fn model_endpoint_status_rank(status: ModelEndpointStatus) -> usize {
@@ -13725,12 +13908,12 @@ mod tests {
         model_download_huggingface_endpoint, model_download_huggingface_endpoints,
         model_download_jobs_status, model_hardware_recommendation, model_snapshot_file_allowed,
         normalize_unified_admin_path, overlay_model_endpoints_with_runtime_truth,
-        parse_approval_decision_path, parse_camera_analyze_path, parse_camera_live_page_path,
-        parse_camera_live_stream_path, parse_camera_recording_start_path,
-        parse_camera_recording_stop_path, parse_camera_share_link_path, parse_camera_snapshot_path,
-        parse_camera_task_snapshot_path, parse_device_credential_status_path,
-        parse_device_credentials_path, parse_device_evidence_path,
-        parse_device_metadata_patch_path, parse_device_rtsp_check_path,
+        parse_approval_decision_path, parse_automation_review_action_path,
+        parse_camera_analyze_path, parse_camera_live_page_path, parse_camera_live_stream_path,
+        parse_camera_recording_start_path, parse_camera_recording_stop_path,
+        parse_camera_share_link_path, parse_camera_snapshot_path, parse_camera_task_snapshot_path,
+        parse_device_credential_status_path, parse_device_credentials_path,
+        parse_device_evidence_path, parse_device_metadata_patch_path, parse_device_rtsp_check_path,
         parse_device_validation_run_path, parse_knowledge_index_job_cancel_path,
         parse_member_default_delivery_surface_update_path, parse_member_role_update_path,
         parse_model_download_cancel_path, parse_model_download_job_path, parse_model_endpoint_path,
@@ -13746,7 +13929,8 @@ mod tests {
         run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
         scan_request_task_args, url_encode_path_segment, AdminApi, KnowledgeSearchApiRequest,
         LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
-        ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
+        ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT, SEMANTIC_ROUTER_BOOTSTRAP_MODEL_ID,
+        SEMANTIC_ROUTER_ENDPOINT_ID,
     };
     use harborbeacon_local_agent::control_plane::media::{
         MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
@@ -14473,7 +14657,31 @@ mod tests {
         assert!(is_admin_surface_path(
             "/api/harboros/apps/home-assistant/install"
         ));
+        assert!(is_admin_surface_path("/api/automation/reviews"));
+        assert!(is_admin_surface_path(
+            "/api/automation/reviews/review-1/enable"
+        ));
         assert!(is_admin_surface_path("/api/models/capabilities"));
+    }
+
+    #[test]
+    fn automation_review_action_paths_decode_ids_and_status_actions() {
+        assert_eq!(
+            parse_automation_review_action_path("/api/automation/reviews/review%2F1/enable"),
+            Some(("review/1".to_string(), "active".to_string()))
+        );
+        assert_eq!(
+            parse_automation_review_action_path("/api/automation/reviews/review-1/pause"),
+            Some(("review-1".to_string(), "paused".to_string()))
+        );
+        assert_eq!(
+            parse_automation_review_action_path("/api/automation/reviews/review-1/discard"),
+            Some(("review-1".to_string(), "discarded".to_string()))
+        );
+        assert_eq!(
+            parse_automation_review_action_path("/api/automation/reviews/review-1/delete"),
+            None
+        );
     }
 
     #[test]
@@ -14493,6 +14701,10 @@ mod tests {
         assert_eq!(
             normalize_unified_admin_path("/api/beacon/home-assistant/status"),
             "/api/home-assistant/status"
+        );
+        assert_eq!(
+            normalize_unified_admin_path("/api/beacon/automation/reviews/review-1/enable"),
+            "/api/automation/reviews/review-1/enable"
         );
         assert_eq!(
             normalize_unified_admin_path("/api/beacon/harboros/apps/home-assistant/install"),
@@ -15346,15 +15558,26 @@ mod tests {
             .iter()
             .find(|capability| capability.capability_id == "semantic_router")
             .expect("router capability");
-        assert_eq!(router.status, "needs_model");
+        assert_eq!(router.status, "degraded");
+        assert_eq!(
+            router.selected_model_id.as_deref(),
+            Some(SEMANTIC_ROUTER_BOOTSTRAP_MODEL_ID)
+        );
         assert_eq!(
             router.required_runtime_profile.as_deref(),
             Some("harbor-candle")
         );
         assert!(router.runtime_installed);
         assert!(router.runtime_installable);
-        assert_eq!(router.next_action, "选择或安装模型");
-        assert!(router.current_model.is_none());
+        assert_eq!(router.next_action, "runtime offline");
+        assert!(router.installable_models.is_empty());
+        let current = router.current_model.as_ref().expect("fixed router model");
+        assert_eq!(current.model_endpoint_id, SEMANTIC_ROUTER_ENDPOINT_ID);
+        assert_eq!(current.model_name, SEMANTIC_ROUTER_BOOTSTRAP_MODEL_ID);
+        assert!(router
+            .evidence
+            .iter()
+            .any(|entry| entry == "fixed_capability=semantic_router"));
     }
 
     #[test]
@@ -16592,10 +16815,10 @@ mod tests {
             })
         }));
         api.admin_store
-            .save_model_capability_binding("semantic_router", "qwen2.5-1.5b-instruct")
+            .save_model_capability_binding("retrieval_answer", "qwen2.5-1.5b-instruct")
             .expect("save binding");
 
-        api.activate_selected_model_capability("semantic_router", "qwen2.5-1.5b-instruct")
+        api.activate_selected_model_capability("retrieval_answer", "qwen2.5-1.5b-instruct")
             .expect("activate selected model");
 
         let requests = seen_requests.lock().expect("request lock");
@@ -16677,7 +16900,7 @@ mod tests {
         }));
 
         let error = api
-            .activate_selected_model_capability("semantic_router", "Qwen/Qwen3.5-4B")
+            .activate_selected_model_capability("retrieval_answer", "Qwen/Qwen3.5-4B")
             .expect_err("external runtime model should not be auto-started");
 
         assert!(error.contains("OpenAI-compatible runtime"));
@@ -16687,6 +16910,33 @@ mod tests {
         let _ = fs::remove_file(registry_path);
         let _ = fs::remove_file(conversation_path);
         let _ = fs::remove_dir_all(model_store);
+    }
+
+    #[test]
+    fn semantic_router_model_selection_is_locked_to_cpu_bootstrap() {
+        let registry_path = unique_store_path("harborbeacon-router-select-registry");
+        let admin_path = unique_store_path("harborbeacon-router-select-state");
+        let conversation_path = unique_store_path("harborbeacon-router-select-conversations");
+
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
+        let api = AdminApi::new(
+            admin_store,
+            task_service,
+            PathBuf::from("frontend/harbor-assistant/dist/harbor-assistant"),
+            "http://harborbeacon.local:4174".to_string(),
+        );
+
+        let error = api
+            .activate_selected_model_capability("semantic_router", "qwen2.5-1.5b-instruct")
+            .expect_err("semantic router selection should be locked");
+        assert!(error.contains("CPU Candle bootstrap runtime"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
     }
 
     #[test]

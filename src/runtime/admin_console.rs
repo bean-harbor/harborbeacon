@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -489,7 +490,77 @@ pub struct AdminConsoleState {
     #[serde(default)]
     pub knowledge_index_jobs: Vec<KnowledgeIndexJobRecord>,
     #[serde(default)]
+    pub automation_reviews: Vec<AutomationRuleReviewRecord>,
+    #[serde(default)]
     pub home_assistant: HomeAssistantAdminState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutomationRuleReviewRecord {
+    pub review_id: String,
+    pub workspace_id: String,
+    pub source: String,
+    #[serde(default)]
+    pub source_channel: Option<String>,
+    #[serde(default)]
+    pub source_conversation_id: Option<String>,
+    pub original_prompt: String,
+    pub status: String,
+    #[serde(default)]
+    pub trigger_definition: Option<Value>,
+    #[serde(default)]
+    pub condition_definition: Option<Value>,
+    #[serde(default)]
+    pub action_plan: Option<Value>,
+    #[serde(default)]
+    pub device_refs: Vec<Value>,
+    #[serde(default)]
+    pub risk_level: Option<String>,
+    #[serde(default)]
+    pub requires_approval: bool,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    #[serde(default)]
+    pub run_summaries: Vec<Value>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AutomationRuleReviewPayload {
+    #[serde(default)]
+    pub review_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub source_channel: Option<String>,
+    #[serde(default)]
+    pub source_conversation_id: Option<String>,
+    pub original_prompt: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub trigger_definition: Option<Value>,
+    #[serde(default)]
+    pub condition_definition: Option<Value>,
+    #[serde(default)]
+    pub action_plan: Option<Value>,
+    #[serde(default)]
+    pub device_refs: Vec<Value>,
+    #[serde(default)]
+    pub risk_level: Option<String>,
+    #[serde(default)]
+    pub requires_approval: Option<bool>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -677,6 +748,7 @@ const DEFAULT_POLICY_RETRIEVAL_EMBED: &str = "retrieval.embed";
 const DEFAULT_POLICY_RETRIEVAL_ANSWER: &str = "retrieval.answer";
 const DEFAULT_POLICY_RETRIEVAL_VISION_SUMMARY: &str = "retrieval.vision_summary";
 const DEFAULT_POLICY_SEMANTIC_ROUTER: &str = "semantic.router";
+const DEFAULT_SEMANTIC_ROUTER_ENDPOINT_ID: &str = "semantic-router-local-cpu";
 const DEFAULT_SILICONFLOW_ENDPOINT_ID: &str = "llm-cloud-siliconflow";
 const DEFAULT_SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.cn/v1";
 const DEFAULT_SILICONFLOW_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
@@ -689,6 +761,63 @@ const MODEL_API_BASE_URL_ENV: &str = "HARBOR_MODEL_API_BASE_URL";
 const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
 const DEFAULT_MODEL_API_BASE_URL: &str = "http://127.0.0.1:4174/api/inference/v1";
 const DEFAULT_MODEL_API_TOKEN: &str = "harbor-local-model-token";
+
+fn state_write_target(path: &Path) -> PathBuf {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return path.to_path_buf();
+    };
+    if !metadata.file_type().is_symlink() {
+        return path.to_path_buf();
+    }
+    let Ok(target) = fs::read_link(path) else {
+        return path.to_path_buf();
+    };
+    if target.is_absolute() {
+        target
+    } else {
+        path.parent()
+            .map(|parent| parent.join(&target))
+            .unwrap_or(target)
+    }
+}
+
+fn write_state_atomically(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    let target = state_write_target(path);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("admin-console.json");
+    let tmp_path = target.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let write_result = (|| {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(payload)?;
+        file.sync_all()?;
+        drop(file);
+        match fs::rename(&tmp_path, &target) {
+            Ok(()) => Ok(()),
+            Err(error) if target.exists() => {
+                #[cfg(windows)]
+                {
+                    let _ = error;
+                    fs::remove_file(&target)?;
+                    fs::rename(&tmp_path, &target)
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_result
+}
 
 impl AdminConsoleStore {
     pub fn new(path: impl Into<PathBuf>, registry_store: DeviceRegistryStore) -> Self {
@@ -741,7 +870,7 @@ impl AdminConsoleStore {
                 self.path.display()
             )
         })?;
-        fs::write(&self.path, payload).map_err(|e| {
+        write_state_atomically(&self.path, payload.as_bytes()).map_err(|e| {
             format!(
                 "failed to write admin console state {}: {e}",
                 self.path.display()
@@ -775,6 +904,50 @@ impl AdminConsoleStore {
         let state = self.load_state()?;
         self.save_state(&state)?;
         Ok(state)
+    }
+
+    pub fn automation_reviews(&self) -> Result<Vec<AutomationRuleReviewRecord>, String> {
+        Ok(self.load_or_create_state()?.automation_reviews)
+    }
+
+    pub fn create_automation_review(
+        &self,
+        payload: AutomationRuleReviewPayload,
+    ) -> Result<Vec<AutomationRuleReviewRecord>, String> {
+        let mut state = self.load_or_create_state()?;
+        let review = automation_review_from_payload(payload)?;
+        state.automation_reviews.retain(|existing| {
+            existing.review_id != review.review_id && existing.status != "expired"
+        });
+        state.automation_reviews.insert(0, review);
+        self.save_projected_state(state)
+            .map(|state| state.automation_reviews)
+    }
+
+    pub fn update_automation_review_status(
+        &self,
+        review_id: &str,
+        status: &str,
+    ) -> Result<Vec<AutomationRuleReviewRecord>, String> {
+        let review_id = review_id.trim();
+        if review_id.is_empty() {
+            return Err("review_id is required".to_string());
+        }
+        let status = normalize_automation_review_status(status)
+            .ok_or_else(|| format!("unsupported automation review status: {status}"))?;
+        let mut state = self.load_or_create_state()?;
+        let now = model_test_timestamp();
+        let Some(review) = state
+            .automation_reviews
+            .iter_mut()
+            .find(|review| review.review_id == review_id)
+        else {
+            return Err(format!("automation review not found: {review_id}"));
+        };
+        review.status = status;
+        review.updated_at = Some(now);
+        self.save_projected_state(state)
+            .map(|state| state.automation_reviews)
     }
 
     pub fn home_assistant_state(&self) -> Result<HomeAssistantAdminState, String> {
@@ -2697,14 +2870,49 @@ pub fn sanitize_model_endpoint(mut endpoint: ModelEndpoint) -> Result<ModelEndpo
     endpoint.capability_tags.dedup();
     endpoint.cost_policy = normalize_json_object(endpoint.cost_policy);
     endpoint.metadata = normalize_json_object(endpoint.metadata);
+    normalize_semantic_router_endpoint(&mut endpoint);
     normalize_builtin_local_model_api_endpoint(&mut endpoint);
     Ok(endpoint)
+}
+
+fn normalize_semantic_router_endpoint(endpoint: &mut ModelEndpoint) {
+    if endpoint.model_endpoint_id != DEFAULT_SEMANTIC_ROUTER_ENDPOINT_ID {
+        return;
+    }
+
+    endpoint.model_kind = ModelKind::Llm;
+    endpoint.endpoint_kind = ModelEndpointKind::Local;
+    endpoint.provider_key = "openai_compatible".to_string();
+    endpoint.model_name = "Qwen/Qwen2.5-0.5B-Instruct".to_string();
+    if endpoint.status == ModelEndpointStatus::Disabled {
+        endpoint.status = ModelEndpointStatus::Degraded;
+    }
+    endpoint.capability_tags = vec![
+        "bootstrap".to_string(),
+        "cpu".to_string(),
+        "local_first".to_string(),
+        "semantic_router".to_string(),
+    ];
+
+    set_model_endpoint_metadata_string(endpoint, "capability", "semantic_router".to_string());
+    set_model_endpoint_metadata_string(endpoint, "fixed_capability", "semantic_router".to_string());
+    set_model_endpoint_metadata_string(endpoint, "runtime_profile", "harbor-candle".to_string());
+    set_model_endpoint_metadata_bool(endpoint, "cpu_only", true);
+    set_model_endpoint_metadata_bool(endpoint, "bootstrap_model", true);
+    set_model_endpoint_metadata_string(
+        endpoint,
+        "bootstrap_model_id",
+        "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+    );
+    set_model_endpoint_metadata_bool(endpoint, "selection_locked", true);
 }
 
 fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
     if !matches!(
         endpoint.model_endpoint_id.as_str(),
-        "embed-local-openai-compatible" | "llm-local-openai-compatible"
+        "embed-local-openai-compatible"
+            | "llm-local-openai-compatible"
+            | DEFAULT_SEMANTIC_ROUTER_ENDPOINT_ID
     ) {
         return;
     }
@@ -2976,6 +3184,25 @@ pub fn sanitize_model_route_policy(
         ];
     }
     policy.metadata = normalize_json_object(policy.metadata);
+    if policy.route_policy_id == DEFAULT_POLICY_SEMANTIC_ROUTER {
+        policy.workspace_id = DEFAULT_MODEL_WORKSPACE_ID.to_string();
+        policy.domain_scope = "planning".to_string();
+        policy.modality = "text".to_string();
+        policy.privacy_level = PrivacyLevel::StrictLocal;
+        policy.local_preferred = true;
+        policy.max_cost_per_run = None;
+        policy.fallback_order = vec!["local".to_string()];
+        policy.status = "active".to_string();
+        policy.metadata = json!({
+            "capability": "router",
+            "preferred_endpoint_id": DEFAULT_SEMANTIC_ROUTER_ENDPOINT_ID,
+            "fixed_endpoint_id": DEFAULT_SEMANTIC_ROUTER_ENDPOINT_ID,
+            "fixed_runtime_profile": "harbor-candle",
+            "cloud_fallback": false,
+            "cpu_only": true,
+            "bootstrap_model": true,
+        });
+    }
     Ok(policy)
 }
 
@@ -3026,6 +3253,38 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
             }),
         },
         ModelEndpoint {
+            model_endpoint_id: DEFAULT_SEMANTIC_ROUTER_ENDPOINT_ID.to_string(),
+            workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Llm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+            capability_tags: vec![
+                "bootstrap".to_string(),
+                "cpu".to_string(),
+                "local_first".to_string(),
+                "semantic_router".to_string(),
+            ],
+            cost_policy: json!({"cost_hint": "local_cpu"}),
+            status: ModelEndpointStatus::Degraded,
+            metadata: json!({
+                "builtin": true,
+                "base_url": local_base_url.clone(),
+                "healthz_url": local_healthz_url.clone(),
+                "api_key": local_api_key.clone(),
+                "api_key_configured": true,
+                "capability": "semantic_router",
+                "fixed_capability": "semantic_router",
+                "runtime_profile": "harbor-candle",
+                "runtime_profiles": ["harbor-candle", "harbor-model-api-candle"],
+                "cpu_only": true,
+                "bootstrap_model": true,
+                "bootstrap_model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+                "selection_locked": true,
+            }),
+        },
+        ModelEndpoint {
             model_endpoint_id: "llm-local-openai-compatible".to_string(),
             workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
             provider_account_id: None,
@@ -3071,7 +3330,6 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "api_key_configured": false,
                 "model": DEFAULT_SILICONFLOW_MODEL,
                 "fallback_scope": [
-                    DEFAULT_POLICY_SEMANTIC_ROUTER,
                     DEFAULT_POLICY_RETRIEVAL_ANSWER,
                 ],
                 "secret_redaction": "endpoint_metadata",
@@ -3167,19 +3425,19 @@ pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {
             workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
             domain_scope: "semantic".to_string(),
             modality: "text".to_string(),
-            privacy_level: PrivacyLevel::AllowRedactedCloud,
+            privacy_level: PrivacyLevel::StrictLocal,
             local_preferred: true,
             max_cost_per_run: None,
-            fallback_order: vec![
-                "local".to_string(),
-                "sidecar".to_string(),
-                "cloud".to_string(),
-            ],
+            fallback_order: vec!["local".to_string()],
             status: "active".to_string(),
             metadata: json!({
                 "capability": "router",
-                "cloud_fallback_scope": "semantic_router_only",
-                "redaction_required": true,
+                "preferred_endpoint_id": DEFAULT_SEMANTIC_ROUTER_ENDPOINT_ID,
+                "fixed_endpoint_id": DEFAULT_SEMANTIC_ROUTER_ENDPOINT_ID,
+                "fixed_runtime_profile": "harbor-candle",
+                "cloud_fallback": false,
+                "cpu_only": true,
+                "bootstrap_model": true,
             }),
         },
         ModelRoutePolicy {
@@ -3331,7 +3589,131 @@ fn sanitize_legacy_admin_fields(state: &mut AdminConsoleState) {
     state.models = sanitize_model_center_state(state.models.clone());
     state.knowledge = sanitize_knowledge_settings(state.knowledge.clone());
     state.knowledge_index_jobs = sanitize_knowledge_index_jobs(state.knowledge_index_jobs.clone());
+    state.automation_reviews = sanitize_automation_reviews(state.automation_reviews.clone());
     state.home_assistant = sanitize_home_assistant_state(state.home_assistant.clone());
+}
+
+fn automation_review_from_payload(
+    payload: AutomationRuleReviewPayload,
+) -> Result<AutomationRuleReviewRecord, String> {
+    let original_prompt = payload.original_prompt.trim().to_string();
+    if original_prompt.is_empty() {
+        return Err("original_prompt is required".to_string());
+    }
+    let now = model_test_timestamp();
+    Ok(AutomationRuleReviewRecord {
+        review_id: payload
+            .review_id
+            .as_deref()
+            .and_then(non_empty_opt)
+            .unwrap_or_else(new_automation_review_id),
+        workspace_id: payload
+            .workspace_id
+            .as_deref()
+            .and_then(non_empty_opt)
+            .unwrap_or_else(|| "local".to_string()),
+        source: payload
+            .source
+            .as_deref()
+            .and_then(non_empty_opt)
+            .unwrap_or_else(|| "harbor_assistant_chat".to_string()),
+        source_channel: payload.source_channel.as_deref().and_then(non_empty_opt),
+        source_conversation_id: payload
+            .source_conversation_id
+            .as_deref()
+            .and_then(non_empty_opt),
+        original_prompt,
+        status: payload
+            .status
+            .as_deref()
+            .and_then(normalize_automation_review_status)
+            .unwrap_or_else(|| "pending".to_string()),
+        trigger_definition: non_null_json(payload.trigger_definition),
+        condition_definition: non_null_json(payload.condition_definition),
+        action_plan: non_null_json(payload.action_plan),
+        device_refs: payload.device_refs,
+        risk_level: payload.risk_level.as_deref().and_then(non_empty_opt),
+        requires_approval: payload.requires_approval.unwrap_or(true),
+        created_at: Some(now.clone()),
+        updated_at: Some(now),
+        expires_at: None,
+        rule_id: None,
+        run_summaries: Vec::new(),
+        metadata: non_null_json(payload.metadata),
+    })
+}
+
+fn sanitize_automation_reviews(
+    reviews: Vec<AutomationRuleReviewRecord>,
+) -> Vec<AutomationRuleReviewRecord> {
+    let mut seen = HashSet::new();
+    reviews
+        .into_iter()
+        .filter_map(sanitize_automation_review)
+        .filter(|review| seen.insert(review.review_id.clone()))
+        .collect()
+}
+
+fn sanitize_automation_review(
+    mut review: AutomationRuleReviewRecord,
+) -> Option<AutomationRuleReviewRecord> {
+    review.review_id = non_empty_opt(&review.review_id).unwrap_or_else(new_automation_review_id);
+    review.workspace_id =
+        non_empty_opt(&review.workspace_id).unwrap_or_else(|| "local".to_string());
+    review.source =
+        non_empty_opt(&review.source).unwrap_or_else(|| "harbor_assistant_chat".to_string());
+    review.source_channel = review.source_channel.as_deref().and_then(non_empty_opt);
+    review.source_conversation_id = review
+        .source_conversation_id
+        .as_deref()
+        .and_then(non_empty_opt);
+    review.original_prompt = review.original_prompt.trim().to_string();
+    if review.original_prompt.is_empty() {
+        return None;
+    }
+    review.status =
+        normalize_automation_review_status(&review.status).unwrap_or_else(|| "pending".to_string());
+    review.trigger_definition = non_null_json(review.trigger_definition);
+    review.condition_definition = non_null_json(review.condition_definition);
+    review.action_plan = non_null_json(review.action_plan);
+    review.risk_level = review.risk_level.as_deref().and_then(non_empty_opt);
+    let now = model_test_timestamp();
+    review.created_at = review
+        .created_at
+        .as_deref()
+        .and_then(non_empty_opt)
+        .or_else(|| {
+            review
+                .updated_at
+                .as_deref()
+                .and_then(non_empty_opt)
+                .or_else(|| Some(now.clone()))
+        });
+    review.updated_at = review
+        .updated_at
+        .as_deref()
+        .and_then(non_empty_opt)
+        .or_else(|| review.created_at.clone());
+    review.expires_at = review.expires_at.as_deref().and_then(non_empty_opt);
+    review.rule_id = review.rule_id.as_deref().and_then(non_empty_opt);
+    review.metadata = non_null_json(review.metadata);
+    Some(review)
+}
+
+fn normalize_automation_review_status(status: &str) -> Option<String> {
+    let status = status.trim().to_ascii_lowercase();
+    match status.as_str() {
+        "draft" | "pending" | "active" | "paused" | "discarded" | "expired" => Some(status),
+        _ => None,
+    }
+}
+
+fn new_automation_review_id() -> String {
+    format!("automation-review-{}", Uuid::new_v4().simple())
+}
+
+fn non_null_json(value: Option<Value>) -> Option<Value> {
+    value.filter(|value| !value.is_null())
 }
 
 pub fn default_home_assistant_exposed_domains() -> Vec<String> {
@@ -5224,7 +5606,7 @@ mod tests {
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
     use crate::control_plane::media::RecordingTriggerMode;
     use crate::control_plane::models::{
-        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind,
+        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
     };
     use crate::control_plane::users::{
         Membership, MembershipStatus, RoleKind, UserAccount, UserStatus,
@@ -5240,11 +5622,11 @@ mod tests {
         resolved_identity_binding_records, resolved_remote_view_config,
         sanitize_bridge_provider_config, sanitize_defaults, sanitize_model_center_state,
         user_default_delivery_surface, user_recent_interactive_surface, AdminConsoleStore,
-        AdminDefaults, AdminModelCenterState, BridgeProviderCapabilities, BridgeProviderConfig,
-        DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings,
-        HomeAssistantConfigUpdate, IdentityBindingRecord, KnowledgeSettings, KnowledgeSourceRoot,
-        RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID,
-        LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
+        AdminDefaults, AdminModelCenterState, AutomationRuleReviewPayload,
+        BridgeProviderCapabilities, BridgeProviderConfig, DeviceCredentialSecret,
+        DeviceEvidenceRecord, DvrRecordingSettings, HomeAssistantConfigUpdate,
+        IdentityBindingRecord, KnowledgeSettings, KnowledgeSourceRoot, RemoteViewConfig,
+        BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID, LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -5335,6 +5717,49 @@ mod tests {
             .expect("reload secret ha state");
         assert_eq!(preserved.base_url, "http://ha-new.local:8123");
         assert_eq!(preserved.access_token, "ha-token");
+    }
+
+    #[test]
+    fn automation_reviews_are_created_and_status_updates_persist() {
+        let registry_path = temp_path("registry-automation-reviews");
+        let admin_path = temp_path("admin-automation-reviews");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        let reviews = store
+            .create_automation_review(AutomationRuleReviewPayload {
+                workspace_id: Some("home-1".to_string()),
+                source: Some("harbor_assistant_chat".to_string()),
+                source_channel: Some("HarborAssistant Chat".to_string()),
+                original_prompt: "Turn on hallway lights when motion is detected".to_string(),
+                status: Some("pending".to_string()),
+                trigger_definition: Some(json!({"kind": "motion"})),
+                action_plan: Some(json!({"service": "light.turn_on"})),
+                metadata: Some(json!({"test": true})),
+                ..AutomationRuleReviewPayload::default()
+            })
+            .expect("create review");
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].status, "pending");
+        let review_id = reviews[0].review_id.clone();
+
+        let reviews = store
+            .update_automation_review_status(&review_id, "active")
+            .expect("enable review");
+        assert_eq!(reviews[0].status, "active");
+
+        let reviews = store
+            .update_automation_review_status(&review_id, "paused")
+            .expect("pause review");
+        assert_eq!(reviews[0].status, "paused");
+
+        let reloaded = store.load_or_create_state().expect("reload state");
+        assert_eq!(reloaded.automation_reviews.len(), 1);
+        assert_eq!(reloaded.automation_reviews[0].review_id, review_id);
+        assert_eq!(reloaded.automation_reviews[0].status, "paused");
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
     }
 
     #[test]
@@ -6087,20 +6512,39 @@ mod tests {
             json!("https://api.siliconflow.cn/v1")
         );
         assert_eq!(endpoint.metadata["api_key_configured"], json!(false));
+        assert_eq!(
+            endpoint.metadata["fallback_scope"],
+            json!(["retrieval.answer"])
+        );
+
+        let router_endpoint = endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "semantic-router-local-cpu")
+            .expect("semantic router endpoint");
+        assert_eq!(router_endpoint.model_kind, ModelKind::Llm);
+        assert_eq!(router_endpoint.endpoint_kind, ModelEndpointKind::Local);
+        assert_eq!(router_endpoint.provider_key, "openai_compatible");
+        assert_eq!(router_endpoint.metadata["cpu_only"], json!(true));
+        assert_eq!(router_endpoint.metadata["bootstrap_model"], json!(true));
+        assert_eq!(
+            router_endpoint.metadata["fixed_capability"],
+            json!("semantic_router")
+        );
 
         let policies = default_model_route_policies();
         let router_policy = policies
             .iter()
             .find(|policy| policy.route_policy_id == "semantic.router")
             .expect("semantic router policy");
-        assert_eq!(
-            router_policy.privacy_level,
-            crate::control_plane::models::PrivacyLevel::AllowRedactedCloud
-        );
-        assert!(router_policy
+        assert_eq!(router_policy.privacy_level, PrivacyLevel::StrictLocal);
+        assert!(!router_policy
             .fallback_order
             .iter()
             .any(|kind| kind == "cloud"));
+        assert_eq!(
+            router_policy.metadata["preferred_endpoint_id"],
+            json!("semantic-router-local-cpu")
+        );
 
         let vlm_policy = policies
             .iter()

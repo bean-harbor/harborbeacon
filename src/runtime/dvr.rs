@@ -219,8 +219,6 @@ impl DvrRuntime {
             .arg(&stream_url)
             .arg("-map")
             .arg("0:v:0")
-            .arg("-map")
-            .arg("0:a?")
             .arg("-c")
             .arg("copy")
             .arg("-f")

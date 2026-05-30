@@ -31,6 +31,7 @@ const OCR_POLICY_ID: &str = "retrieval.ocr";
 const EMBED_POLICY_ID: &str = "retrieval.embed";
 const LLM_POLICY_ID: &str = "retrieval.answer";
 const SEMANTIC_ROUTER_POLICY_ID: &str = "semantic.router";
+const SEMANTIC_ROUTER_ENDPOINT_ID: &str = "semantic-router-local-cpu";
 const VLM_POLICY_ID: &str = "retrieval.vision_summary";
 const DEFAULT_ADMIN_STATE_PATH: &str = ".harborbeacon/admin-console.json";
 const DEFAULT_TESSERACT_LANGS: &str = "chi_sim+eng";
@@ -480,16 +481,36 @@ pub fn run_llm_text_with_state_and_options(
     let route_policy_id = llm_route_policy_id(options);
     let candidates = resolve_endpoint_candidates(state, ModelKind::Llm, route_policy_id);
     if candidates.is_empty() {
+        let semantic_router_fixed = route_policy_id == SEMANTIC_ROUTER_POLICY_ID;
         return LlmTextExecution {
             available: false,
-            status: "disabled".to_string(),
-            summary: "No LLM endpoint is enabled.".to_string(),
+            status: if semantic_router_fixed {
+                "degraded".to_string()
+            } else {
+                "disabled".to_string()
+            },
+            summary: if semantic_router_fixed {
+                "semantic.router CPU Candle bootstrap runtime is unavailable.".to_string()
+            } else {
+                "No LLM endpoint is enabled.".to_string()
+            },
             provider_key: String::new(),
             model_endpoint_id: None,
             text: String::new(),
             details: json!({
                 "route_policy_id": route_policy_id,
                 "attempted_endpoints": [],
+                "fallback_used": false,
+                "fixed_endpoint_id": if semantic_router_fixed {
+                    Some(SEMANTIC_ROUTER_ENDPOINT_ID)
+                } else {
+                    None
+                },
+                "cloud_fallback": if semantic_router_fixed {
+                    Some(false)
+                } else {
+                    None
+                },
             }),
         };
     };
@@ -851,6 +872,7 @@ struct LocalRuntimeProjection {
     api_key_configured: bool,
     ready: bool,
     backend_ready: bool,
+    backend_kind: Option<String>,
     chat_model: Option<String>,
     embedding_model: Option<String>,
 }
@@ -912,6 +934,7 @@ fn resolve_endpoint_candidates(
     route_policy_id: &str,
 ) -> Vec<ModelEndpoint> {
     let state = runtime_wired_model_center_state(state);
+    let semantic_router_fixed = route_policy_id == SEMANTIC_ROUTER_POLICY_ID;
     let policy = state
         .route_policies
         .iter()
@@ -934,6 +957,14 @@ fn resolve_endpoint_candidates(
         .iter()
         .filter(|endpoint| {
             endpoint.model_kind == model_kind && endpoint.status != ModelEndpointStatus::Disabled
+        })
+        .filter(|endpoint| {
+            if semantic_router_fixed {
+                endpoint.model_endpoint_id == SEMANTIC_ROUTER_ENDPOINT_ID
+                    && endpoint.status == ModelEndpointStatus::Active
+            } else {
+                endpoint.model_endpoint_id != SEMANTIC_ROUTER_ENDPOINT_ID
+            }
         })
         .filter(|endpoint| cloud_allowed || endpoint.endpoint_kind != ModelEndpointKind::Cloud)
         .cloned()
@@ -1121,6 +1152,13 @@ fn probe_local_runtime_target(target: &LocalRuntimeProbeTarget) -> LocalRuntimeP
             .and_then(|value| value.get("ready"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        backend_kind: payload
+            .get("backend")
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
         chat_model: payload
             .get("chat_model")
             .and_then(Value::as_str)
@@ -1149,6 +1187,7 @@ fn overlay_endpoints_with_runtime_truth(
         .iter()
         .map(|endpoint| {
             let mut overlayed = endpoint.clone();
+            let fixed_semantic_router = overlayed.model_endpoint_id == SEMANTIC_ROUTER_ENDPOINT_ID;
             if let Some(default_endpoint) = builtin_defaults.get(&overlayed.model_endpoint_id) {
                 if is_builtin_local_openai_endpoint(default_endpoint) {
                     let legacy_base_url = metadata_string(&overlayed.metadata, "base_url")
@@ -1208,15 +1247,28 @@ fn overlay_endpoints_with_runtime_truth(
                     {
                         set_metadata_bool(&mut overlayed.metadata, "api_key_configured", true);
                     }
-                    if matches!(overlayed.model_kind, ModelKind::Llm | ModelKind::Embedder) {
+                    if matches!(overlayed.model_kind, ModelKind::Llm | ModelKind::Embedder)
+                        && metadata_string(&overlayed.metadata, "mock_text").is_none()
+                    {
                         let runtime_model_available = match overlayed.model_kind {
                             ModelKind::Llm => runtime.chat_model.is_some(),
                             ModelKind::Embedder => runtime.embedding_model.is_some(),
                             _ => false,
                         };
-                        if runtime.ready && runtime.backend_ready && runtime_model_available {
+                        let backend_allowed = !fixed_semantic_router
+                            || runtime
+                                .backend_kind
+                                .as_deref()
+                                .is_some_and(|kind| kind.eq_ignore_ascii_case("candle"));
+                        if runtime.ready
+                            && runtime.backend_ready
+                            && runtime_model_available
+                            && backend_allowed
+                        {
                             overlayed.status = ModelEndpointStatus::Active;
-                        } else if overlayed.status == ModelEndpointStatus::Active {
+                        } else if overlayed.status == ModelEndpointStatus::Active
+                            || fixed_semantic_router
+                        {
                             overlayed.status = ModelEndpointStatus::Degraded;
                         }
                     }
@@ -2073,7 +2125,7 @@ mod tests {
             "摄像头能干什么",
             &state,
             &LlmTextOptions {
-                purpose: Some("router".to_string()),
+                purpose: Some("retrieval.answer".to_string()),
                 max_tokens: Some(12),
                 ..Default::default()
             },
@@ -2088,24 +2140,40 @@ mod tests {
     }
 
     #[test]
-    fn run_llm_text_with_state_falls_back_from_local_to_cloud_for_router() {
+    fn run_llm_text_with_state_routes_router_to_fixed_cpu_endpoint() {
         let state = AdminModelCenterState {
             endpoints: vec![
                 ModelEndpoint {
-                    model_endpoint_id: "llm-local-openai-compatible".to_string(),
+                    model_endpoint_id: "semantic-router-local-cpu".to_string(),
                     workspace_id: Some("home-1".to_string()),
                     provider_account_id: None,
                     model_kind: ModelKind::Llm,
                     endpoint_kind: ModelEndpointKind::Local,
                     provider_key: "openai_compatible".to_string(),
-                    model_name: "harbor-local-chat".to_string(),
-                    capability_tags: vec!["chat".to_string(), "local_first".to_string()],
+                    model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+                    capability_tags: vec!["semantic_router".to_string(), "local_first".to_string()],
                     cost_policy: json!({}),
                     status: ModelEndpointStatus::Active,
                     metadata: json!({
-                        "builtin": false,
-                        "base_url": "http://127.0.0.1:9/v1",
-                        "api_key": "",
+                        "builtin": true,
+                        "fixed_capability": "semantic_router",
+                        "runtime_profile": "harbor-candle",
+                        "mock_text": "local_router",
+                    }),
+                },
+                ModelEndpoint {
+                    model_endpoint_id: "external-local-llm".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Local,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "external-chat".to_string(),
+                    capability_tags: vec!["chat".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "mock_text": "external_router",
                     }),
                 },
                 ModelEndpoint {
@@ -2127,7 +2195,99 @@ mod tests {
                         "builtin": true,
                         "base_url": "https://api.siliconflow.cn/v1",
                         "api_key": "configured",
-                        "mock_text": "rag_answer",
+                        "mock_text": "cloud_router",
+                    }),
+                },
+            ],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "semantic.router".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "semantic".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({
+                    "capability": "router",
+                    "preferred_endpoint_id": "semantic-router-local-cpu",
+                }),
+            }],
+            ..AdminModelCenterState::default()
+        };
+
+        let result = run_llm_text_with_state_and_options(
+            "route this",
+            &state,
+            &LlmTextOptions {
+                purpose: Some("router".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert!(result.available);
+        assert_eq!(result.text, "local_router");
+        assert_eq!(
+            result.model_endpoint_id.as_deref(),
+            Some("semantic-router-local-cpu")
+        );
+        assert_eq!(result.details["route_policy_id"], json!("semantic.router"));
+        assert_eq!(result.details["fallback_used"], json!(false));
+        assert_eq!(
+            result.details["attempted_endpoints"],
+            json!(["semantic-router-local-cpu"])
+        );
+    }
+
+    #[test]
+    fn run_llm_text_with_state_does_not_fallback_router_from_fixed_cpu_endpoint() {
+        let state = AdminModelCenterState {
+            endpoints: vec![
+                ModelEndpoint {
+                    model_endpoint_id: "semantic-router-local-cpu".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Local,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+                    capability_tags: vec!["semantic_router".to_string(), "local_first".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "builtin": true,
+                        "fixed_capability": "semantic_router",
+                    }),
+                },
+                ModelEndpoint {
+                    model_endpoint_id: "external-local-llm".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Local,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "external-chat".to_string(),
+                    capability_tags: vec!["chat".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "mock_text": "external_router",
+                    }),
+                },
+                ModelEndpoint {
+                    model_endpoint_id: "llm-cloud-siliconflow".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Cloud,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
+                    capability_tags: vec!["chat".to_string(), "cloud_fallback".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "mock_text": "cloud_router",
                     }),
                 },
             ],
@@ -2155,17 +2315,13 @@ mod tests {
             },
         );
 
-        assert!(result.available);
-        assert_eq!(result.text, "rag_answer");
-        assert_eq!(
-            result.model_endpoint_id.as_deref(),
-            Some("llm-cloud-siliconflow")
-        );
+        assert!(!result.available);
         assert_eq!(result.details["route_policy_id"], json!("semantic.router"));
-        assert_eq!(result.details["fallback_used"], json!(true));
+        assert_eq!(result.details["fallback_used"], json!(false));
+        assert_eq!(result.details["attempted_endpoints"], json!([]));
         assert_eq!(
-            result.details["attempted_endpoints"],
-            json!(["llm-local-openai-compatible", "llm-cloud-siliconflow"])
+            result.details["fixed_endpoint_id"],
+            json!("semantic-router-local-cpu")
         );
     }
 
