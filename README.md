@@ -6,13 +6,19 @@ This repository contains the completed planning deliverables for a HarborBeacon 
 
 The active HarborBeacon <-> HarborGate seam is the v2.0 upgrade control pack.
 
-- Active contract: `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
-- HarborBeacon runbook: `HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md`
+- Active contract: `C:\Users\beanw\OpenSource\HarborGate\docs\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
+- HarborBeacon runbook: `docs/HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md`
 - Cutover gates: `docs/im-v2.0-cutover-rollback-observability-gates.md`
 
 The previous v1.5 seam is historical only. Current implementation work should
 move toward `POST /api/web/turns`, `conversation.handle`, `active_frame`,
 `continuation`, `delivery_hints`, and `X-Contract-Version: 2.0`.
+
+The wider product boundary is tracked in `docs/harbor-framework-protocol-map.md`:
+HarborBeacon is the business core; HarborGate is the IM/channel edge;
+HarborCloud owns account/entitlement/cloud metadata; HarborLink owns Hub-side
+MQTT and Home Assistant/camera bridge execution; harbor-dock owns Android/Paper
+UI intent; HarborNAS-webui owns HarborOS UI presentation.
 
 ## Rust Runtime (New)
 

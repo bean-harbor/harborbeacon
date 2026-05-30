@@ -43,7 +43,7 @@ backend。
   Harbor does not auto-reuse or manage `127.0.0.1:11434`.
 - Only a backend/model combination that passes the relevant benchmark gate may
   be shown as default-ready in Harbor Assistant.
-- Cloud fallback is not backend promotion evidence. The product remains local-first; SiliconFlow may be used only as controlled fallback for `semantic.router` and `retrieval.answer`, and it must not be cited as the default local backend.
+- Cloud fallback is not backend promotion evidence. The product remains local-first; NSP / `semantic.router` is fixed to the Candle CPU bootstrap model, while SiliconFlow may be used only as controlled fallback for explicitly cloud-enabled `retrieval.answer`, and it must not be cited as the default local backend.
 - Model prefetch/download jobs should record the Hugging Face endpoint used. Mirror priority is Harbor Assistant input -> `HF_ENDPOINT` -> `https://hf-mirror.com`.
 
 ## 4. Required Evidence
