@@ -5,6 +5,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::connectors::notifications::{
+    NotificationContent, NotificationDelivery, NotificationDeliveryMode, NotificationDestination,
+    NotificationDestinationKind, NotificationMetadata, NotificationPayloadFormat,
+    NotificationRequest, NotificationSource,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -126,6 +131,12 @@ pub struct StoredLocalVisionEvent {
     pub event: LocalVisionEvent,
     pub audit_record: Value,
     pub ha_mqtt_payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LocalVisionNotificationIntent {
+    pub notification_request: NotificationRequest,
+    pub audit_record: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -368,6 +379,82 @@ pub fn build_ha_mqtt_payload(event: &LocalVisionEvent) -> Value {
     payload
 }
 
+pub fn build_local_vision_notification_intent(
+    stored: &StoredLocalVisionEvent,
+    route_key: &str,
+) -> Result<LocalVisionNotificationIntent, String> {
+    let notification_request = build_local_vision_notification_request(stored, route_key)?;
+    let audit_record = build_local_vision_notification_audit(stored, &notification_request);
+    Ok(LocalVisionNotificationIntent {
+        notification_request,
+        audit_record,
+    })
+}
+
+pub fn build_local_vision_notification_request(
+    stored: &StoredLocalVisionEvent,
+    route_key: &str,
+) -> Result<NotificationRequest, String> {
+    validate_local_vision_event(&stored.event)?;
+    let route_key = route_key.trim();
+    if route_key.is_empty() {
+        return Err("local vision notification requires destination.route_key".to_string());
+    }
+    let event = &stored.event;
+    let digest = stable_event_notification_digest(event);
+    let request = NotificationRequest {
+        notification_id: format!("notif_{}", &digest[..24]),
+        trace_id: format!("trace_{}", event.event_id.trim()),
+        source: NotificationSource {
+            service: "harborbeacon".to_string(),
+            module: "local_vision_event".to_string(),
+            event_type: "harbornavi.local_vision_event".to_string(),
+        },
+        destination: NotificationDestination {
+            kind: NotificationDestinationKind::Conversation,
+            route_key: route_key.to_string(),
+            id: String::new(),
+            platform: String::new(),
+            recipient: None,
+        },
+        content: NotificationContent {
+            title: local_vision_notification_title(event),
+            body: local_vision_notification_body(event),
+            payload_format: NotificationPayloadFormat::PlainText,
+            structured_payload: local_vision_notification_metadata(stored),
+            attachments: Vec::new(),
+        },
+        delivery: NotificationDelivery {
+            mode: NotificationDeliveryMode::Send,
+            reply_to_message_id: String::new(),
+            update_message_id: String::new(),
+            idempotency_key: format!("idem_{}", &digest[..24]),
+        },
+        metadata: NotificationMetadata {
+            correlation_id: event.event_id.clone(),
+        },
+    };
+    validate_local_vision_notification_request(&request)?;
+    Ok(request)
+}
+
+pub fn validate_local_vision_notification_request(
+    request: &NotificationRequest,
+) -> Result<(), String> {
+    if request.content.attachments.is_empty() {
+        let payload = serde_json::to_value(request)
+            .map_err(|error| format!("failed to inspect local vision notification: {error}"))?;
+        reject_sensitive_value(&payload)?;
+        reject_local_path_value(&payload)?;
+        Ok(())
+    } else {
+        Err(
+            "local vision notification must be text-only and cannot include attachments"
+                .to_string(),
+        )
+    }
+}
+
 pub fn validate_local_vision_event(event: &LocalVisionEvent) -> Result<(), String> {
     if event.event_id.trim().is_empty() {
         return Err("local vision event requires event_id".to_string());
@@ -384,6 +471,109 @@ pub fn validate_local_vision_event(event: &LocalVisionEvent) -> Result<(), Strin
     let payload = serde_json::to_value(event)
         .map_err(|error| format!("failed to inspect local vision event: {error}"))?;
     reject_sensitive_value(&payload)
+}
+
+fn build_local_vision_notification_audit(
+    stored: &StoredLocalVisionEvent,
+    request: &NotificationRequest,
+) -> Value {
+    json!({
+        "audit_kind": "local_vision_event.notification_intent_built",
+        "event_id": stored.event.event_id,
+        "camera_id": stored.event.camera_id,
+        "event_type": stored.event.event_type,
+        "notification_id": request.notification_id,
+        "trace_id": request.trace_id,
+        "delivery_mode": "send",
+        "destination_route_bound": !request.destination.route_key.trim().is_empty(),
+        "text_only": true,
+        "attachments_included": false,
+        "raw_image_included": false,
+        "local_paths_included": false,
+        "vlm_status": stored.event.vlm.as_ref().map(|vlm| vlm.status.clone()).unwrap_or_else(|| "not_sampled".to_string()),
+        "classification": "p1_support_notification_smoke",
+    })
+}
+
+fn local_vision_notification_title(event: &LocalVisionEvent) -> String {
+    match event.event_type.as_str() {
+        "person_detected" => "HarborNavi 人员事件".to_string(),
+        "pet_detected" => "HarborNavi 宠物事件".to_string(),
+        "vehicle_detected" => "HarborNavi 车辆事件".to_string(),
+        _ => "HarborNavi 家庭事件".to_string(),
+    }
+}
+
+fn local_vision_notification_body(event: &LocalVisionEvent) -> String {
+    let summary = local_vision_notification_summary(event);
+    let confidence = (event.confidence.clamp(0.0, 1.0) * 100.0).round() as u32;
+    format!(
+        "{}：{}（摄像头 {}，置信度 {}%，延迟 {}ms）。",
+        local_vision_event_type_label(&event.event_type),
+        summary,
+        event.camera_id,
+        confidence,
+        event.latency_ms
+    )
+}
+
+fn local_vision_notification_summary(event: &LocalVisionEvent) -> String {
+    if let Some(vlm) = event.vlm.as_ref() {
+        if vlm.status == "active" && !vlm.summary.trim().is_empty() {
+            return sanitize_model_text(vlm.summary.trim());
+        }
+        if !vlm.derived_text.trim().is_empty() {
+            return sanitize_model_text(vlm.derived_text.trim());
+        }
+    }
+    sanitize_model_text(event.summary.trim())
+}
+
+fn local_vision_event_type_label(event_type: &str) -> &'static str {
+    match event_type {
+        "person_detected" => "检测到人员活动",
+        "pet_detected" => "检测到宠物活动",
+        "vehicle_detected" => "检测到车辆相关目标",
+        "motion_like_scene" => "检测到画面变化",
+        _ => "检测到本地视觉事件",
+    }
+}
+
+fn local_vision_notification_metadata(stored: &StoredLocalVisionEvent) -> Value {
+    let event = &stored.event;
+    json!({
+        "kind": "harbornavi.local_vision_event_notification",
+        "event": {
+            "event_id": event.event_id,
+            "camera_id": event.camera_id,
+            "event_type": event.event_type,
+            "confidence": event.confidence,
+            "labels": event.labels,
+            "summary": local_vision_notification_summary(event),
+            "started_at": event.started_at,
+            "received_at": stored.received_at,
+            "analyzer": event.analyzer,
+            "latency_ms": event.latency_ms,
+            "vlm_status": event.vlm.as_ref().map(|vlm| vlm.status.clone()).unwrap_or_else(|| "not_sampled".to_string()),
+            "vlm_summary_present": event.vlm.as_ref().map(|vlm| !vlm.summary.trim().is_empty()).unwrap_or(false),
+        },
+        "privacy": {
+            "text_only": true,
+            "attachments_included": false,
+            "raw_image_included": false,
+            "local_paths_included": false,
+        },
+    })
+}
+
+fn stable_event_notification_digest(event: &LocalVisionEvent) -> String {
+    hex_sha256(
+        format!(
+            "harbornavi.local_vision_event.notification:{}",
+            event.event_id.trim()
+        )
+        .as_bytes(),
+    )
 }
 
 pub fn classify_local_vision_event(
@@ -629,6 +819,43 @@ fn reject_sensitive_text(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn reject_local_path_value(value: &Value) -> Result<(), String> {
+    match value {
+        Value::String(text) => reject_local_path_text(text),
+        Value::Array(items) => {
+            for item in items {
+                reject_local_path_value(item)?;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                reject_local_path_text(key)?;
+                reject_local_path_value(item)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn reject_local_path_text(text: &str) -> Result<(), String> {
+    let lower = text.to_ascii_lowercase().replace('\\', "/");
+    let blocked = [
+        ".harborbeacon/",
+        "/tmp/",
+        "/var/tmp/",
+        "/var/lib/",
+        "/home/",
+        "/run/",
+        "c:/users/",
+    ];
+    if blocked.iter().any(|needle| lower.contains(needle)) {
+        return Err("local vision notification contains local path material".to_string());
+    }
+    Ok(())
+}
+
 fn sanitize_model_text(text: &str) -> String {
     let mut sanitized = text.to_string();
     for needle in [
@@ -862,6 +1089,108 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn local_vision_notification_uses_yolo_summary_without_attachments_or_paths() {
+        let stored = sample_stored_event(sample_event());
+
+        let intent = build_local_vision_notification_intent(&stored, "gw_route_harbornavi_dev")
+            .expect("notification intent");
+        let request = intent.notification_request;
+        let text = serde_json::to_string(&request).expect("serialize request");
+
+        assert!(request.notification_id.starts_with("notif_"));
+        assert!(request.delivery.idempotency_key.starts_with("idem_"));
+        assert_eq!(request.source.module, "local_vision_event");
+        assert_eq!(request.destination.route_key, "gw_route_harbornavi_dev");
+        assert!(request.content.body.contains("本地视觉事件"));
+        assert!(request.content.attachments.is_empty());
+        assert!(!text.contains("/tmp/source.jpg"));
+        assert!(!text.contains("rtsp://"));
+        assert_eq!(
+            intent.audit_record["audit_kind"],
+            json!("local_vision_event.notification_intent_built")
+        );
+        assert_eq!(intent.audit_record["text_only"], json!(true));
+    }
+
+    #[test]
+    fn local_vision_notification_prefers_active_vlm_summary() {
+        let mut event = sample_event();
+        event.event_type = "vehicle_detected".to_string();
+        event.vlm = Some(LocalVisionEventVlmSummary {
+            status: "active".to_string(),
+            summary: "画面中有一辆蓝色车辆停在门口。".to_string(),
+            tags: vec!["vehicle".to_string()],
+            labels: vec!["car".to_string()],
+            derived_text: "画面中有一辆蓝色车辆停在门口。".to_string(),
+            artifacts: Vec::new(),
+            ingest_metadata: json!({"frame_path_redacted": true}),
+            vlm_metrics: json!({"elapsed_ms": 1880}),
+            error: None,
+        });
+        let stored = sample_stored_event(event);
+
+        let intent = build_local_vision_notification_intent(&stored, "gw_route_harbornavi_dev")
+            .expect("notification intent");
+
+        assert!(intent
+            .notification_request
+            .content
+            .body
+            .contains("蓝色车辆"));
+        assert_eq!(
+            intent.notification_request.content.structured_payload["event"]["vlm_status"],
+            json!("active")
+        );
+        assert_eq!(intent.audit_record["vlm_status"], json!("active"));
+    }
+
+    #[test]
+    fn local_vision_notification_idempotency_is_stable_for_same_event_id() {
+        let first = sample_stored_event(sample_event());
+        let mut changed_event = sample_event();
+        changed_event.summary = "新的本地摘要不应改变同一事件的投递幂等键。".to_string();
+        let second = sample_stored_event(changed_event);
+
+        let first = build_local_vision_notification_intent(&first, "gw_route_harbornavi_dev")
+            .expect("first intent");
+        let second = build_local_vision_notification_intent(&second, "gw_route_harbornavi_dev")
+            .expect("second intent");
+
+        assert_eq!(
+            first.notification_request.notification_id,
+            second.notification_request.notification_id
+        );
+        assert_eq!(
+            first.notification_request.delivery.idempotency_key,
+            second.notification_request.delivery.idempotency_key
+        );
+    }
+
+    #[test]
+    fn local_vision_notification_rejects_sensitive_or_local_path_text() {
+        let mut event = sample_event();
+        event.summary = "调试帧在 /tmp/source.jpg".to_string();
+        let stored = sample_stored_event(event);
+
+        let error = build_local_vision_notification_intent(&stored, "gw_route_harbornavi_dev")
+            .expect_err("local path must fail");
+
+        assert!(error.contains("local path"));
+
+        let mut request = build_local_vision_notification_intent(
+            &sample_stored_event(sample_event()),
+            "gw_route_harbornavi_dev",
+        )
+        .expect("intent")
+        .notification_request;
+        request.content.body = "camera credential rtsp://user:pass@192.168.3.231/stream2".into();
+
+        let error = validate_local_vision_notification_request(&request)
+            .expect_err("sensitive material must fail");
+        assert!(error.contains("sensitive") || error.contains("URL credentials"));
+    }
+
     fn detection(label: &str, confidence: f32) -> LocalVisionDetection {
         LocalVisionDetection {
             label: label.to_string(),
@@ -894,6 +1223,15 @@ mod tests {
             latency_ms: 100,
             metrics: json!({}),
             vlm: None,
+        }
+    }
+
+    fn sample_stored_event(event: LocalVisionEvent) -> StoredLocalVisionEvent {
+        StoredLocalVisionEvent {
+            received_at: "epoch_ms:2".to_string(),
+            audit_record: build_audit_record(&event),
+            ha_mqtt_payload: build_ha_mqtt_payload(&event),
+            event,
         }
     }
 }
