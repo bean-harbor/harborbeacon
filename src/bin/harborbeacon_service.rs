@@ -161,6 +161,7 @@ impl HarborBeaconService {
                 "admin": "/api/admin/*",
                 "web": "/api/web/*",
                 "inference": "/api/inference/*",
+                "beacon_inference": "/api/beacon/inference/*",
                 "harbor_beacon_inference": "/api/harbor-beacon/inference/*"
             })));
             return;
@@ -409,7 +410,11 @@ fn main() {
 }
 
 fn inference_model_path(path: &str) -> String {
-    for prefix in ["/api/harbor-beacon/inference", "/api/inference"] {
+    for prefix in [
+        "/api/beacon/inference",
+        "/api/harbor-beacon/inference",
+        "/api/inference",
+    ] {
         if let Some(tail) = path.strip_prefix(prefix) {
             if tail.is_empty() || tail == "/" {
                 return "/healthz".to_string();
@@ -425,6 +430,8 @@ fn inference_model_path(path: &str) -> String {
 fn is_inference_api_path(path: &str) -> bool {
     path == "/api/inference"
         || path.starts_with("/api/inference/")
+        || path == "/api/beacon/inference"
+        || path.starts_with("/api/beacon/inference/")
         || path == "/api/harbor-beacon/inference"
         || path.starts_with("/api/harbor-beacon/inference/")
 }
@@ -571,15 +578,25 @@ mod tests {
     #[test]
     fn harbor_beacon_inference_prefix_maps_to_embedded_model_api() {
         assert!(is_inference_api_path("/api/inference/healthz"));
+        assert!(is_inference_api_path("/api/beacon/inference/healthz"));
         assert!(is_inference_api_path(
             "/api/harbor-beacon/inference/healthz"
         ));
+        assert!(!is_inference_api_path("/api/beacon/models/runtimes"));
         assert!(!is_inference_api_path("/api/harbor-beacon/models/runtimes"));
         assert_eq!(inference_model_path("/api/inference"), "/healthz");
         assert_eq!(inference_model_path("/api/inference/"), "/healthz");
         assert_eq!(
             inference_model_path("/api/inference/v1/embeddings"),
             "/v1/embeddings"
+        );
+        assert_eq!(
+            inference_model_path("/api/beacon/inference/healthz"),
+            "/healthz"
+        );
+        assert_eq!(
+            inference_model_path("/api/beacon/inference/v1/chat/completions"),
+            "/v1/chat/completions"
         );
         assert_eq!(
             inference_model_path("/api/harbor-beacon/inference"),

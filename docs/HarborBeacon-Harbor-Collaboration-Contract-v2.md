@@ -7,35 +7,50 @@ development model across:
 
 - the HarborBeacon repo
 - the external HarborGate repo
+- the HarborCloud repo
+- the HarborLink repo
+- the harbor-dock repo
+- the HarborNAS-webui repo
 - the `harbor-*` skill topology used to organize ownership
 
 It supersedes the narrower HarborOS-control-only collaboration model as the
 primary coordination document for the current phase.
 
 This document does not replace or reinterpret the external IM contract. For the
-current phase, the active external IM contract is v2.0.
+current phase, the active external IM service-to-service contract is v2.0, and
+the wider product boundary is defined by the Harbor framework protocol maps in
+each repository.
 
 ## Normative References
 
 The authoritative cross-repo IM boundary remains:
 
-- `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
+- `C:\Users\beanw\OpenSource\HarborGate\docs\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
 
 The northbound channel-edge upgrade is:
 
-- `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-Agent-Contract-v3.0.md`
+- `C:\Users\beanw\OpenSource\HarborGate\docs\HarborBeacon-HarborGate-Agent-Contract-v3.0.md`
+
+The product boundary maps are:
+
+- `C:\Users\beanw\OpenSource\HarborBeacon\docs\harbor-framework-protocol-map.md`
+- `C:\Users\beanw\OpenSource\HarborGate\docs\harbor-framework-protocol-map.md`
+- `C:\Users\beanw\OpenSource\HarborCloud\docs\harbor-framework-protocol-map.md`
+- `C:\Users\beanw\OpenSource\HarborLink\docs\harbor-framework-protocol-map.md`
+- `C:\Users\beanw\OpenSource\harbor-dock\docs\harbor-framework-protocol-map.md`
+- `C:\Users\beanw\OpenSource\HarborNAS-webui\docs\harbor-framework-protocol-map.md`
 
 The previous v1.5 contract is historical reference only during the v2.0
 upgrade.
 
 Execution planning references:
 
-- `C:\Users\beanw\HarborBeacon-LocalAgent-Project-git\HarborBeacon-LocalAgent-Roadmap.md`
-- `C:\Users\beanw\HarborBeacon-LocalAgent-Project-git\HarborBeacon-LocalAgent-Plan.md`
+- `C:\Users\beanw\OpenSource\HarborBeacon\docs\HarborBeacon-LocalAgent-Roadmap.md`
+- `C:\Users\beanw\OpenSource\HarborBeacon\docs\HarborBeacon-LocalAgent-Plan.md`
 
 Historical same-repo HarborOS-only collaboration context:
 
-- `C:\Users\beanw\HarborBeacon-LocalAgent-Project-git\HarborBeacon-HarborOS-Control-Collaboration-Contract-v1.md`
+- `C:\Users\beanw\OpenSource\HarborBeacon\docs\HarborBeacon-HarborOS-Control-Collaboration-Contract-v1.md`
 
 If this document conflicts with the IM contract v2.0 on cross-repo interface
 semantics, the IM contract v2.0 wins.
@@ -48,6 +63,10 @@ without re-coupling the system.
 The intended operating model for this phase is:
 
 - IM remains in a separate repo
+- cloud control remains in HarborCloud
+- Hub outbound MQTT/home bridge remains in HarborLink
+- Android/Paper client intent remains in harbor-dock
+- HarborOS WebUI display/operation state remains in HarborNAS-webui
 - HarborBeacon remains the business-core repo
 - southbound work is domain-split, not one generic adapter bucket
 - each lane owns implementation inside a frozen collaboration boundary
@@ -58,17 +77,21 @@ Model execution is a shared capability layer, not a business domain. HarborBeaco
 owns model-center orchestration, endpoint policy, redaction, and audit evidence;
 HarborGate does not own model choice, model credentials, or retrieval semantics.
 
-The current model architecture is local-first. Cloud endpoints are allowed only
-as controlled fallback for explicitly cloud-enabled route policies. The first
-cloud fallback scope is limited to:
+The current model architecture is local-first. `semantic.router` is the NSP
+capability and is fixed to the Harbor-managed Candle CPU bootstrap endpoint
+`semantic-router-local-cpu` with `Qwen/Qwen2.5-0.5B-Instruct`; it must not use
+cloud fallback or user-managed external OpenAI-compatible LLMs. If the
+bootstrap runtime or model artifact is missing, the capability is degraded.
 
-- `semantic.router`
+Cloud endpoints are allowed only as controlled fallback for explicitly
+cloud-enabled route policies. The current cloud fallback scope is limited to:
+
 - `retrieval.answer`
 
 Cloud fallback must not become the default path for HarborOS command execution,
-AIoT control, OCR, VLM, or embedding routes. Each LLM fallback attempt must
-record the selected endpoint, attempted endpoints, and fallback reason without
-persisting plaintext API keys or full sensitive prompts.
+AIoT control, NSP / `semantic.router`, OCR, VLM, or embedding routes. Each LLM
+fallback attempt must record the selected endpoint, attempted endpoints, and
+fallback reason without persisting plaintext API keys or full sensitive prompts.
 
 ## Team Topology
 
@@ -152,6 +175,66 @@ Do not automatically own:
 - HarborOS system-domain execution
 - HarborBeacon business-state ownership
 
+## Product Repo Boundary
+
+### HarborCloud
+
+Own:
+
+- account, home, member, subscription, entitlement, and Hub identity truth
+- AWS IoT MQTT control-plane integration
+- WebRTC signaling, relay/TURN configuration, event clip metadata, and cloud
+  media metadata
+
+Do not automatically own:
+
+- HarborBeacon task/runtime/model/policy/audit semantics
+- HarborGate IM/channel transport
+- HarborLink local execution or Home Assistant/camera protocol details
+
+### HarborLink
+
+Own:
+
+- Hub-side outbound connector identity
+- MQTT command subscription, state publication, and command acknowledgements
+- Home Assistant and camera bridge execution behind an outbound cloud path
+
+Do not automatically own:
+
+- HarborCloud entitlement truth
+- HarborBeacon task/runtime semantics
+- HarborGate IM/channel semantics
+- Android/WebUI display state
+
+### harbor-dock
+
+Own:
+
+- Android/Paper UI, local app state, secure storage, and user intent
+- photo-frame, Home Assistant companion, camera viewing, and assistant entry
+  surfaces
+
+Do not automatically own:
+
+- Hub/cloud/Beacon/Gate source-of-truth state
+- Home Assistant administration or device protocol execution
+- HarborCloud entitlement, HarborLink MQTT, or HarborGate transport semantics
+
+### HarborNAS-webui
+
+Own:
+
+- HarborOS WebUI presentation and operation flows
+- same-origin UI calls into Beacon-owned `/api/beacon/*` and related aliases
+- Harbor Assistant, Model Center, camera/device/readiness presentation
+
+Do not automatically own:
+
+- HarborBeacon runtime truth
+- IM/channel transport
+- cloud entitlement or Hub connector state
+
 ## System Boundary
 
 ### Cross-Repo Boundary
@@ -159,6 +242,8 @@ Do not automatically own:
 - HarborGate and HarborBeacon communicate only through HTTP/JSON contracts.
 - The repos MUST NOT import each other's runtime code.
 - The repos MUST NOT share `.harborbeacon/*.json` or other runtime state files.
+- HarborCloud, HarborLink, harbor-dock, and HarborNAS-webui MUST NOT be treated
+  as sidecars that can push their state back into HarborBeacon business core.
 
 ### Business Source Of Truth
 
@@ -172,6 +257,10 @@ HarborBeacon remains the source of truth for:
 - business conversation continuity
 
 HarborGate owns transport and platform concerns only.
+
+HarborCloud owns cloud account, entitlement, signaling, and metadata truth.
+HarborLink owns Hub-side outbound connector execution. harbor-dock owns
+Android/Paper UI intent. HarborNAS-webui owns HarborOS UI presentation.
 
 ### Southbound Domain Split
 
@@ -204,6 +293,16 @@ Meaning:
 - HarborGate MAY act as the northbound channel edge for Android/Web chat and
   Beacon admin/config proxying, but MUST NOT own Beacon device, knowledge,
   model, approval, artifact, audit, or workflow truth.
+- HarborGate MUST NOT become the HarborCloud entitlement path, HarborLink MQTT
+  command path, HarborDock remote-control backend, or WebUI display-state owner.
+- HarborCloud MUST NOT define HarborBeacon task policy or runtime business
+  truth.
+- HarborLink MUST NOT own Beacon task state, cloud entitlement, or IM/channel
+  transport.
+- harbor-dock MUST NOT own Hub/cloud/Beacon/Gate durable state beyond local
+  client preferences and user intent.
+- HarborNAS-webui MUST NOT own Beacon runtime state; it presents and operates
+  Beacon-owned APIs.
 - HarborOS control MUST NOT silently absorb Home Device Domain ownership.
 - AIoT work MUST NOT silently collapse device-native control into HarborOS
   system control.
@@ -262,6 +361,26 @@ Unless explicitly reassigned, the following belong to `harbor-aiot`:
 - camera and AIoT protocol adapters
 - device discovery and control execution
 - device-media/control split inside the Home Device Domain
+
+Unless explicitly reassigned, the following belong to HarborCloud:
+
+- account, home, membership, subscription, entitlement, Hub identity, AWS IoT,
+  WebRTC signaling, cloud relay, event clip metadata, and cloud media metadata
+
+Unless explicitly reassigned, the following belong to HarborLink:
+
+- Hub-side outbound MQTT connection, command subscription, acknowledgement
+  publication, Home Assistant bridge execution, and camera bridge execution
+
+Unless explicitly reassigned, the following belong to harbor-dock:
+
+- Android/Paper UI intent, local app persistence, secure storage, frame/home
+  surface, camera-viewing UI, and assistant client surface
+
+Unless explicitly reassigned, the following belong to HarborNAS-webui:
+
+- Angular WebUI presentation, Harbor Assistant UI, Model Center UI, and
+  same-origin calls into Beacon-owned APIs
 
 Unless explicitly reassigned, the following belong to `harbor-architect`:
 
@@ -376,6 +495,8 @@ closeout.
 - `harbor-im-gateway` is the daily sync owner for the external HarborGate repo
 - `harbor-hos-control` syncs HarborOS System Domain changes
 - `harbor-aiot` syncs AIoT and Home Device Domain changes
+- HarborCloud, HarborLink, harbor-dock, and HarborNAS-webui owners sync their
+  own repository changes when their product boundary is touched
 
 At minimum, the lane owner should leave behind:
 
@@ -386,7 +507,7 @@ At minimum, the lane owner should leave behind:
 
 The default reporting template lives at:
 
-- `C:\Users\beanw\HarborBeacon-LocalAgent-Project-git\docs\daily\harbor-daily-sync-template.md`
+- `C:\Users\beanw\OpenSource\HarborBeacon\docs\daily\harbor-daily-sync-template.md`
 
 Lane owners should not wait for `harbor-architect` to do basic commit, push, or
 pull-request hygiene on their behalf.
@@ -418,12 +539,14 @@ In plain terms:
 
 All lanes should preserve and log, when available:
 
-- `task_id`
+- `turn_id`
 - `trace_id`
-- `source.route_key`
-- `source.conversation_id`
+- `conversation.handle`
+- `transport.route_key`
+- `transport.message_id`
+- `active_frame.frame_id`
 - `message.message_id`
-- `notification_id`
+- `notification.notification_id`
 - `delivery.idempotency_key`
 - `destination.route_key`
 
@@ -438,6 +561,11 @@ A cross-lane release is allowed only when:
 - IM credential ownership did not leak into HarborBeacon
 - Beacon-owned device credentials, model secrets, camera config, knowledge roots,
   approvals, artifacts, and audit did not leak into HarborGate
+- cloud entitlement or Hub identity did not leak into HarborBeacon or HarborGate
+- HarborLink MQTT command/ack ownership did not leak into HarborBeacon,
+  HarborGate, HarborDock, or WebUI
+- HarborDock UI intent did not become durable Hub/cloud/core truth
+- WebUI presentation state did not become Beacon runtime truth
 - device-native ownership did not collapse into HarborOS system control
 
 ## Working Principle

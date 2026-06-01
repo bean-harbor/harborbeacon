@@ -75,6 +75,8 @@ Current priority:
 - execute the HarborBeacon x HarborGate Contract v2.0 upgrade control pack
 - replace the v1.5 IM seam with the v2.0 turn / conversation / continuation seam
 - keep repo ownership boundaries frozen while the public HTTP/JSON contract moves
+- keep HarborCloud entitlement, HarborLink MQTT, HarborDock UI intent, and WebUI
+  display state outside HarborBeacon business core
 
 HarborBeacon owns:
 
@@ -92,22 +94,27 @@ HarborGate owns:
 - platform credentials
 - outbound delivery
 
+HarborCloud owns account/entitlement/cloud metadata. HarborLink owns Hub-side
+outbound MQTT and Home Assistant/camera bridge execution. harbor-dock owns
+Android/Paper UI intent. HarborNAS-webui owns HarborOS UI presentation.
+
 ## Read First
 
 Before changing architecture, contracts, routing, approval flow, or cutover logic, read:
 
-1. `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
-2. `HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md`
-3. `HarborBeacon-Harbor-Collaboration-Contract-v2.md`
-4. `HarborBeacon-LocalAgent-Roadmap.md`
-5. `HarborBeacon-LocalAgent-Plan.md`
-6. `HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md`
-7. `HarborBeacon-Skill-Spec-v1.md`
+1. `C:\Users\beanw\OpenSource\HarborGate\docs\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
+2. `docs/harbor-framework-protocol-map.md`
+3. `docs/HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md`
+4. `docs/HarborBeacon-Harbor-Collaboration-Contract-v2.md`
+5. `docs/HarborBeacon-LocalAgent-Roadmap.md`
+6. `docs/HarborBeacon-LocalAgent-Plan.md`
+7. `docs/HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md`
+8. `docs/HarborBeacon-Skill-Spec-v1.md`
 
 If work touches the HarborBeacon <-> HarborGate HTTP boundary, also read:
 
-- `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
-- `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md`
+- `C:\Users\beanw\OpenSource\HarborGate\docs\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
+- `C:\Users\beanw\OpenSource\HarborGate\docs\HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md`
 
 ## Hard Boundaries
 
@@ -120,6 +127,9 @@ If work touches the HarborBeacon <-> HarborGate HTTP boundary, also read:
 - Do not treat transport `session_id` as HarborBeacon business conversation truth.
 - Do not add v1.5/v2.0 runtime dual-stack compatibility unless the user explicitly reverses the current v2.0 direct-upgrade decision.
 - Do not add group chat to this upgrade wave.
+- Do not route HarborCloud entitlement, HarborLink MQTT command/ack, HarborDock
+  remote home/camera control, or WebUI display state through the Beacon/Gate IM
+  seam.
 - Do not collapse AIoT device control into HarborOS system control.
 - Preserve the southbound priority: `middleware API -> midcli -> browser -> MCP`.
 
@@ -130,6 +140,10 @@ If work touches the HarborBeacon <-> HarborGate HTTP boundary, also read:
 - `harbor-hos-control`: HarborOS System Domain, middleware integration, `midcli`, system control paths
 - `harbor-aiot`: Home Device Domain, camera and LAN AIoT native adapters, ONVIF/RTSP/vendor-cloud/device protocols
 - `harbor-architect`: cross-lane boundary changes, release gates, rollback gates, cutover sequencing, final acceptance
+- `HarborCloud`: account, entitlement, Hub identity, AWS IoT, WebRTC signaling, cloud metadata
+- `HarborLink`: Hub-side outbound MQTT, command ack, Home Assistant/camera bridge
+- `harbor-dock`: Android/Paper UI intent, local app state, assistant client surface
+- `HarborNAS-webui`: HarborOS UI presentation over Beacon-owned APIs
 
 Escalate to architecture mode when a change crosses lanes or widens a frozen contract.
 

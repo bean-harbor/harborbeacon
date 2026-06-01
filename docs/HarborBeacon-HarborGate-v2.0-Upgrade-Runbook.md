@@ -13,10 +13,18 @@ unfinished implementation queue.
 
 Authoritative contract:
 
-- `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
+- `C:\Users\beanw\OpenSource\HarborGate\docs\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
+- `C:\Users\beanw\OpenSource\HarborBeacon\docs\harbor-framework-protocol-map.md`
 
 The v1.5 documents are historical references only. Do not use them as current
 release gates.
+
+## Product Boundary Guard
+
+This runbook controls only the HarborBeacon <-> HarborGate IM/channel seam. It
+does not make HarborGate the owner of HarborCloud entitlement, HarborLink MQTT
+command/ack, HarborDock remote home/camera intent, or HarborNAS WebUI display
+state. Those product boundaries are frozen in the protocol maps.
 
 ## Daily Start
 
@@ -105,6 +113,8 @@ Stop and ask the user before continuing when any of these appear:
 
 - A new public v2.0 contract field is required.
 - Ownership between Beacon and Gate would change.
+- The requested change would route HarborCloud entitlement, HarborLink MQTT,
+  HarborDock remote-control, or WebUI state through the Beacon/Gate IM seam.
 - A v1.5 compatibility path is requested.
 - Group chat is needed for the current path.
 - Live target, credential, DNS, or external platform state blocks the work.

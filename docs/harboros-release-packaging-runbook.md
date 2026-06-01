@@ -26,7 +26,7 @@ release-v1 的默认形态固定为：
 - HarborBeacon Rust Linux 默认目标为 `x86_64-unknown-linux-musl`
 - 当目标为 musl 时，builder 使用 `cargo zigbuild --release --target <target>`，并要求 builder 上已有 `cargo-zigbuild` 与 `zig`
 - HarborBeacon 单端口封装本地推理 facade；`harbor-model-api`/Candle/VLM 只作为内部 backend，不再成为对外 systemd/API 契约
-- Runtime Manager + Model Center 是共享能力层：release 默认保持 Harbor-managed Candle-first local runtime，云端只作为 `semantic.router` 与 `retrieval.answer` 的受控 fallback
+- Runtime Manager + Model Center 是共享能力层：release 默认保持 Harbor-managed Candle-first local runtime；NSP / `semantic.router` 固定为 CPU local bootstrap，云端只作为明确放行的 `retrieval.answer` 受控 fallback
 - ISO / release bundle 路线允许通过 `harboros-beacon.deb` 内置约 0.5B bootstrap LLM，用于 IM / WebUI 自然语言入口、意图分类、参数抽取和配置引导；大模型、VLM、ASR 与强 embedding 默认仍按需下载或高级外接
 - `llm-cloud-siliconflow` preset 使用 `https://api.siliconflow.cn/v1`，API key 由 endpoint metadata secret 保存并通过 admin API redaction 返回
 - 本地模型下载默认 mirror 为 `https://hf-mirror.com`；实际优先级为 Harbor Assistant 输入 mirror -> `HF_ENDPOINT` -> 默认 mirror
@@ -68,6 +68,12 @@ release-v1 的默认形态固定为：
 当前 handoff 增量 baseline：
 
 - Harbor Assistant-only cleanup: HarborOS 集成面只保留 `/ui/harbor-assistant` 与 `/api/beacon/**`。
+- HarborAssistant live solidification: package handoff id
+  `harborassistant-live-solidify-20260529` is the current deb-based
+  repeatable delivery lane. The builder output is
+  `/home/harbor-innovations/artifacts/harborassistant-live-solidify-20260529/output`
+  on `.197`; install/rollback/live-gate details are frozen in
+  `docs/harbor-assistant-offline-delivery-runbook.md`.
 - Media tools packaging: release bundle 必须带
   `media-tools/bin/ffmpeg` 与 `media-tools/bin/ffprobe`，installer 会安装到
   `/var/lib/harborbeacon-agent-ci/runtime/media-tools/bin/` 并写入
@@ -273,7 +279,7 @@ sudo install-harborbeacon-release \
 - live path 继续通过 `127.0.0.1:4174/api/inference/v1` 暴露本地推理 facade
 - Harbor-managed Candle-first 是默认产品路径；external OpenAI-compatible endpoint 只在用户高级配置后参与
 - `4186` 可继续保留给 Candle candidate lane
-- ISO nginx / middleware 保持服务级入口：`/api/harbor-beacon/* -> 127.0.0.1:4174` 与 `/api/harbor-gate/* -> 127.0.0.1:8787`，不为模型 runtime 增加新 location
+- ISO nginx / middleware 保持服务级入口：active HarborBeacon 入口为 `/api/beacon/* -> 127.0.0.1:4174`，`/api/harbor-beacon/* -> 127.0.0.1:4174` 只作为旧 WebUI/旧 ISO 兼容 alias；HarborGate 入口为 `/api/harbor-gate/* -> 127.0.0.1:8787`，不为模型 runtime 增加新 location
 - 现行 `harboros-beacon.service` deb 可继续使用 `/var/lib/harboros-beacon/*.json` 保存 service state；Harbor-managed model-store 独立放在 `/mnt/software/harborbeacon-agent-ci/model-store`
 - Bootstrap LLM 由 HarborBeacon release workflow 下载 `Qwen/Qwen2.5-0.5B-Instruct` 并直接打入 `harboros-beacon.deb` 的 `/mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/bootstrap-llm`；postinst 只写 env/目录兜底，不在 ISO rootfs 内保留第二份 `/usr/share` 模型副本。
 

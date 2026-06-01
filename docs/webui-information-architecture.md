@@ -48,7 +48,7 @@
 - `Models & Policies` 必须把 Runtime Manager、capability readiness、model download/install status、endpoint status/test result/kind/provider/route policy/fallback order、SiliconFlow API key 输入、HF mirror URL 输入放在同一页的清晰操作位里，而不是散落成静态说明
 - Harbor Assistant 默认展示 Harbor-managed Candle-first local runtime；约 0.5B bootstrap LLM 只标注为自然语言入口 / 意图分类 / 参数抽取能力，不展示成完整问答或 RAG 模型
 - OpenAI-compatible endpoint 是 Advanced Settings；UI 不自动扫描或接管用户 `127.0.0.1:11434`
-- Harbor Assistant 不把 cloud fallback 展示成默认架构；UI 文案必须保持 local-first，并明确云端只进入 `semantic.router` / `retrieval.answer` 的受控 fallback。
+- Harbor Assistant 不把 cloud fallback 展示成默认架构；UI 文案必须保持 local-first，明确 NSP / `semantic.router` 是只读 CPU local bootstrap capability，云端只进入明确放行的 `retrieval.answer` 受控 fallback。
 
 ## 6. 共享能力
 

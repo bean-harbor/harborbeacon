@@ -4,9 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release"
+        description: "Debian package version / release tag"
         required: true
-        default: "1.0.0"
+        default: "20260529+harborassistant.live.solidify"
+
+env:
+  HARBOR_ASSISTANT_ARTIFACT_ID: harborassistant-live-solidify-20260529
 
 jobs:
   build-deb:
@@ -45,7 +48,7 @@ jobs:
       - name: Create deb package
         run: |
           VERSION="${{ inputs.tag }}"
-          PKG_NAME="harboros-beacon_${VERSION}_linux_amd64"
+          PKG_NAME="harboros-beacon_${VERSION}_${HARBOR_ASSISTANT_ARTIFACT_ID}_linux_amd64"
           PKG_DIR="./deb-package/${PKG_NAME}"
           BOOTSTRAP_MODEL_DIR="./dist/bootstrap-models/qwen2.5-0.5b-instruct"
           BOOTSTRAP_MODEL_PKG_DIR="${PKG_DIR}/mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/bootstrap-llm"
@@ -76,6 +79,13 @@ jobs:
           dpkg-deb --build ${PKG_DIR}
           mkdir -p ./artifacts/
           mv ./deb-package/${PKG_NAME}.deb ./artifacts/
+
+      - name: Verify deb package metadata
+        run: |
+          VERSION="${{ inputs.tag }}"
+          PKG_NAME="harboros-beacon_${VERSION}_${HARBOR_ASSISTANT_ARTIFACT_ID}_linux_amd64"
+          bash ./scripts/verify_harboros_beacon_deb.sh "./artifacts/${PKG_NAME}.deb"
+          ./target/x86_64-unknown-linux-gnu/release/harboros-beacon --help >/tmp/harboros-beacon-help.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

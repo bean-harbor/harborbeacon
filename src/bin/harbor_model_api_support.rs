@@ -495,12 +495,21 @@ impl BackendRuntime {
 struct CandleBackend {
     config: CandleConfig,
     state: Arc<Mutex<CandleRuntimeState>>,
+    chat_state: Arc<Mutex<CandleChatRuntimeState>>,
+    bootstrap_chat_state: Arc<Mutex<CandleChatRuntimeState>>,
 }
 
 #[derive(Debug)]
 enum CandleRuntimeState {
     Uninitialized,
     Ready(CandleRuntime),
+    Failed(String),
+}
+
+#[derive(Debug)]
+enum CandleChatRuntimeState {
+    Uninitialized,
+    Ready(CandleChatRuntime),
     Failed(String),
 }
 
@@ -512,7 +521,6 @@ struct CandleRuntimeStateSummary {
 
 #[derive(Debug)]
 struct CandleRuntime {
-    chat: CandleChatRuntime,
     embeddings: CandleEmbeddingRuntime,
 }
 
@@ -570,6 +578,7 @@ struct CandleEmbeddingRuntime {
 
 #[derive(Debug)]
 struct CandleChatRequest {
+    model: Option<String>,
     prompt: String,
     max_new_tokens: usize,
     temperature: f64,
@@ -618,17 +627,22 @@ impl CandleBackend {
         Self {
             config,
             state: Arc::new(Mutex::new(CandleRuntimeState::Uninitialized)),
+            chat_state: Arc::new(Mutex::new(CandleChatRuntimeState::Uninitialized)),
+            bootstrap_chat_state: Arc::new(Mutex::new(CandleChatRuntimeState::Uninitialized)),
         }
     }
 
     fn health(&self, config: &ModelApiConfig) -> HealthReport {
         let state = self.runtime_state_summary();
+        let chat_state = self.chat_runtime_state_summary(&self.chat_state);
+        let bootstrap_chat_state = self.chat_runtime_state_summary(&self.bootstrap_chat_state);
+        let chat_loaded = state.loaded || chat_state.loaded || bootstrap_chat_state.loaded;
         let chat_available =
-            state.loaded || local_model_assets_available(&self.config.chat_model_id);
+            chat_loaded || local_model_assets_available(&self.config.chat_model_id);
         let embedding_available =
             state.loaded || local_model_assets_available(&self.config.embedding_model_id);
         let mut notes = vec![CANDLE_CANDIDATE_NOTE.to_string()];
-        if state.loaded {
+        if state.loaded || chat_loaded {
             notes.push("model weights are loaded".to_string());
         } else {
             notes.push("runtime is idle; model weights are not loaded".to_string());
@@ -648,6 +662,15 @@ impl CandleBackend {
         if let Some(error) = state.last_error.as_ref() {
             notes.push(format!("last load error: {}", trim_for_note(error)));
         }
+        if let Some(error) = chat_state.last_error.as_ref() {
+            notes.push(format!("last chat load error: {}", trim_for_note(error)));
+        }
+        if let Some(error) = bootstrap_chat_state.last_error.as_ref() {
+            notes.push(format!(
+                "last bootstrap chat load error: {}",
+                trim_for_note(error)
+            ));
+        }
 
         HealthReport {
             service: SERVICE_NAME,
@@ -655,7 +678,7 @@ impl CandleBackend {
             backend: BackendSummary {
                 kind: BackendKind::Candle.as_str(),
                 ready: true,
-                model_loaded: Some(state.loaded),
+                model_loaded: Some(state.loaded || chat_loaded),
                 note: Some(CANDLE_CANDIDATE_NOTE.to_string()),
             },
             bind: config.bind.clone(),
@@ -684,6 +707,29 @@ impl CandleBackend {
                 last_error: Some(error.clone()),
             },
             CandleRuntimeState::Uninitialized => CandleRuntimeStateSummary::default(),
+        }
+    }
+
+    fn chat_runtime_state_summary(
+        &self,
+        state: &Arc<Mutex<CandleChatRuntimeState>>,
+    ) -> CandleRuntimeStateSummary {
+        let Ok(state) = state.lock() else {
+            return CandleRuntimeStateSummary {
+                loaded: false,
+                last_error: Some("candle chat runtime lock is poisoned".to_string()),
+            };
+        };
+        match &*state {
+            CandleChatRuntimeState::Ready(_) => CandleRuntimeStateSummary {
+                loaded: true,
+                last_error: None,
+            },
+            CandleChatRuntimeState::Failed(error) => CandleRuntimeStateSummary {
+                loaded: false,
+                last_error: Some(error.clone()),
+            },
+            CandleChatRuntimeState::Uninitialized => CandleRuntimeStateSummary::default(),
         }
     }
 
@@ -718,7 +764,10 @@ impl CandleBackend {
                 "id": format!("chatcmpl-{}", current_timestamp_ms()),
                 "object": "chat.completion",
                 "created": current_timestamp_secs(),
-                "model": config.chat_model.clone(),
+                "model": request
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| config.chat_model.clone()),
                 "choices": [
                     {
                         "index": 0,
@@ -799,7 +848,13 @@ impl CandleBackend {
     }
 
     fn run_chat(&self, request: &CandleChatRequest) -> Result<CandleChatCompletion, String> {
-        self.with_runtime(|runtime| self.generate_with_runtime(&mut runtime.chat, request))
+        if self.request_targets_bootstrap_chat(request)
+            && !chat_model_id_matches_bootstrap(&self.config.chat_model_id)
+        {
+            self.with_bootstrap_chat_runtime(|runtime| self.generate_with_runtime(runtime, request))
+        } else {
+            self.with_chat_runtime(|runtime| self.generate_with_runtime(runtime, request))
+        }
     }
 
     fn run_embeddings(
@@ -840,7 +895,60 @@ impl CandleBackend {
         }
     }
 
+    fn with_bootstrap_chat_runtime<T>(
+        &self,
+        f: impl FnOnce(&mut CandleChatRuntime) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_chat_state(&self.bootstrap_chat_state, DEFAULT_CANDLE_CHAT_MODEL_ID, f)
+    }
+
+    fn with_chat_runtime<T>(
+        &self,
+        f: impl FnOnce(&mut CandleChatRuntime) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_chat_state(&self.chat_state, &self.config.chat_model_id, f)
+    }
+
+    fn with_chat_state<T>(
+        &self,
+        runtime_state: &Arc<Mutex<CandleChatRuntimeState>>,
+        model_id: &str,
+        f: impl FnOnce(&mut CandleChatRuntime) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut state = runtime_state
+            .lock()
+            .map_err(|_| "candle chat runtime lock is poisoned".to_string())?;
+
+        if matches!(
+            &*state,
+            CandleChatRuntimeState::Uninitialized | CandleChatRuntimeState::Failed(_)
+        ) {
+            *state = match self.load_chat_runtime(model_id) {
+                Ok(runtime) => CandleChatRuntimeState::Ready(runtime),
+                Err(error) => CandleChatRuntimeState::Failed(format!("{error:#}")),
+            };
+        }
+
+        match &mut *state {
+            CandleChatRuntimeState::Ready(runtime) => f(runtime),
+            CandleChatRuntimeState::Failed(error) => Err(format!(
+                "failed to initialize candle chat runtime: {}",
+                trim_for_note(error.as_str())
+            )),
+            CandleChatRuntimeState::Uninitialized => {
+                Err("candle chat runtime did not initialize".to_string())
+            }
+        }
+    }
+
     fn load_runtime(&self) -> AnyResult<CandleRuntime> {
+        self.prepare_cache()?;
+        let embeddings = self.load_embedding_runtime(&self.config.embedding_model_id)?;
+
+        Ok(CandleRuntime { embeddings })
+    }
+
+    fn prepare_cache(&self) -> AnyResult<()> {
         let cache_dir = PathBuf::from(self.config.cache_dir.trim());
         if cache_dir.as_os_str().is_empty() {
             return Err(anyhow!("candle cache dir is empty"));
@@ -857,10 +965,12 @@ impl CandleBackend {
         })?;
         env::set_var("HF_HOME", &cache_dir);
         env::set_var("HF_HUB_CACHE", &hub_cache_dir);
+        Ok(())
+    }
 
-        let chat_assets = resolve_model_assets(&self.config.chat_model_id)?;
-        let embedding_assets = resolve_model_assets(&self.config.embedding_model_id)?;
-
+    fn load_chat_runtime(&self, model_id: &str) -> AnyResult<CandleChatRuntime> {
+        self.prepare_cache()?;
+        let chat_assets = resolve_model_assets(model_id)?;
         let chat_tokenizer = Tokenizer::from_file(&chat_assets.tokenizer_file)
             .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
         let device = Device::Cpu;
@@ -873,6 +983,18 @@ impl CandleBackend {
             }
         }
 
+        Ok(CandleChatRuntime {
+            model: chat_model,
+            tokenizer: chat_tokenizer,
+            device,
+            eos_tokens,
+        })
+    }
+
+    fn load_embedding_runtime(&self, model_id: &str) -> AnyResult<CandleEmbeddingRuntime> {
+        self.prepare_cache()?;
+        let embedding_assets = resolve_model_assets(model_id)?;
+        let device = Device::Cpu;
         let embedding_tokenizer = Tokenizer::from_file(&embedding_assets.tokenizer_file)
             .map_err(|error| anyhow!("failed to load jina tokenizer: {error}"))?;
         let embedding_vb = unsafe {
@@ -891,19 +1013,18 @@ impl CandleBackend {
         let embedding_model = JinaBertModel::new(embedding_vb, &embedding_config)
             .context("failed to construct jina embedding model")?;
 
-        Ok(CandleRuntime {
-            chat: CandleChatRuntime {
-                model: chat_model,
-                tokenizer: chat_tokenizer,
-                device: device.clone(),
-                eos_tokens,
-            },
-            embeddings: CandleEmbeddingRuntime {
-                model: embedding_model,
-                tokenizer: embedding_tokenizer,
-                device,
-            },
+        Ok(CandleEmbeddingRuntime {
+            model: embedding_model,
+            tokenizer: embedding_tokenizer,
+            device,
         })
+    }
+
+    fn request_targets_bootstrap_chat(&self, request: &CandleChatRequest) -> bool {
+        request
+            .model
+            .as_deref()
+            .is_some_and(chat_model_id_matches_bootstrap)
     }
 
     fn generate_with_runtime(
@@ -1225,12 +1346,23 @@ fn normalize_model(payload: &mut Value, default_model: &str) {
     }
 }
 
+fn chat_model_id_matches_bootstrap(value: &str) -> bool {
+    let normalized = value.trim().trim_end_matches('/');
+    normalized == DEFAULT_CHAT_MODEL || normalized == DEFAULT_CANDLE_CHAT_MODEL_ID
+}
+
 fn parse_candle_chat_request(
     body: &[u8],
     config: &CandleConfig,
 ) -> Result<CandleChatRequest, String> {
     let payload: Value =
         serde_json::from_slice(body).map_err(|error| format!("invalid JSON body: {error}"))?;
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let messages = payload
         .get("messages")
         .and_then(Value::as_array)
@@ -1307,6 +1439,7 @@ fn parse_candle_chat_request(
         .and_then(detect_short_answer_focus);
 
     Ok(CandleChatRequest {
+        model,
         prompt: segments.join("\n"),
         max_new_tokens,
         temperature,
@@ -2261,6 +2394,7 @@ mod tests {
     #[test]
     fn parse_candle_chat_request_wraps_messages_in_chatml() {
         let payload = json!({
+            "model": DEFAULT_CHAT_MODEL,
             "messages": [
                 {"role": "user", "content": "请只回答“是”或“否”：摄像头能用于抓拍吗？"}
             ]
@@ -2275,6 +2409,7 @@ mod tests {
         assert!(request.prompt.contains("<|im_start|>assistant"));
         assert!(request.prompt.contains(CANDLE_OUTPUT_POLICY_PROMPT));
         assert_eq!(request.max_new_tokens, DEFAULT_CANDLE_MAX_NEW_TOKENS);
+        assert_eq!(request.model.as_deref(), Some(DEFAULT_CHAT_MODEL));
     }
 
     #[test]
@@ -2300,6 +2435,28 @@ mod tests {
         assert!(request.prompt.contains("樱花\n更像植物还是工具？"));
         assert_eq!(request.max_new_tokens, 8);
         assert_eq!(request.temperature, 0.4);
+    }
+
+    #[test]
+    fn candle_request_recognizes_bootstrap_chat_model() {
+        assert!(chat_model_id_matches_bootstrap(DEFAULT_CHAT_MODEL));
+        assert!(chat_model_id_matches_bootstrap(
+            DEFAULT_CANDLE_CHAT_MODEL_ID
+        ));
+        assert!(!chat_model_id_matches_bootstrap("qwen2.5-1.5b-instruct"));
+
+        let mut candle = CandleConfig::default();
+        candle.chat_model_id = "/models/qwen2.5-1.5b".to_string();
+        let backend = CandleBackend::new(candle);
+        let request = CandleChatRequest {
+            model: Some(DEFAULT_CHAT_MODEL.to_string()),
+            prompt: "prompt".to_string(),
+            max_new_tokens: 1,
+            temperature: DEFAULT_CANDLE_TEMPERATURE,
+            short_answer_options: Vec::new(),
+            short_answer_focus: None,
+        };
+        assert!(backend.request_targets_bootstrap_chat(&request));
     }
 
     #[test]
@@ -2369,6 +2526,7 @@ mod tests {
 
     fn short_answer_request(options: &[&str]) -> CandleChatRequest {
         CandleChatRequest {
+            model: None,
             prompt: "prompt".to_string(),
             max_new_tokens: DEFAULT_CANDLE_MAX_NEW_TOKENS,
             temperature: DEFAULT_CANDLE_TEMPERATURE,
