@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -47,6 +48,9 @@ struct Cli {
     vlm_prompt: String,
     vlm_sample_every: u64,
     vlm_max_samples: usize,
+    vlm_queue_lock_path: Option<PathBuf>,
+    vlm_global_max_samples: Option<usize>,
+    vlm_trigger_policy: VlmTriggerPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +58,50 @@ enum CaptureMode {
     OneshotFfmpeg,
     PersistentFfmpeg,
     LocalRestream,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VlmTriggerPolicy {
+    DetectionOrPeriodic,
+    Periodic,
+}
+
+impl VlmTriggerPolicy {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "detection_or_periodic" => Ok(Self::DetectionOrPeriodic),
+            "periodic" => Ok(Self::Periodic),
+            other => Err(format!(
+                "invalid --vlm-trigger-policy {other}; expected periodic or detection_or_periodic"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DetectionOrPeriodic => "detection_or_periodic",
+            Self::Periodic => "periodic",
+        }
+    }
+}
+
+struct VlmQueueGuard {
+    lock_path: PathBuf,
+}
+
+impl Drop for VlmQueueGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+enum VlmQueueDecision {
+    Run {
+        sample_index: usize,
+        _guard: Option<VlmQueueGuard>,
+    },
+    Skip,
+    Degraded(String),
 }
 
 #[derive(Debug, Clone)]
@@ -398,30 +446,46 @@ fn run_once(
     let mut vlm_ms = None;
     let mut vlm_error = None;
     if should_run_vlm(cli, iteration, detection_count, *vlm_sample_count) {
-        *vlm_sample_count = vlm_sample_count.saturating_add(1);
-        let started = Instant::now();
-        let execution = run_vlm_summary_for_event(cli, &snapshot_path, &event);
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        vlm_status = Some(execution.status.clone());
-        vlm_ms = Some(elapsed_ms);
-        if !execution.available {
-            vlm_error = Some(sanitize_sensitive(&execution.summary));
-        }
-        event = attach_vlm_summary_to_event(
-            event,
-            execution,
-            elapsed_ms,
-            json!({
-                "runtime_id": "local-openai-compatible-vlm",
-                "model_id": cli.vlm_model.clone(),
-                "sample_policy": {
-                    "sample_every": cli.vlm_sample_every,
-                    "max_samples": cli.vlm_max_samples,
-                    "sample_index": *vlm_sample_count,
+        match claim_vlm_slot(cli, *vlm_sample_count) {
+            VlmQueueDecision::Run {
+                sample_index,
+                _guard,
+            } => {
+                *vlm_sample_count = vlm_sample_count.saturating_add(1);
+                let started = Instant::now();
+                let execution = run_vlm_summary_for_event(cli, &snapshot_path, &event);
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                vlm_status = Some(execution.status.clone());
+                vlm_ms = Some(elapsed_ms);
+                if !execution.available {
+                    vlm_error = Some(sanitize_sensitive(&execution.summary));
                 }
-            }),
-        );
-        event.latency_ms = total_started.elapsed().as_millis() as u64;
+                event = attach_vlm_summary_to_event(
+                    event,
+                    execution,
+                    elapsed_ms,
+                    json!({
+                        "runtime_id": "local-openai-compatible-vlm",
+                        "model_id": cli.vlm_model.clone(),
+                        "sample_policy": {
+                            "sample_every": cli.vlm_sample_every,
+                            "max_samples": cli.vlm_max_samples,
+                            "sample_index": sample_index,
+                            "trigger_policy": cli.vlm_trigger_policy.as_str(),
+                            "queue_mode": cli.vlm_queue_mode(),
+                            "global_max_samples": cli.vlm_global_max_samples,
+                        }
+                    }),
+                );
+                event.latency_ms = total_started.elapsed().as_millis() as u64;
+            }
+            VlmQueueDecision::Skip => {}
+            VlmQueueDecision::Degraded(error) => {
+                vlm_status = Some("degraded".to_string());
+                vlm_ms = Some(0);
+                vlm_error = Some(sanitize_sensitive(&error));
+            }
+        }
     }
 
     let ingest_http_status = if cli.no_post {
@@ -507,11 +571,110 @@ fn should_run_vlm(
     if !cli.vlm_enrich || sample_count >= cli.vlm_max_samples {
         return false;
     }
-    if detection_count.unwrap_or(0) > 0 {
+    if cli.vlm_trigger_policy == VlmTriggerPolicy::DetectionOrPeriodic
+        && detection_count.unwrap_or(0) > 0
+    {
         return true;
     }
     let every = cli.vlm_sample_every.max(1) as usize;
-    iteration == 1 || iteration % every == 0
+    match cli.vlm_trigger_policy {
+        VlmTriggerPolicy::DetectionOrPeriodic => iteration == 1 || iteration % every == 0,
+        VlmTriggerPolicy::Periodic => iteration > 0 && iteration % every == 0,
+    }
+}
+
+fn claim_vlm_slot(cli: &Cli, sample_count: usize) -> VlmQueueDecision {
+    let Some(lock_path) = cli.vlm_queue_lock_path.as_ref() else {
+        return VlmQueueDecision::Run {
+            sample_index: sample_count.saturating_add(1),
+            _guard: None,
+        };
+    };
+    let global_max = cli.vlm_global_max_samples.unwrap_or(cli.vlm_max_samples);
+    if global_max == 0 {
+        return VlmQueueDecision::Skip;
+    }
+    let guard = match acquire_vlm_queue_lock(lock_path) {
+        Ok(guard) => guard,
+        Err(error) => return VlmQueueDecision::Degraded(error),
+    };
+    let counter_path = vlm_queue_count_path(lock_path);
+    let current_count = fs::read_to_string(&counter_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    if current_count >= global_max {
+        return VlmQueueDecision::Skip;
+    }
+    let next_count = current_count.saturating_add(1);
+    if let Err(error) = fs::write(&counter_path, next_count.to_string()) {
+        return VlmQueueDecision::Degraded(format!("failed to update VLM queue counter: {error}"));
+    }
+    VlmQueueDecision::Run {
+        sample_index: next_count,
+        _guard: Some(guard),
+    }
+}
+
+fn acquire_vlm_queue_lock(lock_path: &Path) -> Result<VlmQueueGuard, String> {
+    if let Some(parent) = lock_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create VLM queue lock dir {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let started = Instant::now();
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(_) => {
+                return Ok(VlmQueueGuard {
+                    lock_path: lock_path.to_path_buf(),
+                })
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                remove_stale_vlm_queue_lock(lock_path);
+                if started.elapsed() > Duration::from_secs(300) {
+                    return Err("timed out waiting for global VLM queue lock".to_string());
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to acquire VLM queue lock {}: {error}",
+                    lock_path.display()
+                ))
+            }
+        }
+    }
+}
+
+fn remove_stale_vlm_queue_lock(lock_path: &Path) {
+    let stale = fs::metadata(lock_path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| elapsed > Duration::from_secs(600))
+        .unwrap_or(false);
+    if stale {
+        let _ = fs::remove_file(lock_path);
+    }
+}
+
+fn vlm_queue_count_path(lock_path: &Path) -> PathBuf {
+    let name = lock_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("vlm.queue.lock");
+    lock_path.with_file_name(format!("{name}.count"))
 }
 
 fn run_vlm_summary_for_event(
@@ -1237,6 +1400,16 @@ impl Cli {
                 .ok()
                 .map(|value| parse_u64(&value) as usize)
                 .unwrap_or(1),
+            vlm_queue_lock_path: std::env::var("HARBORNAVI_VLM_QUEUE_LOCK_PATH")
+                .ok()
+                .map(PathBuf::from),
+            vlm_global_max_samples: std::env::var("HARBORNAVI_VLM_GLOBAL_MAX_SAMPLES")
+                .ok()
+                .map(|value| parse_u64(&value) as usize),
+            vlm_trigger_policy: std::env::var("HARBORNAVI_VLM_TRIGGER_POLICY")
+                .ok()
+                .map(|value| VlmTriggerPolicy::parse(&value).unwrap_or_else(|error| fail(&error)))
+                .unwrap_or(VlmTriggerPolicy::DetectionOrPeriodic),
         };
         let mut index = 0usize;
         while index < args.len() {
@@ -1313,6 +1486,28 @@ impl Cli {
                     cli.vlm_max_samples =
                         parse_u64(&take_value(&args, &mut index, "--vlm-max-samples")) as usize
                 }
+                "--vlm-queue-lock-path" => {
+                    cli.vlm_queue_lock_path = Some(PathBuf::from(take_value(
+                        &args,
+                        &mut index,
+                        "--vlm-queue-lock-path",
+                    )))
+                }
+                "--vlm-global-max-samples" => {
+                    cli.vlm_global_max_samples = Some(parse_u64(&take_value(
+                        &args,
+                        &mut index,
+                        "--vlm-global-max-samples",
+                    )) as usize)
+                }
+                "--vlm-trigger-policy" => {
+                    cli.vlm_trigger_policy = VlmTriggerPolicy::parse(&take_value(
+                        &args,
+                        &mut index,
+                        "--vlm-trigger-policy",
+                    ))
+                    .unwrap_or_else(|error| fail(&error));
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -1350,8 +1545,119 @@ fn parse_u64(value: &str) -> u64 {
 
 fn print_usage() {
     println!(
-        "Usage: harbornavi-k3-local-vision-smoke [--camera-id ID] [--rtsp-url URL | --source-secret-ref env:VAR | --snapshot-url URL | --fixture] [--duration-seconds N] [--interval-seconds N] [--phase-offset-ms N] [--capture-mode oneshot_ffmpeg|persistent_ffmpeg|local_restream] [--capture-root PATH] [--max-frame-age-ms N] [--decode-backend NAME] [--beacon-url URL] [--output-dir PATH] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--disable-analyzer] [--vlm-enrich] [--vlm-api-base URL] [--vlm-model MODEL] [--vlm-sample-every N] [--vlm-max-samples N] [--no-post] [--redact-paths]"
+        "Usage: harbornavi-k3-local-vision-smoke [--camera-id ID] [--rtsp-url URL | --source-secret-ref env:VAR | --snapshot-url URL | --fixture] [--duration-seconds N] [--interval-seconds N] [--phase-offset-ms N] [--capture-mode oneshot_ffmpeg|persistent_ffmpeg|local_restream] [--capture-root PATH] [--max-frame-age-ms N] [--decode-backend NAME] [--beacon-url URL] [--output-dir PATH] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--disable-analyzer] [--vlm-enrich] [--vlm-api-base URL] [--vlm-model MODEL] [--vlm-sample-every N] [--vlm-max-samples N] [--vlm-queue-lock-path PATH] [--vlm-global-max-samples N] [--vlm-trigger-policy periodic|detection_or_periodic] [--no-post] [--redact-paths]"
     );
+}
+
+impl Cli {
+    fn vlm_queue_mode(&self) -> &'static str {
+        if self.vlm_queue_lock_path.is_some() {
+            "global_serial"
+        } else {
+            "none"
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_cli() -> Cli {
+        Cli {
+            camera_id: "cam-test".to_string(),
+            rtsp_url: None,
+            source_secret_ref: None,
+            snapshot_url: None,
+            beacon_url: "http://127.0.0.1:4174".to_string(),
+            output_dir: PathBuf::from("/tmp/harbornavi-test"),
+            duration_seconds: 0,
+            interval_seconds: 10,
+            phase_offset_ms: 0,
+            no_post: true,
+            fixture: true,
+            ffmpeg: "ffmpeg".to_string(),
+            capture_mode: CaptureMode::OneshotFfmpeg,
+            capture_root: PathBuf::from("/tmp/harbornavi-test-capture"),
+            max_frame_age_ms: 2500,
+            decode_backend: "ffmpeg_sw".to_string(),
+            analyzer_command: None,
+            model_path: "/tmp/model.onnx".to_string(),
+            label_path: "/tmp/label.txt".to_string(),
+            provider: "cpu".to_string(),
+            redact_paths: true,
+            vlm_enrich: true,
+            vlm_api_base: "http://127.0.0.1:8080/v1".to_string(),
+            vlm_model: "test-vlm".to_string(),
+            vlm_api_key: "local".to_string(),
+            vlm_prompt: "describe".to_string(),
+            vlm_sample_every: 3,
+            vlm_max_samples: 4,
+            vlm_queue_lock_path: None,
+            vlm_global_max_samples: None,
+            vlm_trigger_policy: VlmTriggerPolicy::DetectionOrPeriodic,
+        }
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!("harbornavi-{name}-{}-{millis}", std::process::id()))
+    }
+
+    #[test]
+    fn detection_or_periodic_triggers_on_detection() {
+        let cli = base_cli();
+        assert!(should_run_vlm(&cli, 1, Some(1), 0));
+        assert!(should_run_vlm(&cli, 2, Some(1), 0));
+    }
+
+    #[test]
+    fn periodic_trigger_ignores_detection_until_interval() {
+        let mut cli = base_cli();
+        cli.vlm_trigger_policy = VlmTriggerPolicy::Periodic;
+        assert!(!should_run_vlm(&cli, 1, Some(3), 0));
+        assert!(!should_run_vlm(&cli, 2, Some(3), 0));
+        assert!(should_run_vlm(&cli, 3, Some(0), 0));
+    }
+
+    #[test]
+    fn local_sample_limit_still_applies_before_queue() {
+        let cli = base_cli();
+        assert!(!should_run_vlm(&cli, 1, Some(1), cli.vlm_max_samples));
+    }
+
+    #[test]
+    fn global_vlm_slot_respects_max_samples() {
+        let dir = unique_temp_dir("vlm-queue");
+        let lock_path = dir.join("vlm.queue.lock");
+        let mut cli = base_cli();
+        cli.vlm_queue_lock_path = Some(lock_path.clone());
+        cli.vlm_global_max_samples = Some(1);
+
+        match claim_vlm_slot(&cli, 0) {
+            VlmQueueDecision::Run {
+                sample_index,
+                _guard: guard,
+            } => {
+                assert_eq!(sample_index, 1);
+                assert!(lock_path.exists());
+                drop(guard);
+                assert!(!lock_path.exists());
+            }
+            _ => panic!("first global VLM slot should run"),
+        }
+        assert!(matches!(claim_vlm_slot(&cli, 0), VlmQueueDecision::Skip));
+        assert_eq!(
+            fs::read_to_string(vlm_queue_count_path(&lock_path))
+                .expect("counter exists")
+                .trim(),
+            "1"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 fn fail(message: &str) -> ! {
