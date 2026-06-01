@@ -6,9 +6,9 @@ use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use hf_hub::{
@@ -205,6 +205,7 @@ pub struct AdminApi {
     admin_store: AdminConsoleStore,
     task_service: TaskApiService,
     dvr_runtime: DvrRuntime,
+    hls_live_runtime: HlsLiveRuntime,
     harbor_assistant_dist: PathBuf,
     public_origin: String,
     model_runtime_activation: Option<ModelRuntimeActivationHandler>,
@@ -1252,6 +1253,7 @@ impl AdminApi {
             admin_store,
             task_service,
             dvr_runtime: DvrRuntime::default(),
+            hls_live_runtime: HlsLiveRuntime::default(),
             harbor_assistant_dist,
             public_origin,
             model_runtime_activation: None,
@@ -1530,6 +1532,33 @@ impl AdminApi {
             Method::Get if path.starts_with("/live/cameras/") => self
                 .handle_live_view_page(&raw_url, &path, remote_addr, &headers, &identity_hints)
                 .boxed(),
+            Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/live/start") => {
+                self.handle_camera_hls_live_start(&path, remote_addr, &headers, &identity_hints)
+                    .boxed()
+            }
+            Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/live/stop") => {
+                self.handle_camera_hls_live_stop(
+                    &path,
+                    &mut request,
+                    remote_addr,
+                    &headers,
+                    &identity_hints,
+                )
+                .boxed()
+            }
+            Method::Get if path.starts_with("/api/cameras/") && path.ends_with("/live/status") => {
+                self.handle_camera_hls_live_status(
+                    &raw_url,
+                    &path,
+                    remote_addr,
+                    &headers,
+                    &identity_hints,
+                )
+                .boxed()
+            }
+            Method::Get if parse_camera_hls_live_asset_path(&path).is_some() => {
+                self.handle_camera_hls_live_asset(&path, remote_addr, &headers, &identity_hints)
+            }
             Method::Get if path.starts_with("/api/cameras/") && path.ends_with("/live.mjpeg") => {
                 self.handle_camera_live_mjpeg(&path, remote_addr, &headers, &identity_hints)
             }
@@ -4419,6 +4448,175 @@ impl AdminApi {
         }
     }
 
+    fn handle_camera_hls_live_start(
+        &self,
+        path: &str,
+        remote_addr: Option<SocketAddr>,
+        headers: &[Header],
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        let device_id = match parse_camera_hls_live_start_path(path) {
+            Some(device_id) => device_id,
+            None => return error_json(StatusCode(400), "invalid live start path"),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+
+        let device = match self.load_camera_device(&device_id) {
+            Ok(device) => self.camera_device_with_runtime_credentials(&device),
+            Err(error) if error.contains("device not found") => {
+                return error_json(StatusCode(404), &error)
+            }
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+
+        match self
+            .hls_live_runtime
+            .start_session(&device.device_id, &device.primary_stream.url)
+        {
+            Ok(session) => ok_json(&session.to_response(&self.public_origin)),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_camera_hls_live_status(
+        &self,
+        raw_url: &str,
+        path: &str,
+        remote_addr: Option<SocketAddr>,
+        headers: &[Header],
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        let device_id = match parse_camera_hls_live_status_path(path) {
+            Some(device_id) => device_id,
+            None => return error_json(StatusCode(400), "invalid live status path"),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+        let session_id = parse_query_param(raw_url, "session_id");
+        ok_json(
+            &self
+                .hls_live_runtime
+                .status(&device_id, session_id.as_deref())
+                .to_response(&self.public_origin),
+        )
+    }
+
+    fn handle_camera_hls_live_stop(
+        &self,
+        path: &str,
+        request: &mut Request,
+        remote_addr: Option<SocketAddr>,
+        headers: &[Header],
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        let device_id = match parse_camera_hls_live_stop_path(path) {
+            Some(device_id) => device_id,
+            None => return error_json(StatusCode(400), "invalid live stop path"),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+        let payload = match read_json_body_or_default::<LiveStopRequest>(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        ok_json(
+            &self
+                .hls_live_runtime
+                .stop_session(&device_id, payload.session_id.as_deref())
+                .to_response(&self.public_origin),
+        )
+    }
+
+    fn handle_camera_hls_live_asset(
+        &self,
+        path: &str,
+        remote_addr: Option<SocketAddr>,
+        headers: &[Header],
+        hints: &AccessIdentityHints,
+    ) -> ResponseBox {
+        if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
+            return error_json(StatusCode(403), &error).boxed();
+        }
+
+        let (device_id, session_id, asset_name) = match parse_camera_hls_live_asset_path(path) {
+            Some(parts) => parts,
+            None => return error_json(StatusCode(400), "invalid live asset path").boxed(),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error).boxed();
+        }
+
+        let asset_path =
+            match self
+                .hls_live_runtime
+                .asset_path(&device_id, &session_id, &asset_name)
+            {
+                Ok(path) => path,
+                Err(error) if error.contains("not found") => {
+                    return error_json(StatusCode(404), &error).boxed()
+                }
+                Err(error) => return error_json(StatusCode(422), &error).boxed(),
+            };
+
+        let file = match fs::File::open(&asset_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return error_json(StatusCode(404), "live asset not found").boxed()
+            }
+            Err(error) => {
+                return error_json(
+                    StatusCode(422),
+                    &format!("failed to read live asset: {error}"),
+                )
+                .boxed()
+            }
+        };
+
+        let metadata = file.metadata().ok();
+        let headers = vec![
+            Header::from_bytes(
+                b"Content-Type".as_slice(),
+                live_asset_mime_type(&asset_name).as_bytes(),
+            )
+            .expect("header"),
+            Header::from_bytes(b"X-Accel-Buffering".as_slice(), b"no".as_slice()).expect("header"),
+        ];
+        let mut response = Response::new(
+            StatusCode(200),
+            headers,
+            file,
+            metadata.map(|value| value.len() as usize),
+            None,
+        )
+        .boxed();
+        add_common_headers(&mut response);
+        response
+    }
+
     fn handle_camera_live_mjpeg(
         &self,
         path: &str,
@@ -6550,6 +6748,10 @@ fn is_admin_surface_path(path: &str) -> bool {
         || (path.starts_with("/api/cameras/") && path.ends_with("/share-link"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/snapshot.jpg"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/live.mjpeg"))
+        || (path.starts_with("/api/cameras/") && path.ends_with("/live/start"))
+        || (path.starts_with("/api/cameras/") && path.ends_with("/live/stop"))
+        || (path.starts_with("/api/cameras/") && path.ends_with("/live/status"))
+        || parse_camera_hls_live_asset_path(path).is_some()
         || (path.starts_with("/api/cameras/") && path.ends_with("/recordings/start"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/recordings/stop"))
         || (path.starts_with("/api/share-links/") && path.ends_with("/revoke"))
@@ -13657,6 +13859,46 @@ fn parse_camera_live_stream_path(path: &str) -> Option<String> {
     }
 }
 
+fn parse_camera_hls_live_start_path(path: &str) -> Option<String> {
+    parse_camera_live_action_path(path, "/live/start")
+}
+
+fn parse_camera_hls_live_stop_path(path: &str) -> Option<String> {
+    parse_camera_live_action_path(path, "/live/stop")
+}
+
+fn parse_camera_hls_live_status_path(path: &str) -> Option<String> {
+    parse_camera_live_action_path(path, "/live/status")
+}
+
+fn parse_camera_live_action_path(path: &str, suffix: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/cameras/")?;
+    let device_id = trimmed.strip_suffix(suffix)?;
+    if device_id.is_empty() {
+        None
+    } else {
+        percent_decode_path_segment(device_id).ok()
+    }
+}
+
+fn parse_camera_hls_live_asset_path(path: &str) -> Option<(String, String, String)> {
+    let trimmed = path.strip_prefix("/api/cameras/")?;
+    let (device_id, rest) = trimmed.split_once("/live/")?;
+    let (session_id, asset_name) = rest.split_once('/')?;
+    if device_id.is_empty() || session_id.is_empty() || !session_id.starts_with("live-") {
+        return None;
+    }
+    let asset_name = percent_decode_path_segment(asset_name).ok()?;
+    if !is_safe_live_asset_name(&asset_name) {
+        return None;
+    }
+    Some((
+        percent_decode_path_segment(device_id).ok()?,
+        percent_decode_path_segment(session_id).ok()?,
+        asset_name,
+    ))
+}
+
 fn parse_camera_analyze_path(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/cameras/")?;
     let device_id = trimmed.strip_suffix("/analyze")?;
@@ -13829,6 +14071,391 @@ fn decode_hex(value: u8) -> Option<u8> {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct LiveStopRequest {
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HlsLiveSessionProjection {
+    device_id: String,
+    session_id: Option<String>,
+    status: String,
+    playlist_url: Option<String>,
+    playlist_ready: bool,
+    mode: String,
+    codec: String,
+    started_at: Option<String>,
+    updated_at: String,
+    message: String,
+}
+
+impl HlsLiveSessionProjection {
+    fn stopped(device_id: &str, message: impl Into<String>) -> Self {
+        Self {
+            device_id: device_id.to_string(),
+            session_id: None,
+            status: "stopped".to_string(),
+            playlist_url: None,
+            playlist_ready: false,
+            mode: "hls_fmp4".to_string(),
+            codec: "h264_copy".to_string(),
+            started_at: None,
+            updated_at: current_unix_secs().to_string(),
+            message: message.into(),
+        }
+    }
+
+    fn to_response(&self, _public_origin: &str) -> Self {
+        self.clone()
+    }
+}
+
+struct HlsLiveSession {
+    device_id: String,
+    session_id: String,
+    root: PathBuf,
+    started_at: String,
+    child: Child,
+}
+
+#[derive(Clone, Default)]
+struct HlsLiveRuntime {
+    inner: Arc<Mutex<HlsLiveRuntimeInner>>,
+}
+
+#[derive(Default)]
+struct HlsLiveRuntimeInner {
+    sessions: HashMap<String, HlsLiveSession>,
+    device_sessions: HashMap<String, String>,
+}
+
+impl HlsLiveRuntime {
+    fn start_session(
+        &self,
+        device_id: &str,
+        stream_url: &str,
+    ) -> Result<HlsLiveSessionProjection, String> {
+        let ffmpeg_bin = resolve_ffmpeg_bin()
+            .ok_or_else(|| format!("当前机器缺少 ffmpeg，{}", ffmpeg_resolution_hint()))?;
+        let session_id = format!("live-{}", Uuid::new_v4().as_simple());
+        let root = hls_live_root()
+            .join(safe_live_path_segment(device_id))
+            .join(&session_id);
+        if root.exists() {
+            fs::remove_dir_all(&root)
+                .map_err(|error| format!("failed to reset live session directory: {error}"))?;
+        }
+        fs::create_dir_all(&root)
+            .map_err(|error| format!("failed to create live session directory: {error}"))?;
+
+        let playlist_path = root.join("index.m3u8");
+        let init_path = root.join("init.mp4");
+        let segment_pattern = root.join("segment_%05d.m4s");
+        let mut child = Command::new(&ffmpeg_bin)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-rtsp_transport",
+                "tcp",
+                "-fflags",
+                "nobuffer",
+                "-flags",
+                "low_delay",
+                "-i",
+                stream_url,
+                "-map",
+                "0:v:0",
+                "-an",
+                "-c:v",
+                "copy",
+                "-f",
+                "hls",
+                "-hls_time",
+                "1",
+                "-hls_list_size",
+                "6",
+                "-hls_flags",
+                "delete_segments+omit_endlist+independent_segments",
+                "-hls_segment_type",
+                "fmp4",
+                "-hls_fmp4_init_filename",
+                init_path.to_string_lossy().as_ref(),
+                "-hls_segment_filename",
+                segment_pattern.to_string_lossy().as_ref(),
+                playlist_path.to_string_lossy().as_ref(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("启动 H.264 live remux ffmpeg 失败: {error}"))?;
+
+        for _ in 0..20 {
+            if playlist_path.exists() {
+                break;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = fs::remove_dir_all(&root);
+                    return Err(format!(
+                        "H.264 live remux exited before playlist was ready: {status}"
+                    ));
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(100)),
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&root);
+                    return Err(format!("failed to check live remux process: {error}"));
+                }
+            }
+        }
+
+        let session = HlsLiveSession {
+            device_id: device_id.to_string(),
+            session_id: session_id.clone(),
+            root,
+            started_at: current_unix_secs().to_string(),
+            child,
+        };
+
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "live session lock is poisoned".to_string())?;
+        if let Some(existing_session_id) = inner.device_sessions.remove(device_id) {
+            if let Some(mut existing) = inner.sessions.remove(&existing_session_id) {
+                stop_hls_live_session(&mut existing);
+            }
+        }
+        inner
+            .device_sessions
+            .insert(device_id.to_string(), session_id.clone());
+        inner.sessions.insert(session_id.clone(), session);
+        Ok(self.projection_locked(&mut inner, device_id, Some(&session_id)))
+    }
+
+    fn status(&self, device_id: &str, session_id: Option<&str>) -> HlsLiveSessionProjection {
+        let Ok(mut inner) = self.inner.lock() else {
+            return HlsLiveSessionProjection::stopped(
+                device_id,
+                "live session lock is unavailable",
+            );
+        };
+        self.projection_locked(&mut inner, device_id, session_id)
+    }
+
+    fn stop_session(&self, device_id: &str, session_id: Option<&str>) -> HlsLiveSessionProjection {
+        let Ok(mut inner) = self.inner.lock() else {
+            return HlsLiveSessionProjection::stopped(
+                device_id,
+                "live session lock is unavailable",
+            );
+        };
+        let Some(session_id) = session_id
+            .map(str::to_string)
+            .or_else(|| inner.device_sessions.get(device_id).cloned())
+        else {
+            return HlsLiveSessionProjection::stopped(device_id, "no live session is running");
+        };
+        let Some(mut session) = inner.sessions.remove(&session_id) else {
+            inner.device_sessions.remove(device_id);
+            return HlsLiveSessionProjection::stopped(
+                device_id,
+                "live session was already stopped",
+            );
+        };
+        inner.device_sessions.remove(&session.device_id);
+        stop_hls_live_session(&mut session);
+        HlsLiveSessionProjection {
+            device_id: session.device_id,
+            session_id: Some(session.session_id),
+            status: "stopped".to_string(),
+            playlist_url: None,
+            playlist_ready: false,
+            mode: "hls_fmp4".to_string(),
+            codec: "h264_copy".to_string(),
+            started_at: Some(session.started_at),
+            updated_at: current_unix_secs().to_string(),
+            message: "live session stopped".to_string(),
+        }
+    }
+
+    fn asset_path(
+        &self,
+        device_id: &str,
+        session_id: &str,
+        asset_name: &str,
+    ) -> Result<PathBuf, String> {
+        if !is_safe_live_asset_name(asset_name) {
+            return Err("unsafe live asset path".to_string());
+        }
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "live session lock is poisoned".to_string())?;
+        let session = inner
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| "live session not found".to_string())?;
+        if session.device_id != device_id {
+            return Err("live session not found for camera".to_string());
+        }
+        let path = session.root.join(asset_name);
+        if !path_is_same_or_inside(&path.to_string_lossy(), &session.root.to_string_lossy()) {
+            return Err("unsafe live asset path".to_string());
+        }
+        Ok(path)
+    }
+
+    fn projection_locked(
+        &self,
+        inner: &mut HlsLiveRuntimeInner,
+        device_id: &str,
+        session_id: Option<&str>,
+    ) -> HlsLiveSessionProjection {
+        let Some(session_id) = session_id
+            .map(str::to_string)
+            .or_else(|| inner.device_sessions.get(device_id).cloned())
+        else {
+            return HlsLiveSessionProjection::stopped(device_id, "no live session is running");
+        };
+
+        let Some(session) = inner.sessions.get_mut(&session_id) else {
+            inner.device_sessions.remove(device_id);
+            return HlsLiveSessionProjection::stopped(device_id, "live session is not registered");
+        };
+        if session.device_id != device_id {
+            return HlsLiveSessionProjection::stopped(
+                device_id,
+                "live session belongs to another camera",
+            );
+        }
+        match session.child.try_wait() {
+            Ok(Some(status)) => {
+                let mut session = inner
+                    .sessions
+                    .remove(&session_id)
+                    .expect("session exists after get_mut");
+                inner.device_sessions.remove(&session.device_id);
+                stop_hls_live_session(&mut session);
+                return HlsLiveSessionProjection {
+                    device_id: session.device_id,
+                    session_id: Some(session.session_id),
+                    status: "failed".to_string(),
+                    playlist_url: None,
+                    playlist_ready: false,
+                    mode: "hls_fmp4".to_string(),
+                    codec: "h264_copy".to_string(),
+                    started_at: Some(session.started_at),
+                    updated_at: current_unix_secs().to_string(),
+                    message: format!("live remux process exited: {status}"),
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return HlsLiveSessionProjection {
+                    device_id: device_id.to_string(),
+                    session_id: Some(session_id),
+                    status: "degraded".to_string(),
+                    playlist_url: None,
+                    playlist_ready: false,
+                    mode: "hls_fmp4".to_string(),
+                    codec: "h264_copy".to_string(),
+                    started_at: Some(session.started_at.clone()),
+                    updated_at: current_unix_secs().to_string(),
+                    message: format!("failed to inspect live remux process: {error}"),
+                };
+            }
+        }
+
+        let playlist_ready = session.root.join("index.m3u8").exists();
+        HlsLiveSessionProjection {
+            device_id: session.device_id.clone(),
+            session_id: Some(session.session_id.clone()),
+            status: if playlist_ready {
+                "running"
+            } else {
+                "starting"
+            }
+            .to_string(),
+            playlist_url: Some(format!(
+                "/api/beacon/cameras/{}/live/{}/index.m3u8",
+                url_encode_path_segment(&session.device_id),
+                url_encode_path_segment(&session.session_id)
+            )),
+            playlist_ready,
+            mode: "hls_fmp4".to_string(),
+            codec: "h264_copy".to_string(),
+            started_at: Some(session.started_at.clone()),
+            updated_at: current_unix_secs().to_string(),
+            message: if playlist_ready {
+                "H.264 live remux is running"
+            } else {
+                "H.264 live remux is starting"
+            }
+            .to_string(),
+        }
+    }
+}
+
+fn stop_hls_live_session(session: &mut HlsLiveSession) {
+    let _ = session.child.kill();
+    let _ = session.child.wait();
+    let _ = fs::remove_dir_all(&session.root);
+}
+
+fn hls_live_root() -> PathBuf {
+    env::var("HARBORNAVI_LIVE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/run/harbornavi/live"))
+}
+
+fn safe_live_path_segment(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            output.push(ch);
+        } else {
+            output.push('_');
+        }
+    }
+    if output.is_empty() {
+        "camera".to_string()
+    } else {
+        output
+    }
+}
+
+fn is_safe_live_asset_name(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains("..")
+        && matches!(
+            Path::new(value).extension().and_then(|ext| ext.to_str()),
+            Some("m3u8" | "m4s" | "mp4" | "ts")
+        )
+}
+
+fn live_asset_mime_type(value: &str) -> &'static str {
+    match Path::new(value).extension().and_then(|ext| ext.to_str()) {
+        Some("m3u8") => "application/vnd.apple.mpegurl",
+        Some("m4s") => "video/iso.segment",
+        Some("mp4") => "video/mp4",
+        Some("ts") => "video/mp2t",
+        _ => "application/octet-stream",
+    }
+}
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs()
+}
+
 struct FfmpegMjpegStream {
     child: Child,
     stdout: ChildStdout,
@@ -13909,13 +14536,16 @@ mod tests {
         harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
-        is_harbor_assistant_surface_path, knowledge_preview_mime_supported,
-        latest_model_download_jobs, live_bridge_provider_from_setup_status,
-        local_model_catalog_item, local_model_catalog_specs, mime_type_for_path,
-        model_download_huggingface_endpoint, model_download_huggingface_endpoints,
-        model_download_jobs_status, model_hardware_recommendation, model_snapshot_file_allowed,
-        normalize_unified_admin_path, overlay_model_endpoints_with_runtime_truth,
-        parse_approval_decision_path, parse_camera_analyze_path, parse_camera_live_page_path,
+        is_harbor_assistant_surface_path, is_safe_live_asset_name,
+        knowledge_preview_mime_supported, latest_model_download_jobs,
+        live_bridge_provider_from_setup_status, local_model_catalog_item,
+        local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
+        model_download_huggingface_endpoints, model_download_jobs_status,
+        model_hardware_recommendation, model_snapshot_file_allowed, normalize_unified_admin_path,
+        overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
+        parse_camera_analyze_path, parse_camera_hls_live_asset_path,
+        parse_camera_hls_live_start_path, parse_camera_hls_live_status_path,
+        parse_camera_hls_live_stop_path, parse_camera_live_page_path,
         parse_camera_live_stream_path, parse_camera_recording_start_path,
         parse_camera_recording_stop_path, parse_camera_share_link_path, parse_camera_snapshot_path,
         parse_camera_task_snapshot_path, parse_device_credential_status_path,
@@ -14228,6 +14858,28 @@ mod tests {
             Some("camera 1/left".to_string())
         );
         assert_eq!(
+            parse_camera_hls_live_start_path(&format!("/api/cameras/{encoded}/live/start")),
+            Some("camera 1/left".to_string())
+        );
+        assert_eq!(
+            parse_camera_hls_live_stop_path(&format!("/api/cameras/{encoded}/live/stop")),
+            Some("camera 1/left".to_string())
+        );
+        assert_eq!(
+            parse_camera_hls_live_status_path(&format!("/api/cameras/{encoded}/live/status")),
+            Some("camera 1/left".to_string())
+        );
+        assert_eq!(
+            parse_camera_hls_live_asset_path(&format!(
+                "/api/cameras/{encoded}/live/live-abc123/index.m3u8"
+            )),
+            Some((
+                "camera 1/left".to_string(),
+                "live-abc123".to_string(),
+                "index.m3u8".to_string()
+            ))
+        );
+        assert_eq!(
             parse_camera_recording_start_path(&format!("/api/cameras/{encoded}/recordings/start")),
             Some("camera 1/left".to_string())
         );
@@ -14238,6 +14890,34 @@ mod tests {
         assert_eq!(
             parse_camera_live_page_path(&format!("/live/cameras/{encoded}")),
             Some("camera 1/left".to_string())
+        );
+    }
+
+    #[test]
+    fn hls_live_asset_paths_reject_traversal() {
+        assert!(is_safe_live_asset_name("index.m3u8"));
+        assert!(is_safe_live_asset_name("segment_00001.m4s"));
+        assert!(is_safe_live_asset_name("init.mp4"));
+        assert!(!is_safe_live_asset_name("../index.m3u8"));
+        assert!(!is_safe_live_asset_name("nested/index.m3u8"));
+        assert!(!is_safe_live_asset_name("segment_00001.jpg"));
+        assert_eq!(
+            parse_camera_hls_live_asset_path(
+                "/api/cameras/cam-1/live/live-abc123/..%2Fsecret.m3u8"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_camera_hls_live_asset_path(
+                "/api/cameras/cam-1/live/live-abc123/%2e%2e%2Fsecret.m3u8"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_camera_hls_live_asset_path(
+                "/api/cameras/cam-1/live/live-abc123/nested/index.m3u8"
+            ),
+            None
         );
     }
 
