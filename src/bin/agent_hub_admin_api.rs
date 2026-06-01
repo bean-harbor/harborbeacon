@@ -14136,6 +14136,9 @@ impl HlsLiveRuntime {
         device_id: &str,
         stream_url: &str,
     ) -> Result<HlsLiveSessionProjection, String> {
+        if stream_url.trim().is_empty() {
+            return Err("camera RTSP stream is not configured".to_string());
+        }
         let ffmpeg_bin = resolve_ffmpeg_bin()
             .ok_or_else(|| format!("当前机器缺少 ffmpeg，{}", ffmpeg_resolution_hint()))?;
         let session_id = format!("live-{}", Uuid::new_v4().as_simple());
@@ -14150,9 +14153,8 @@ impl HlsLiveRuntime {
             .map_err(|error| format!("failed to create live session directory: {error}"))?;
 
         let playlist_path = root.join("index.m3u8");
-        let init_path = root.join("init.mp4");
-        let segment_pattern = root.join("segment_%05d.m4s");
         let mut child = Command::new(&ffmpeg_bin)
+            .current_dir(&root)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -14182,10 +14184,10 @@ impl HlsLiveRuntime {
                 "-hls_segment_type",
                 "fmp4",
                 "-hls_fmp4_init_filename",
-                init_path.to_string_lossy().as_ref(),
+                "init.mp4",
                 "-hls_segment_filename",
-                segment_pattern.to_string_lossy().as_ref(),
-                playlist_path.to_string_lossy().as_ref(),
+                "segment_%05d.m4s",
+                "index.m3u8",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
