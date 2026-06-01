@@ -46,10 +46,10 @@ use harborbeacon_local_agent::runtime::admin_console::{
     device_rtsp_credential_id, harboros_writable_root, normalize_delivery_surface,
     path_is_same_or_inside, user_default_delivery_surface, user_recent_interactive_surface,
     validate_knowledge_settings, AccountManagementSnapshot, AdminConsoleState, AdminConsoleStore,
-    AdminDefaults, AdminModelCenterState, BridgeProviderConfig, DeviceCredentialSecret,
-    DeviceEvidenceRecord, GatewayStatusSummary, HomeAssistantAdminState, HomeAssistantConfigUpdate,
-    KnowledgeIndexJobRecord, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
-    ModelRuntimeRecord, RagResourceProfile,
+    AdminDefaults, AdminModelCenterState, AutomationRuleReview, BridgeProviderConfig,
+    DeviceCredentialSecret, DeviceEvidenceRecord, GatewayStatusSummary, HomeAssistantAdminState,
+    HomeAssistantConfigUpdate, KnowledgeIndexJobRecord, KnowledgeSettings, KnowledgeSourceRoot,
+    ModelDownloadJobRecord, ModelRuntimeRecord, RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::discovery::RtspProbeRequest;
 use harborbeacon_local_agent::runtime::dvr::{
@@ -447,6 +447,50 @@ struct NotificationTargetDefaultRequest {
 #[derive(Debug, Serialize)]
 struct NotificationTargetsResponse {
     targets: Vec<harborbeacon_local_agent::runtime::admin_console::NotificationTargetRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutomationReviewRequest {
+    #[serde(default)]
+    review_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    source_channel: Option<String>,
+    #[serde(default)]
+    source_conversation_id: Option<String>,
+    original_prompt: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    trigger_definition: Option<Value>,
+    #[serde(default)]
+    condition_definition: Option<Value>,
+    #[serde(default)]
+    action_plan: Option<Value>,
+    #[serde(default)]
+    device_refs: Vec<Value>,
+    #[serde(default)]
+    risk_level: Option<String>,
+    #[serde(default)]
+    requires_approval: bool,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    rule_id: Option<String>,
+    #[serde(default)]
+    run_summaries: Vec<Value>,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct AutomationReviewsResponse {
+    generated_at: String,
+    pending_count: usize,
+    reviews: Vec<AutomationRuleReview>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1460,6 +1504,9 @@ impl AdminApi {
             Method::Get if path == "/api/tasks/approvals" => {
                 self.handle_pending_approvals(&identity_hints).boxed()
             }
+            Method::Get if path == "/api/automation/reviews" => {
+                self.handle_automation_reviews(&identity_hints).boxed()
+            }
             Method::Get if path == "/api/admin/notification-targets" => {
                 self.handle_notification_targets(&identity_hints).boxed()
             }
@@ -1507,6 +1554,9 @@ impl AdminApi {
                 .boxed(),
             Method::Post if path == "/api/admin/notification-targets/default" => self
                 .handle_set_default_notification_target(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post if path == "/api/automation/reviews" => self
+                .handle_create_automation_review(&mut request, &identity_hints)
                 .boxed(),
             Method::Post if path == "/api/models/endpoints" => self
                 .handle_create_model_endpoint(&mut request, &identity_hints)
@@ -1581,6 +1631,36 @@ impl AdminApi {
             {
                 self.handle_reject_approval(path.as_str(), &mut request, &identity_hints)
                     .boxed()
+            }
+            Method::Post
+                if path.starts_with("/api/automation/reviews/") && path.ends_with("/enable") =>
+            {
+                self.handle_update_automation_review_status(
+                    path.as_str(),
+                    "active",
+                    &identity_hints,
+                )
+                .boxed()
+            }
+            Method::Post
+                if path.starts_with("/api/automation/reviews/") && path.ends_with("/pause") =>
+            {
+                self.handle_update_automation_review_status(
+                    path.as_str(),
+                    "paused",
+                    &identity_hints,
+                )
+                .boxed()
+            }
+            Method::Post
+                if path.starts_with("/api/automation/reviews/") && path.ends_with("/discard") =>
+            {
+                self.handle_update_automation_review_status(
+                    path.as_str(),
+                    "discarded",
+                    &identity_hints,
+                )
+                .boxed()
             }
             Method::Post if path == "/api/discovery/scan" => {
                 self.handle_scan(&mut request, &identity_hints).boxed()
@@ -3339,6 +3419,87 @@ impl AdminApi {
                 approval,
                 task_response: None,
             }),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_automation_reviews(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.load_or_create_state() {
+            Ok(state) => ok_json(&build_automation_reviews_response(state.automation_reviews)),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_create_automation_review(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
+            return error_json(StatusCode(403), &error);
+        }
+        let body: AutomationReviewRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let review = AutomationRuleReview {
+            review_id: body.review_id.unwrap_or_default(),
+            workspace_id: body.workspace_id.unwrap_or_default(),
+            source: body
+                .source
+                .unwrap_or_else(|| "harbor_assistant".to_string()),
+            source_channel: body.source_channel,
+            source_conversation_id: body.source_conversation_id,
+            original_prompt: body.original_prompt,
+            status: body.status.unwrap_or_else(|| "draft".to_string()),
+            trigger_definition: body.trigger_definition,
+            condition_definition: body.condition_definition,
+            action_plan: body.action_plan,
+            device_refs: body.device_refs,
+            risk_level: body.risk_level,
+            requires_approval: body.requires_approval,
+            created_at: None,
+            updated_at: None,
+            expires_at: body.expires_at,
+            rule_id: body.rule_id,
+            run_summaries: body.run_summaries,
+            metadata: body.metadata,
+        };
+        match self
+            .admin_store
+            .upsert_automation_review(review)
+            .map(|state| build_automation_reviews_response(state.automation_reviews))
+        {
+            Ok(payload) => ok_json(&payload),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_update_automation_review_status(
+        &self,
+        path: &str,
+        status: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
+            return error_json(StatusCode(403), &error);
+        }
+        let review_id = match parse_automation_review_action_path(path) {
+            Some(review_id) => review_id,
+            None => return error_json(StatusCode(400), "invalid automation review path"),
+        };
+        match self
+            .admin_store
+            .set_automation_review_status(&review_id, status)
+            .map(|state| build_automation_reviews_response(state.automation_reviews))
+        {
+            Ok(payload) => ok_json(&payload),
             Err(error) => error_json(StatusCode(422), &error),
         }
     }
@@ -5146,6 +5307,33 @@ fn parse_query_param(url: &str, key: &str) -> Option<String> {
     None
 }
 
+fn parse_automation_review_action_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/automation/reviews/")?;
+    let (review_id, action) = trimmed.rsplit_once('/')?;
+    if !matches!(action, "enable" | "pause" | "discard") {
+        return None;
+    }
+    let review_id = review_id.trim();
+    if review_id.is_empty() || review_id.contains('/') {
+        return None;
+    }
+    Some(review_id.to_string())
+}
+
+fn build_automation_reviews_response(
+    reviews: Vec<AutomationRuleReview>,
+) -> AutomationReviewsResponse {
+    let pending_count = reviews
+        .iter()
+        .filter(|review| matches!(review.status.as_str(), "draft" | "pending"))
+        .count();
+    AutomationReviewsResponse {
+        generated_at: now_unix_string(),
+        pending_count,
+        reviews,
+    }
+}
+
 fn request_identity_hints(url: &str, headers: &[Header]) -> AccessIdentityHints {
     AccessIdentityHints {
         user_id: header_value(headers, "X-Harbor-User-Id")
@@ -6350,6 +6538,8 @@ fn is_admin_surface_path(path: &str) -> bool {
         || (path.starts_with("/api/access/members/") && path.ends_with("/default-delivery-surface"))
         || path == "/api/tasks/approvals"
         || path.starts_with("/api/tasks/approvals/")
+        || path == "/api/automation/reviews"
+        || path.starts_with("/api/automation/reviews/")
         || path == "/api/discovery/scan"
         || path == "/api/devices/manual"
         || path == "/api/devices/default-camera"
@@ -14450,6 +14640,10 @@ mod tests {
         ));
         assert!(is_admin_surface_path(
             "/api/tasks/approvals/approval-1/reject"
+        ));
+        assert!(is_admin_surface_path("/api/automation/reviews"));
+        assert!(is_admin_surface_path(
+            "/api/automation/reviews/review-1/discard"
         ));
         assert!(is_admin_surface_path("/api/cameras/camera-1/share-link"));
         assert!(is_admin_surface_path("/api/cameras/recording-settings"));

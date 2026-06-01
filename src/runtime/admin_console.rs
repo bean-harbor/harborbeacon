@@ -154,6 +154,46 @@ pub struct NotificationTargetRecord {
     pub is_default: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutomationRuleReview {
+    pub review_id: String,
+    #[serde(default = "default_workspace_id")]
+    pub workspace_id: String,
+    #[serde(default = "default_automation_review_source")]
+    pub source: String,
+    #[serde(default)]
+    pub source_channel: Option<String>,
+    #[serde(default)]
+    pub source_conversation_id: Option<String>,
+    pub original_prompt: String,
+    #[serde(default = "default_automation_review_status")]
+    pub status: String,
+    #[serde(default)]
+    pub trigger_definition: Option<Value>,
+    #[serde(default)]
+    pub condition_definition: Option<Value>,
+    #[serde(default)]
+    pub action_plan: Option<Value>,
+    #[serde(default)]
+    pub device_refs: Vec<Value>,
+    #[serde(default)]
+    pub risk_level: Option<String>,
+    #[serde(default)]
+    pub requires_approval: bool,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    #[serde(default)]
+    pub run_summaries: Vec<Value>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdminDefaults {
     pub cidr: String,
@@ -475,6 +515,8 @@ pub struct AdminConsoleState {
     #[serde(default)]
     pub notification_targets: Vec<NotificationTargetRecord>,
     #[serde(default)]
+    pub automation_reviews: Vec<AutomationRuleReview>,
+    #[serde(default)]
     pub device_credentials: Vec<DeviceCredentialSecret>,
     #[serde(default)]
     pub device_evidence: Vec<DeviceEvidenceRecord>,
@@ -686,6 +728,18 @@ const HARBOROS_WRITABLE_ROOT_ENV: &str = "HARBOR_HARBOROS_WRITABLE_ROOT";
 const DEFAULT_HARBOROS_WRITABLE_ROOT: &str = "/mnt/software/harborbeacon-agent-ci";
 const DEFAULT_KNOWLEDGE_INDEX_SUBDIR: &str = "knowledge-index";
 const MODEL_API_BASE_URL_ENV: &str = "HARBOR_MODEL_API_BASE_URL";
+
+fn default_workspace_id() -> String {
+    DEFAULT_WORKSPACE_ID.to_string()
+}
+
+fn default_automation_review_source() -> String {
+    "harbor_assistant".to_string()
+}
+
+fn default_automation_review_status() -> String {
+    "draft".to_string()
+}
 const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
 const DEFAULT_MODEL_API_BASE_URL: &str = "http://127.0.0.1:4174/api/inference/v1";
 const DEFAULT_MODEL_API_TOKEN: &str = "harbor-local-model-token";
@@ -1026,6 +1080,56 @@ impl AdminConsoleStore {
             return Err(format!("未找到 notification target {target_id}"));
         }
         state.notification_targets = sanitize_notification_targets(state.notification_targets);
+        self.save_projected_state(state)
+    }
+
+    pub fn upsert_automation_review(
+        &self,
+        review: AutomationRuleReview,
+    ) -> Result<AdminConsoleState, String> {
+        let mut state = self.load_or_create_state()?;
+        let mut review = sanitize_automation_review(review)?;
+        let now = model_test_timestamp();
+        if review.created_at.is_none() {
+            review.created_at = Some(now.clone());
+        }
+        review.updated_at = Some(now);
+
+        if let Some(existing) = state
+            .automation_reviews
+            .iter_mut()
+            .find(|existing| existing.review_id == review.review_id)
+        {
+            *existing = review;
+        } else {
+            state.automation_reviews.push(review);
+        }
+
+        state.automation_reviews = sanitize_automation_reviews(state.automation_reviews);
+        self.save_projected_state(state)
+    }
+
+    pub fn set_automation_review_status(
+        &self,
+        review_id: &str,
+        status: &str,
+    ) -> Result<AdminConsoleState, String> {
+        let review_id = review_id.trim();
+        if review_id.is_empty() {
+            return Err("review_id 不能为空".to_string());
+        }
+        let normalized_status = sanitize_automation_review_status(status)?;
+        let mut state = self.load_or_create_state()?;
+        let Some(review) = state
+            .automation_reviews
+            .iter_mut()
+            .find(|review| review.review_id == review_id)
+        else {
+            return Err(format!("未找到 automation review {review_id}"));
+        };
+        review.status = normalized_status;
+        review.updated_at = Some(model_test_timestamp());
+        state.automation_reviews = sanitize_automation_reviews(state.automation_reviews);
         self.save_projected_state(state)
     }
 
@@ -2451,6 +2555,106 @@ fn new_notification_target_id() -> String {
     format!("target-{}", Uuid::new_v4().simple())
 }
 
+fn sanitize_automation_reviews(reviews: Vec<AutomationRuleReview>) -> Vec<AutomationRuleReview> {
+    let mut normalized = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for review in reviews {
+        let Ok(review) = sanitize_automation_review(review) else {
+            continue;
+        };
+        if !seen_ids.insert(review.review_id.clone()) {
+            continue;
+        }
+        normalized.push(review);
+    }
+    normalized.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    normalized.truncate(100);
+    normalized
+}
+
+fn sanitize_automation_review(
+    mut review: AutomationRuleReview,
+) -> Result<AutomationRuleReview, String> {
+    review.review_id = review.review_id.trim().to_string();
+    if review.review_id.is_empty() {
+        review.review_id = new_automation_review_id();
+    }
+    review.workspace_id =
+        non_empty_opt(&review.workspace_id).unwrap_or_else(|| DEFAULT_WORKSPACE_ID.to_string());
+    review.source = non_empty_opt(&review.source).unwrap_or_else(|| "harbor_assistant".to_string());
+    review.source_channel = review
+        .source_channel
+        .and_then(|value| non_empty_opt(value.trim()));
+    review.source_conversation_id = review
+        .source_conversation_id
+        .and_then(|value| non_empty_opt(value.trim()));
+    review.original_prompt = review.original_prompt.trim().to_string();
+    if review.original_prompt.is_empty() {
+        return Err("original_prompt 不能为空".to_string());
+    }
+    review.status = sanitize_automation_review_status(&review.status)?;
+    review.risk_level = review
+        .risk_level
+        .and_then(|value| non_empty_opt(value.trim()));
+    review.created_at = review
+        .created_at
+        .and_then(|value| non_empty_opt(value.trim()));
+    review.updated_at = review
+        .updated_at
+        .and_then(|value| non_empty_opt(value.trim()));
+    review.expires_at = review
+        .expires_at
+        .and_then(|value| non_empty_opt(value.trim()));
+    review.rule_id = review.rule_id.and_then(|value| non_empty_opt(value.trim()));
+    if automation_review_has_sensitive_payload(&review) {
+        return Err("automation review payload 包含敏感字段，已拒绝保存".to_string());
+    }
+    Ok(review)
+}
+
+fn sanitize_automation_review_status(status: &str) -> Result<String, String> {
+    let normalized = status.trim().to_ascii_lowercase();
+    let normalized = if normalized.is_empty() {
+        "draft".to_string()
+    } else {
+        normalized
+    };
+    match normalized.as_str() {
+        "draft" | "pending" | "active" | "paused" | "discarded" | "expired" => Ok(normalized),
+        _ => Err(format!("不支持的 automation review status {status}")),
+    }
+}
+
+fn automation_review_has_sensitive_payload(review: &AutomationRuleReview) -> bool {
+    let Ok(payload) = serde_json::to_string(review) else {
+        return true;
+    };
+    let normalized = payload.to_ascii_lowercase();
+    [
+        "rtsp://",
+        "rtsps://",
+        "ha_token",
+        "home_assistant_token",
+        "access_token",
+        "api_key",
+        "apikey",
+        "private_key",
+        "begin private key",
+        "camera credential",
+        "camera_credential",
+        "upload_url",
+        "presigned",
+        "/var/lib/harboros-beacon",
+        "/tmp/harbornavi",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn new_automation_review_id() -> String {
+    format!("review-{}", Uuid::new_v4().simple())
+}
+
 pub fn gateway_manage_url(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -3326,6 +3530,7 @@ fn sanitize_legacy_admin_fields(state: &mut AdminConsoleState) {
     state.dvr = sanitize_dvr_recording_settings(state.dvr.clone());
     upsert_dvr_knowledge_root(&mut state.knowledge, &state.dvr);
     state.notification_targets = sanitize_notification_targets(state.notification_targets.clone());
+    state.automation_reviews = sanitize_automation_reviews(state.automation_reviews.clone());
     state.device_credentials = sanitize_device_credentials(state.device_credentials.clone());
     state.device_evidence = sanitize_device_evidence_records(state.device_evidence.clone());
     state.models = sanitize_model_center_state(state.models.clone());
@@ -5240,8 +5445,8 @@ mod tests {
         resolved_identity_binding_records, resolved_remote_view_config,
         sanitize_bridge_provider_config, sanitize_defaults, sanitize_model_center_state,
         user_default_delivery_surface, user_recent_interactive_surface, AdminConsoleStore,
-        AdminDefaults, AdminModelCenterState, BridgeProviderCapabilities, BridgeProviderConfig,
-        DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings,
+        AdminDefaults, AdminModelCenterState, AutomationRuleReview, BridgeProviderCapabilities,
+        BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings,
         HomeAssistantConfigUpdate, IdentityBindingRecord, KnowledgeSettings, KnowledgeSourceRoot,
         RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID,
         LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
@@ -5959,6 +6164,89 @@ mod tests {
                 .map(|target| target.route_key.as_str()),
             Some("gw_route_feishu")
         );
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn automation_reviews_persist_and_update_status() {
+        let registry_path = temp_path("registry-automation-reviews");
+        let admin_path = temp_path("admin-automation-reviews");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        let updated = store
+            .upsert_automation_review(AutomationRuleReview {
+                review_id: String::new(),
+                workspace_id: String::new(),
+                source: String::new(),
+                source_channel: Some("k3-webui-smoke".to_string()),
+                source_conversation_id: None,
+                original_prompt: "当门口检测到有人时，生成家庭通知草稿。".to_string(),
+                status: String::new(),
+                trigger_definition: Some(json!({"event_type": "person_detected"})),
+                condition_definition: None,
+                action_plan: Some(json!({"action": "draft_notification"})),
+                device_refs: vec![json!({"camera_id": "camera.front_door"})],
+                risk_level: Some("low".to_string()),
+                requires_approval: true,
+                created_at: None,
+                updated_at: None,
+                expires_at: None,
+                rule_id: None,
+                run_summaries: Vec::new(),
+                metadata: Some(json!({"smoke": "k3-assistant-parity"})),
+            })
+            .expect("save review");
+        assert_eq!(updated.automation_reviews.len(), 1);
+        let review_id = updated.automation_reviews[0].review_id.clone();
+        assert!(review_id.starts_with("review-"));
+        assert_eq!(updated.automation_reviews[0].status, "draft");
+
+        let updated = store
+            .set_automation_review_status(&review_id, "discarded")
+            .expect("discard review");
+        assert_eq!(updated.automation_reviews[0].status, "discarded");
+
+        let reloaded = store.load_or_create_state().expect("reload");
+        assert_eq!(reloaded.automation_reviews[0].status, "discarded");
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn automation_reviews_reject_sensitive_payloads() {
+        let registry_path = temp_path("registry-automation-review-secret");
+        let admin_path = temp_path("admin-automation-review-secret");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        let error = store
+            .upsert_automation_review(AutomationRuleReview {
+                review_id: "review-secret".to_string(),
+                workspace_id: String::new(),
+                source: String::new(),
+                source_channel: None,
+                source_conversation_id: None,
+                original_prompt: "请把 rtsp://user:pass@example.local/stream 发到群里".to_string(),
+                status: "draft".to_string(),
+                trigger_definition: None,
+                condition_definition: None,
+                action_plan: None,
+                device_refs: Vec::new(),
+                risk_level: None,
+                requires_approval: false,
+                created_at: None,
+                updated_at: None,
+                expires_at: None,
+                rule_id: None,
+                run_summaries: Vec::new(),
+                metadata: None,
+            })
+            .expect_err("sensitive review should be rejected");
+        assert!(error.contains("敏感字段"));
 
         let _ = std::fs::remove_file(admin_path);
         let _ = std::fs::remove_file(registry_path);
