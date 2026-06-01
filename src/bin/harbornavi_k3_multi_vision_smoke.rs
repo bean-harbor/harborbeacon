@@ -25,6 +25,9 @@ struct Cli {
     vlm_api_key: Option<String>,
     vlm_sample_every: Option<u64>,
     vlm_max_samples: Option<u64>,
+    vlm_queue_lock_path: Option<PathBuf>,
+    vlm_global_max_samples: Option<u64>,
+    vlm_trigger_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +52,8 @@ struct CameraManifest {
     vlm_sample_every: Option<u64>,
     #[serde(default, alias = "vlm_max_samples")]
     vlm_max_samples: Option<u64>,
+    #[serde(default, alias = "vlm_queue")]
+    vlm_queue: Option<VlmQueueSettings>,
     capture: Option<CaptureSettings>,
     cameras: Vec<CameraSource>,
 }
@@ -100,6 +105,18 @@ struct CaptureSettings {
     decode_backend: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VlmQueueSettings {
+    mode: Option<String>,
+    #[serde(default, alias = "lock_path")]
+    lock_path: Option<PathBuf>,
+    #[serde(default, alias = "global_max_samples")]
+    global_max_samples: Option<u64>,
+    #[serde(default, alias = "trigger_policy")]
+    trigger_policy: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct ResolvedCapture {
     mode: String,
@@ -130,6 +147,7 @@ struct ResolvedConfig {
     vlm_api_key: Option<String>,
     vlm_sample_every: Option<u64>,
     vlm_max_samples: Option<u64>,
+    vlm_queue: Option<VlmQueueSettings>,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,6 +163,7 @@ struct MultiVisionReport {
     output_scope: String,
     source_mix: SourceMix,
     aggregate: AggregateSummary,
+    vlm_queue: Option<VlmQueueReport>,
     classification: String,
     cameras: Vec<CameraReport>,
     notes: Vec<String>,
@@ -214,6 +233,18 @@ struct AggregateSummary {
     vlm_total: usize,
     vlm_passed: usize,
     p95_vlm_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VlmQueueReport {
+    mode: String,
+    lock_path_redacted: bool,
+    global_max_samples: Option<u64>,
+    trigger_policy: Option<String>,
+    global_total: usize,
+    global_passed: usize,
+    global_failed: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,6 +342,7 @@ fn main() {
 
     let source_mix = summarize_sources(&manifest.cameras);
     let aggregate = summarize_aggregate(&camera_reports);
+    let vlm_queue = summarize_vlm_queue(config.vlm_queue.as_ref(), &aggregate);
     let classification = classify_result(&aggregate, &camera_reports);
     let ok = classification == "pass";
     let notes = vec![
@@ -328,6 +360,7 @@ fn main() {
         output_scope: "[redacted-local-path]".to_string(),
         source_mix,
         aggregate,
+        vlm_queue,
         classification,
         cameras: camera_reports,
         notes,
@@ -430,6 +463,22 @@ fn run_camera(
         args.push(sample_every.to_string());
         args.push("--vlm-max-samples".to_string());
         args.push(max_samples.to_string());
+        if let Some(queue) = config.vlm_queue.as_ref() {
+            if queue.mode_name() == "global_serial" {
+                if let Some(lock_path) = queue.lock_path.as_ref() {
+                    args.push("--vlm-queue-lock-path".to_string());
+                    args.push(lock_path.to_string_lossy().to_string());
+                }
+                if let Some(global_max_samples) = queue.global_max_samples {
+                    args.push("--vlm-global-max-samples".to_string());
+                    args.push(global_max_samples.to_string());
+                }
+                if let Some(trigger_policy) = queue.trigger_policy.as_deref() {
+                    args.push("--vlm-trigger-policy".to_string());
+                    args.push(trigger_policy.to_string());
+                }
+            }
+        }
     }
     if let Some(command) = config.analyzer_command.as_deref() {
         args.push("--analyzer-command".to_string());
@@ -693,6 +742,22 @@ fn summarize_aggregate(cameras: &[CameraReport]) -> AggregateSummary {
     }
 }
 
+fn summarize_vlm_queue(
+    queue: Option<&VlmQueueSettings>,
+    aggregate: &AggregateSummary,
+) -> Option<VlmQueueReport> {
+    let queue = queue?;
+    Some(VlmQueueReport {
+        mode: queue.mode_name().to_string(),
+        lock_path_redacted: queue.lock_path.is_some(),
+        global_max_samples: queue.global_max_samples,
+        trigger_policy: queue.trigger_policy.clone(),
+        global_total: aggregate.vlm_total,
+        global_passed: aggregate.vlm_passed,
+        global_failed: aggregate.vlm_total.saturating_sub(aggregate.vlm_passed),
+    })
+}
+
 fn summarize_sources(cameras: &[CameraSource]) -> SourceMix {
     let mut mix = SourceMix::default();
     for camera in cameras {
@@ -733,6 +798,10 @@ fn resolve_config(cli: &Cli, manifest: &CameraManifest) -> ResolvedConfig {
         .unwrap_or_else(|| "cpu".to_string());
     if provider != "cpu" && provider != "spacemit" {
         fail("--provider or manifest provider must be cpu or spacemit");
+    }
+    let vlm_queue = cli_vlm_queue(cli).or_else(|| manifest.vlm_queue.clone());
+    if let Some(queue) = vlm_queue.as_ref() {
+        queue.validate();
     }
     ResolvedConfig {
         schema: manifest
@@ -782,7 +851,23 @@ fn resolve_config(cli: &Cli, manifest: &CameraManifest) -> ResolvedConfig {
         vlm_api_key: cli.vlm_api_key.clone(),
         vlm_sample_every: cli.vlm_sample_every.or(manifest.vlm_sample_every),
         vlm_max_samples: cli.vlm_max_samples.or(manifest.vlm_max_samples),
+        vlm_queue,
     }
+}
+
+fn cli_vlm_queue(cli: &Cli) -> Option<VlmQueueSettings> {
+    if cli.vlm_queue_lock_path.is_none()
+        && cli.vlm_global_max_samples.is_none()
+        && cli.vlm_trigger_policy.is_none()
+    {
+        return None;
+    }
+    Some(VlmQueueSettings {
+        mode: Some("global_serial".to_string()),
+        lock_path: cli.vlm_queue_lock_path.clone(),
+        global_max_samples: cli.vlm_global_max_samples,
+        trigger_policy: cli.vlm_trigger_policy.clone(),
+    })
 }
 
 fn load_manifest(path: &Path) -> CameraManifest {
@@ -953,6 +1038,37 @@ impl CameraSource {
     }
 }
 
+impl VlmQueueSettings {
+    fn mode_name(&self) -> &str {
+        self.mode.as_deref().unwrap_or_else(|| {
+            if self.lock_path.is_some() {
+                "global_serial"
+            } else {
+                "none"
+            }
+        })
+    }
+
+    fn validate(&self) {
+        match self.mode_name() {
+            "global_serial" => {
+                if self.lock_path.is_none() {
+                    fail("vlmQueue.mode=global_serial requires vlmQueue.lockPath");
+                }
+            }
+            "none" => {}
+            other => fail(&format!(
+                "vlmQueue.mode must be global_serial or none, got {other}"
+            )),
+        }
+        if let Some(policy) = self.trigger_policy.as_deref() {
+            if policy != "periodic" && policy != "detection_or_periodic" {
+                fail("vlmQueue.triggerPolicy must be periodic or detection_or_periodic");
+            }
+        }
+    }
+}
+
 impl CameraReport {
     fn system_error(camera_id: &str, source_kind: &str, error: &str) -> Self {
         Self {
@@ -1018,6 +1134,9 @@ impl Cli {
             vlm_api_key: std::env::var("HARBORNAVI_VLM_API_KEY").ok(),
             vlm_sample_every: None,
             vlm_max_samples: None,
+            vlm_queue_lock_path: None,
+            vlm_global_max_samples: None,
+            vlm_trigger_policy: None,
         };
         let mut index = 0usize;
         while index < args.len() {
@@ -1082,6 +1201,24 @@ impl Cli {
                         "--vlm-max-samples",
                     )))
                 }
+                "--vlm-queue-lock-path" => {
+                    cli.vlm_queue_lock_path = Some(PathBuf::from(take_value(
+                        &args,
+                        &mut index,
+                        "--vlm-queue-lock-path",
+                    )))
+                }
+                "--vlm-global-max-samples" => {
+                    cli.vlm_global_max_samples = Some(parse_u64(&take_value(
+                        &args,
+                        &mut index,
+                        "--vlm-global-max-samples",
+                    )))
+                }
+                "--vlm-trigger-policy" => {
+                    cli.vlm_trigger_policy =
+                        Some(take_value(&args, &mut index, "--vlm-trigger-policy"))
+                }
                 "--no-post" => cli.no_post = true,
                 "--help" | "-h" => {
                     print_usage();
@@ -1114,7 +1251,7 @@ fn parse_u64(value: &str) -> u64 {
 
 fn print_usage() {
     println!(
-        "Usage: harbornavi-k3-multi-vision-smoke --camera-manifest cameras.json [--output-dir PATH] [--duration-seconds N] [--interval-seconds N] [--beacon-url URL] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--local-smoke-bin PATH] [--vlm-enrich] [--vlm-api-base URL] [--vlm-model MODEL] [--vlm-sample-every N] [--vlm-max-samples N] [--no-post]"
+        "Usage: harbornavi-k3-multi-vision-smoke --camera-manifest cameras.json [--output-dir PATH] [--duration-seconds N] [--interval-seconds N] [--beacon-url URL] [--analyzer-command PATH] [--model-path PATH] [--label-path PATH] [--provider cpu|spacemit] [--local-smoke-bin PATH] [--vlm-enrich] [--vlm-api-base URL] [--vlm-model MODEL] [--vlm-sample-every N] [--vlm-max-samples N] [--vlm-queue-lock-path PATH] [--vlm-global-max-samples N] [--vlm-trigger-policy periodic|detection_or_periodic] [--no-post]"
     );
 }
 
@@ -1142,6 +1279,12 @@ mod tests {
                 "durationSeconds": 30,
                 "intervalSeconds": 10,
                 "provider": "cpu",
+                "vlmQueue": {
+                    "mode": "global_serial",
+                    "lockPath": "/tmp/harbornavi-evt/test/vlm.queue.lock",
+                    "globalMaxSamples": 4,
+                    "triggerPolicy": "periodic"
+                },
                 "capture": {"mode": "persistent_ffmpeg", "maxFrameAgeMs": 2500},
                 "cameras": [
                     {"cameraId": "cam-real", "kind": "real", "sourceSecretRef": "env:CAM_REAL_RTSP"},
@@ -1164,6 +1307,10 @@ mod tests {
                 .and_then(|capture| capture.phase_offset_ms),
             Some(2500)
         );
+        let queue = manifest.vlm_queue.expect("vlm queue parses");
+        assert_eq!(queue.mode_name(), "global_serial");
+        assert_eq!(queue.global_max_samples, Some(4));
+        assert_eq!(queue.trigger_policy.as_deref(), Some("periodic"));
     }
 
     #[test]
@@ -1187,6 +1334,7 @@ mod tests {
             vlm_api_key: None,
             vlm_sample_every: None,
             vlm_max_samples: None,
+            vlm_queue: None,
         };
         let camera = CameraSource {
             camera_id: "cam-3".to_string(),
@@ -1219,6 +1367,37 @@ mod tests {
         assert_eq!(p95(&[1, 2, 3, 4, 5]), 5);
         assert_eq!(p95(&[50, 10, 30, 20]), 50);
         assert_eq!(p95(&[]), 0);
+    }
+
+    #[test]
+    fn vlm_queue_report_redacts_lock_path() {
+        let queue = VlmQueueSettings {
+            mode: Some("global_serial".to_string()),
+            lock_path: Some(PathBuf::from("/tmp/harbornavi-secret/vlm.queue.lock")),
+            global_max_samples: Some(4),
+            trigger_policy: Some("periodic".to_string()),
+        };
+        let aggregate = AggregateSummary {
+            total: 10,
+            passed: 10,
+            failed: 0,
+            success_rate: 1.0,
+            p95_total_ms: 1000,
+            max_total_ms: 1200,
+            p95_capture_ms: 100,
+            p95_capture_read_ms: 20,
+            p95_frame_age_ms: 200,
+            p95_detector_ms: 300,
+            p95_event_ingest_ms: 40,
+            vlm_total: 4,
+            vlm_passed: 3,
+            p95_vlm_ms: 4500,
+        };
+        let report = summarize_vlm_queue(Some(&queue), &aggregate).expect("queue report");
+        assert!(report.lock_path_redacted);
+        assert_eq!(report.global_failed, 1);
+        let serialized = serde_json::to_string(&report).expect("serialize queue report");
+        assert!(!serialized.contains("harbornavi-secret"));
     }
 
     #[test]
