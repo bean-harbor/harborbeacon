@@ -47,6 +47,7 @@ mkdir -p "$pkg_dir/usr/bin"
 mkdir -p "$pkg_dir/etc/systemd/system"
 mkdir -p "$pkg_dir/usr/lib/harboros-beacon"
 mkdir -p "$pkg_dir/usr/share/doc/harboros-beacon"
+find "$build_root" -type d -exec chmod 0755 {} +
 
 cp "target/${target}/release/harboros-beacon" "$pkg_dir/usr/bin/harboros-beacon"
 cp "target/${target}/release/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke"
