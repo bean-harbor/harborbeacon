@@ -39,11 +39,18 @@ use crate::runtime::registry::{CameraDevice, DeviceRegistryStore};
 const DEFAULT_BINDING_CHANNEL_LABEL: &str = "Harbor HarborGate";
 const DEFAULT_PROVIDER_ACCOUNT_DISPLAY_NAME: &str = "Harbor HarborGate";
 static ADMIN_CONSOLE_MODEL_DOWNLOAD_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static ADMIN_CONSOLE_STATE_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 fn model_download_write_guard() -> Result<MutexGuard<'static, ()>, String> {
     ADMIN_CONSOLE_MODEL_DOWNLOAD_WRITE_LOCK
         .lock()
         .map_err(|_| "model download state write lock poisoned".to_string())
+}
+
+fn admin_console_state_file_guard() -> Result<MutexGuard<'static, ()>, String> {
+    ADMIN_CONSOLE_STATE_FILE_LOCK
+        .lock()
+        .map_err(|_| "admin console state file lock poisoned".to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -761,6 +768,7 @@ impl AdminConsoleStore {
             return self.bootstrap_state();
         }
 
+        let _guard = admin_console_state_file_guard()?;
         let text = fs::read_to_string(&self.path).map_err(|e| {
             format!(
                 "failed to read admin console state {}: {e}",
@@ -795,6 +803,7 @@ impl AdminConsoleStore {
                 self.path.display()
             )
         })?;
+        let _guard = admin_console_state_file_guard()?;
         fs::write(&self.path, payload).map_err(|e| {
             format!(
                 "failed to write admin console state {}: {e}",
