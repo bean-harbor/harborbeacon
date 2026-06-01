@@ -47,7 +47,7 @@ mkdir -p "$pkg_dir/usr/bin"
 mkdir -p "$pkg_dir/etc/systemd/system"
 mkdir -p "$pkg_dir/usr/lib/harboros-beacon"
 mkdir -p "$pkg_dir/usr/share/doc/harboros-beacon"
-find "$build_root" -type d -exec chmod 0755 {} +
+find "$build_root" -type d -exec chmod a-s,u=rwx,go=rx {} +
 
 cp "target/${target}/release/harboros-beacon" "$pkg_dir/usr/bin/harboros-beacon"
 cp "target/${target}/release/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke"
@@ -90,6 +90,7 @@ persistent_capture_root=/run/harbornavi/capture
 EOF
 
 mkdir -p "$out_dir"
+find "$pkg_dir" -type d -exec chmod a-s,u=rwx,go=rx {} +
 dpkg-deb --build "$pkg_dir" "${out_dir}/${pkg_name}.deb"
 
 sha256sum "${out_dir}/${pkg_name}.deb" > "${out_dir}/${pkg_name}.deb.sha256"
