@@ -13,6 +13,8 @@ out_dir="${OUT_DIR:-${repo_root}/dist/harbornavi-k3-debs}"
 build_root="${repo_root}/target/harbornavi-k3-deb"
 pkg_name="harboros-beacon_${release_label}_${deb_arch}"
 pkg_dir="${build_root}/${pkg_name}"
+cargo_target_root="${CARGO_TARGET_DIR:-${repo_root}/target}"
+cargo_release_dir="${cargo_target_root}/${target}/release"
 
 if [[ "$target" != "riscv64gc-unknown-linux-gnu" ]]; then
   echo "error: K3 package target must be riscv64gc-unknown-linux-gnu, got ${target}" >&2
@@ -47,11 +49,12 @@ mkdir -p "$pkg_dir/usr/bin"
 mkdir -p "$pkg_dir/etc/systemd/system"
 mkdir -p "$pkg_dir/usr/lib/harboros-beacon"
 mkdir -p "$pkg_dir/usr/share/doc/harboros-beacon"
+find "$build_root" -type d -exec chmod a-s,u=rwx,go=rx {} +
 
-cp "target/${target}/release/harboros-beacon" "$pkg_dir/usr/bin/harboros-beacon"
-cp "target/${target}/release/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke"
-cp "target/${target}/release/harbornavi-k3-multi-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-multi-vision-smoke"
-cp "target/${target}/release/harbornavi-ha-mqtt-event-contract-smoke" "$pkg_dir/usr/bin/harbornavi-ha-mqtt-event-contract-smoke"
+cp "${cargo_release_dir}/harboros-beacon" "$pkg_dir/usr/bin/harboros-beacon"
+cp "${cargo_release_dir}/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke"
+cp "${cargo_release_dir}/harbornavi-k3-multi-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-multi-vision-smoke"
+cp "${cargo_release_dir}/harbornavi-ha-mqtt-event-contract-smoke" "$pkg_dir/usr/bin/harbornavi-ha-mqtt-event-contract-smoke"
 chmod 0755 "$pkg_dir/usr/bin/harboros-beacon" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-multi-vision-smoke" "$pkg_dir/usr/bin/harbornavi-ha-mqtt-event-contract-smoke"
 cp scripts/harbornavi_k3_yolov8_analyzer.py "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
 chmod 0755 "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
@@ -89,10 +92,11 @@ persistent_capture_root=/run/harbornavi/capture
 EOF
 
 mkdir -p "$out_dir"
+find "$pkg_dir" -type d -exec chmod a-s,u=rwx,go=rx {} +
 dpkg-deb --build "$pkg_dir" "${out_dir}/${pkg_name}.deb"
 
 sha256sum "${out_dir}/${pkg_name}.deb" > "${out_dir}/${pkg_name}.deb.sha256"
-file "target/${target}/release/harboros-beacon" > "${out_dir}/${pkg_name}.file.txt"
+file "${cargo_release_dir}/harboros-beacon" > "${out_dir}/${pkg_name}.file.txt"
 dpkg-deb --info "${out_dir}/${pkg_name}.deb" > "${out_dir}/${pkg_name}.info.txt"
 dpkg-deb --contents "${out_dir}/${pkg_name}.deb" > "${out_dir}/${pkg_name}.contents.txt"
 
