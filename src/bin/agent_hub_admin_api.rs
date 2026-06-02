@@ -13151,12 +13151,23 @@ fn redact_state_snapshot(mut state: StateResponse) -> StateResponse {
 }
 
 fn redact_camera_device_projection(device: &mut CameraDevice) {
-    device.primary_stream.url = redact_stream_url_credentials(&device.primary_stream.url);
+    device.primary_stream.url = redact_camera_primary_stream_url(&device.primary_stream.url);
     if let Some(snapshot_url) = device.snapshot_url.as_mut() {
         *snapshot_url = redact_stream_url_credentials(snapshot_url);
     }
     if let Some(onvif_url) = device.onvif_device_service_url.as_mut() {
         *onvif_url = redact_stream_url_credentials(onvif_url);
+    }
+}
+
+fn redact_camera_primary_stream_url(value: &str) -> String {
+    if Url::parse(value)
+        .ok()
+        .is_some_and(|url| url.scheme().eq_ignore_ascii_case("rtsp"))
+    {
+        "__harbor_redacted_rtsp_url__".to_string()
+    } else {
+        redact_stream_url_credentials(value)
     }
 }
 
@@ -16270,10 +16281,7 @@ mod tests {
 
         redact_camera_device_projection(&mut device);
 
-        assert_eq!(
-            device.primary_stream.url,
-            "rtsp://redacted:redacted@192.168.3.73:8554/stream1"
-        );
+        assert_eq!(device.primary_stream.url, "__harbor_redacted_rtsp_url__");
         assert_eq!(
             device.snapshot_url.as_deref(),
             Some("http://redacted:redacted@192.168.3.73/snapshot.jpg")
@@ -16303,7 +16311,8 @@ mod tests {
         let payload = serde_json::to_string(&redacted).expect("serialize redacted state");
 
         assert!(!payload.contains("admin:secret"));
-        assert!(payload.contains("rtsp://redacted:redacted@192.168.3.73:8554/stream1"));
+        assert!(!payload.contains("rtsp://"));
+        assert!(payload.contains("__harbor_redacted_rtsp_url__"));
         assert!(payload.contains("http://redacted:redacted@192.168.3.73/snapshot.jpg"));
 
         let _ = fs::remove_file(admin_path);
