@@ -28,6 +28,9 @@ use harborbeacon_local_agent::connectors::home_assistant::{
     HomeAssistantServiceCallResponse, HomeAssistantServiceDomain,
 };
 use harborbeacon_local_agent::connectors::im_gateway::GatewayPlatformStatus;
+use harborbeacon_local_agent::connectors::notifications::{
+    NotificationDeliveryError, NotificationDeliveryRecord, NotificationDeliveryService,
+};
 use harborbeacon_local_agent::connectors::storage::StorageTarget;
 use harborbeacon_local_agent::control_plane::media::{
     MediaAsset, MediaAssetKind, MediaSession, MediaSessionStatus, ShareLink,
@@ -50,7 +53,7 @@ use harborbeacon_local_agent::runtime::admin_console::{
     AdminDefaults, AdminModelCenterState, AutomationRuleReview, BridgeProviderConfig,
     DeviceCredentialSecret, DeviceEvidenceRecord, GatewayStatusSummary, HomeAssistantAdminState,
     HomeAssistantConfigUpdate, KnowledgeIndexJobRecord, KnowledgeSettings, KnowledgeSourceRoot,
-    ModelDownloadJobRecord, ModelRuntimeRecord, RagResourceProfile,
+    ModelDownloadJobRecord, ModelRuntimeRecord, NotificationTargetRecord, RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::discovery::RtspProbeRequest;
 use harborbeacon_local_agent::runtime::dvr::{
@@ -83,8 +86,8 @@ use harborbeacon_local_agent::runtime::task_api::{
 };
 use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
 use harborbeacon_local_agent::runtime::vision_event::{
-    ingest_local_vision_event_default, list_recent_local_vision_events_default, LocalVisionEvent,
-    StoredLocalVisionEvent,
+    build_local_vision_notification_intent, ingest_local_vision_event_default,
+    list_recent_local_vision_events_default, LocalVisionEvent, StoredLocalVisionEvent,
 };
 
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
@@ -210,6 +213,8 @@ pub struct AdminApi {
     harbor_assistant_dist: PathBuf,
     public_origin: String,
     model_runtime_activation: Option<ModelRuntimeActivationHandler>,
+    last_event_notification_attempt: Arc<Mutex<Option<Value>>>,
+    last_home_assistant_service_action: Arc<Mutex<Option<Value>>>,
 }
 
 pub(crate) type ModelRuntimeActivationHandler = Arc<
@@ -391,10 +396,29 @@ struct HomeAssistantServiceSmokeRequest {
     domain: String,
     #[serde(default)]
     service: String,
+    #[serde(default)]
+    fields: Value,
 }
+
+type HomeAssistantServiceActionRequest = HomeAssistantServiceSmokeRequest;
 
 #[derive(Debug, Serialize)]
 struct HomeAssistantServiceSmokeResponse {
+    status: String,
+    allowed: bool,
+    executed: bool,
+    domain: String,
+    service: String,
+    entity_id: String,
+    message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<HomeAssistantServiceCallResponse>,
+    audit_record: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct HomeAssistantServiceActionResponse {
+    action_id: String,
     status: String,
     allowed: bool,
     executed: bool,
@@ -440,6 +464,7 @@ struct RedactedDiagnosticsBundleResponse {
     memory: Value,
     cameras: Value,
     events: Value,
+    workflow: Value,
     home_assistant: HomeAssistantStatusResponse,
     models: Value,
     security: Value,
@@ -587,6 +612,24 @@ struct VisionEventsResponse {
     generated_at: String,
     limit: usize,
     events: Vec<StoredLocalVisionEvent>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct LocalVisionEventNotificationResponse {
+    event_id: String,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notification_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    platform_hint: Option<String>,
+    message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_record: Option<Value>,
+    audit_record: Value,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -1314,6 +1357,8 @@ impl AdminApi {
             harbor_assistant_dist,
             public_origin,
             model_runtime_activation: None,
+            last_event_notification_attempt: Arc::new(Mutex::new(None)),
+            last_home_assistant_service_action: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1327,6 +1372,40 @@ impl AdminApi {
 
     fn hub(&self) -> CameraHubService {
         CameraHubService::new(self.admin_store.clone())
+    }
+
+    fn record_last_event_notification_attempt(
+        &self,
+        response: &LocalVisionEventNotificationResponse,
+    ) {
+        let Ok(mut guard) = self.last_event_notification_attempt.lock() else {
+            return;
+        };
+        *guard = Some(serde_json::to_value(response).unwrap_or_else(|_| json!({})));
+    }
+
+    fn record_last_home_assistant_service_action(
+        &self,
+        response: &HomeAssistantServiceActionResponse,
+    ) {
+        let Ok(mut guard) = self.last_home_assistant_service_action.lock() else {
+            return;
+        };
+        *guard = Some(serde_json::to_value(response).unwrap_or_else(|_| json!({})));
+    }
+
+    fn last_event_notification_attempt(&self) -> Option<Value> {
+        self.last_event_notification_attempt
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn last_home_assistant_service_action(&self) -> Option<Value> {
+        self.last_home_assistant_service_action
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     fn authorize_admin_action(
@@ -1506,6 +1585,9 @@ impl AdminApi {
             Method::Post if path == "/api/home-assistant/service-smoke" => self
                 .handle_home_assistant_service_smoke(&mut request, &identity_hints)
                 .boxed(),
+            Method::Post if path == "/api/home-assistant/service-action" => self
+                .handle_home_assistant_service_action(&mut request, &identity_hints)
+                .boxed(),
             Method::Get if path == "/api/harboros/apps/home-assistant/status" => self
                 .handle_home_assistant_install_status(&identity_hints)
                 .boxed(),
@@ -1548,6 +1630,12 @@ impl AdminApi {
             Method::Post if path == "/api/vision/events" => self
                 .handle_ingest_local_vision_event(&mut request, &identity_hints)
                 .boxed(),
+            Method::Post
+                if path.starts_with("/api/vision/events/") && path.ends_with("/notify") =>
+            {
+                self.handle_notify_local_vision_event(&path, &identity_hints)
+                    .boxed()
+            }
             Method::Get if path == "/api/models/policies" => {
                 self.handle_model_policies(&identity_hints).boxed()
             }
@@ -2095,10 +2183,15 @@ impl AdminApi {
             harborbeacon_local_agent::runtime::admin_console::redact_home_assistant_state(
                 admin_state.home_assistant,
             );
+        let live_gateway_status = fetch_remote_gateway_status().ok();
         let bundle = build_redacted_diagnostics_bundle(
             &redacted_state,
             &build_home_assistant_status_response(&home_assistant),
             &runtime_projection,
+            self.last_event_notification_attempt(),
+            self.last_home_assistant_service_action(),
+            &admin_state.notification_targets,
+            live_gateway_status.as_ref(),
         );
         ok_json(&bundle)
     }
@@ -2747,6 +2840,7 @@ impl AdminApi {
             &normalized.domain,
             &normalized.service,
             &normalized.entity_id,
+            Some(&normalized.fields),
         ) {
             Ok(result) => ok_json(&HomeAssistantServiceSmokeResponse {
                 status: "succeeded".to_string(),
@@ -2767,6 +2861,107 @@ impl AdminApi {
                 ),
             }),
             Err(error) => error_json(StatusCode(422), &redact_admin_string(&error)),
+        }
+    }
+
+    fn handle_home_assistant_service_action(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let body: HomeAssistantServiceActionRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let state = match self.admin_store.home_assistant_secret_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let action_id = format!("ha_action_{}", Uuid::new_v4().simple());
+        let normalized = normalize_home_assistant_service_smoke_request(&body);
+        if let Err(message) = validate_home_assistant_service_smoke(&normalized, &state) {
+            let response = HomeAssistantServiceActionResponse {
+                action_id,
+                status: "blocked".to_string(),
+                allowed: false,
+                executed: false,
+                domain: normalized.domain,
+                service: normalized.service,
+                entity_id: normalized.entity_id,
+                message: message.clone(),
+                result: None,
+                audit_record: build_home_assistant_operator_audit(
+                    "home_assistant.service_action_blocked",
+                    "blocked",
+                    false,
+                    false,
+                    &message,
+                    &body,
+                ),
+            };
+            self.record_last_home_assistant_service_action(&response);
+            return ok_json(&response);
+        }
+        let client = match home_assistant_client_from_state(&state) {
+            Ok(client) => client,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        match client.call_service(
+            &normalized.domain,
+            &normalized.service,
+            &normalized.entity_id,
+            Some(&normalized.fields),
+        ) {
+            Ok(result) => {
+                let response = HomeAssistantServiceActionResponse {
+                    action_id,
+                    status: "succeeded".to_string(),
+                    allowed: true,
+                    executed: true,
+                    domain: normalized.domain,
+                    service: normalized.service,
+                    entity_id: normalized.entity_id,
+                    message: "Home Assistant low-risk service action completed.".to_string(),
+                    result: Some(result),
+                    audit_record: build_home_assistant_operator_audit(
+                        "home_assistant.service_action_executed",
+                        "succeeded",
+                        true,
+                        true,
+                        "Home Assistant low-risk service action completed.",
+                        &body,
+                    ),
+                };
+                self.record_last_home_assistant_service_action(&response);
+                ok_json(&response)
+            }
+            Err(error) => {
+                let message = redact_admin_string(&error);
+                let response = HomeAssistantServiceActionResponse {
+                    action_id,
+                    status: "failed".to_string(),
+                    allowed: true,
+                    executed: false,
+                    domain: normalized.domain,
+                    service: normalized.service,
+                    entity_id: normalized.entity_id,
+                    message: message.clone(),
+                    result: None,
+                    audit_record: build_home_assistant_operator_audit(
+                        "home_assistant.service_action_failed",
+                        "failed",
+                        true,
+                        false,
+                        &message,
+                        &body,
+                    ),
+                };
+                self.record_last_home_assistant_service_action(&response);
+                ok_json(&response)
+            }
         }
     }
 
@@ -3061,6 +3256,98 @@ impl AdminApi {
                 events,
             }),
             Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_notify_local_vision_event(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let event_id = match parse_local_vision_event_notify_path(path) {
+            Some(event_id) => event_id,
+            None => return error_json(StatusCode(400), "invalid local vision event notify path"),
+        };
+        let event = match find_recent_local_vision_event(&event_id) {
+            Ok(Some(event)) => event,
+            Ok(None) => return error_json(StatusCode(404), "local vision event not found"),
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let target = match default_notification_target_record(&state.notification_targets).cloned()
+        {
+            Some(target) => target,
+            None => {
+                let response = build_local_vision_event_notification_blocked_response(
+                    &event,
+                    None,
+                    "No default notification target is configured.",
+                );
+                self.record_last_event_notification_attempt(&response);
+                return ok_json(&response);
+            }
+        };
+        let intent = match build_local_vision_notification_intent(&event, &target.route_key) {
+            Ok(intent) => intent,
+            Err(error) => {
+                let response = build_local_vision_event_notification_failed_response(
+                    &event,
+                    Some(&target),
+                    None,
+                    None,
+                    &error,
+                );
+                self.record_last_event_notification_attempt(&response);
+                return ok_json(&response);
+            }
+        };
+        let service = match NotificationDeliveryService::new() {
+            Ok(service) => service,
+            Err(error) => {
+                let response = build_local_vision_event_notification_blocked_response(
+                    &event,
+                    Some(&target),
+                    &redact_admin_string(&error),
+                );
+                self.record_last_event_notification_attempt(&response);
+                return ok_json(&response);
+            }
+        };
+        match service.deliver(&intent.notification_request) {
+            Ok(record) if record.ok => {
+                let response = build_local_vision_event_notification_delivered_response(
+                    &event,
+                    &target,
+                    record,
+                    intent.audit_record,
+                );
+                self.record_last_event_notification_attempt(&response);
+                ok_json(&response)
+            }
+            Ok(record) => {
+                let response = build_local_vision_event_notification_failed_response(
+                    &event,
+                    Some(&target),
+                    Some(record),
+                    None,
+                    "HarborGate returned a failed delivery record.",
+                );
+                self.record_last_event_notification_attempt(&response);
+                ok_json(&response)
+            }
+            Err(error) => {
+                let response = build_local_vision_event_notification_delivery_error_response(
+                    &event, &target, error,
+                );
+                self.record_last_event_notification_attempt(&response);
+                ok_json(&response)
+            }
         }
     }
 
@@ -5793,6 +6080,15 @@ fn parse_notification_target_delete_path(path: &str) -> Option<String> {
     }
 }
 
+fn parse_local_vision_event_notify_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/vision/events/")?;
+    let event_id = trimmed.strip_suffix("/notify")?.trim();
+    if event_id.is_empty() || event_id.contains('/') {
+        return None;
+    }
+    percent_decode_path_segment(event_id).ok()
+}
+
 fn parse_model_endpoint_path(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/models/endpoints/")?;
     if trimmed.trim().is_empty() || trimmed.ends_with("/test") {
@@ -6891,6 +7187,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/home-assistant/entities"
         || path == "/api/home-assistant/services"
         || path == "/api/home-assistant/service-smoke"
+        || path == "/api/home-assistant/service-action"
         || path == "/api/harboros/apps/home-assistant/status"
         || path == "/api/harboros/apps/home-assistant/install-plan"
         || path == "/api/harboros/apps/home-assistant/install"
@@ -6902,6 +7199,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/models/local-catalog"
         || path == "/api/models/policies"
         || path == "/api/vision/events"
+        || (path.starts_with("/api/vision/events/") && path.ends_with("/notify"))
         || path == "/admin/models"
         || path == "/api/access/members"
         || path == "/api/share-links"
@@ -9323,6 +9621,10 @@ fn build_redacted_diagnostics_bundle(
     state: &StateResponse,
     home_assistant: &HomeAssistantStatusResponse,
     runtime: &LocalModelRuntimeProjection,
+    last_event_notification_attempt: Option<Value>,
+    last_home_assistant_service_action: Option<Value>,
+    notification_targets: &[NotificationTargetRecord],
+    gateway_status: Option<&Value>,
 ) -> RedactedDiagnosticsBundleResponse {
     let state_value = serde_json::to_value(state).unwrap_or_else(|_| json!({}));
     let devices = state_value
@@ -9381,6 +9683,23 @@ fn build_redacted_diagnostics_bundle(
             "latest_count": latest_event_count,
             "latest_event": latest_event,
             "metadata_only": true,
+        }),
+        workflow: json!({
+            "event_notification": last_event_notification_attempt.unwrap_or_else(|| json!({
+                "status": "not_run",
+                "message": "No event notification has been attempted in this API process.",
+            })),
+            "home_assistant_service_action": last_home_assistant_service_action.unwrap_or_else(|| json!({
+                "status": "not_run",
+                "message": "No Home Assistant service action has been attempted in this API process.",
+            })),
+            "default_notification_target": build_default_notification_target_readiness(
+                notification_targets,
+                gateway_status,
+            ),
+            "gateway_delivery_observability": build_redacted_gateway_delivery_observability(
+                gateway_status,
+            ),
         }),
         home_assistant: HomeAssistantStatusResponse {
             configured: home_assistant.configured,
@@ -9619,6 +9938,7 @@ fn normalize_home_assistant_service_smoke_request(
         entity_id: request.entity_id.trim().to_lowercase(),
         domain: request.domain.trim().to_lowercase(),
         service: request.service.trim().to_lowercase(),
+        fields: normalize_home_assistant_service_fields(&request.fields),
     }
 }
 
@@ -9656,6 +9976,7 @@ fn validate_home_assistant_service_smoke(
     if !home_assistant_service_is_allowlisted(&request.domain, &request.service) {
         return Err("Home Assistant service is not allowlisted for safe smoke control".to_string());
     }
+    validate_home_assistant_service_fields(&request.fields)?;
     Ok(())
 }
 
@@ -9667,6 +9988,311 @@ fn home_assistant_service_is_allowlisted(domain: &str, service: &str) -> bool {
         "scene" => service == "turn_on",
         _ => false,
     }
+}
+
+fn normalize_home_assistant_service_fields(fields: &Value) -> Value {
+    if fields.is_null() {
+        return json!({});
+    }
+    fields.clone()
+}
+
+fn validate_home_assistant_service_fields(fields: &Value) -> Result<(), String> {
+    if fields.is_null() {
+        return Ok(());
+    }
+    let Some(object) = fields.as_object() else {
+        return Err("Home Assistant service fields must be a JSON object".to_string());
+    };
+    for (key, value) in object {
+        if is_secret_key(key) {
+            return Err(
+                "Home Assistant service fields cannot include secret-like keys".to_string(),
+            );
+        }
+        let serialized = serde_json::to_string(value).unwrap_or_default();
+        if redact_admin_string(&serialized) != serialized {
+            return Err(
+                "Home Assistant service fields cannot include secret-like values".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn find_recent_local_vision_event(
+    event_id: &str,
+) -> Result<Option<StoredLocalVisionEvent>, String> {
+    let event_id = event_id.trim();
+    if event_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(list_recent_local_vision_events_default(50)?
+        .into_iter()
+        .find(|stored| stored.event.event_id == event_id))
+}
+
+fn default_notification_target_record(
+    targets: &[NotificationTargetRecord],
+) -> Option<&NotificationTargetRecord> {
+    targets
+        .iter()
+        .find(|target| target.is_default && !target.route_key.trim().is_empty())
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|target| !target.route_key.trim().is_empty())
+        })
+}
+
+fn build_local_vision_event_notification_blocked_response(
+    stored: &StoredLocalVisionEvent,
+    target: Option<&NotificationTargetRecord>,
+    message: &str,
+) -> LocalVisionEventNotificationResponse {
+    build_local_vision_event_notification_response(
+        stored,
+        target,
+        "blocked",
+        None,
+        None,
+        None,
+        message,
+        "local_vision_event.notification_blocked",
+    )
+}
+
+fn build_local_vision_event_notification_failed_response(
+    stored: &StoredLocalVisionEvent,
+    target: Option<&NotificationTargetRecord>,
+    delivery_record: Option<NotificationDeliveryRecord>,
+    notification_id: Option<String>,
+    message: &str,
+) -> LocalVisionEventNotificationResponse {
+    let delivery_id = delivery_record
+        .as_ref()
+        .map(|record| record.delivery_id.clone());
+    let notification_id = notification_id.or_else(|| {
+        delivery_record
+            .as_ref()
+            .map(|record| record.notification_id.clone())
+    });
+    let delivery_record = delivery_record
+        .as_ref()
+        .map(notification_delivery_record_summary);
+    build_local_vision_event_notification_response(
+        stored,
+        target,
+        "failed",
+        notification_id,
+        delivery_id,
+        delivery_record,
+        message,
+        "local_vision_event.notification_failed",
+    )
+}
+
+fn build_local_vision_event_notification_delivered_response(
+    stored: &StoredLocalVisionEvent,
+    target: &NotificationTargetRecord,
+    delivery_record: NotificationDeliveryRecord,
+    intent_audit_record: Value,
+) -> LocalVisionEventNotificationResponse {
+    let delivery_id = delivery_record.delivery_id.clone();
+    let notification_id = delivery_record.notification_id.clone();
+    let delivery_record = notification_delivery_record_summary(&delivery_record);
+    let mut response = build_local_vision_event_notification_response(
+        stored,
+        Some(target),
+        "delivered",
+        Some(notification_id),
+        Some(delivery_id),
+        Some(delivery_record),
+        "Local vision event notification delivered to the default target.",
+        "local_vision_event.notification_delivered",
+    );
+    response.audit_record["intent_audit_record"] = intent_audit_record;
+    response
+}
+
+fn build_local_vision_event_notification_delivery_error_response(
+    stored: &StoredLocalVisionEvent,
+    target: &NotificationTargetRecord,
+    error: NotificationDeliveryError,
+) -> LocalVisionEventNotificationResponse {
+    let (status, message, error_kind) = classify_notification_delivery_error(error);
+    let mut response = build_local_vision_event_notification_response(
+        stored,
+        Some(target),
+        status,
+        None,
+        None,
+        Some(json!({
+            "error_kind": error_kind,
+            "message": message.clone(),
+            "redacted": true,
+        })),
+        &message,
+        if status == "blocked" {
+            "local_vision_event.notification_blocked"
+        } else {
+            "local_vision_event.notification_failed"
+        },
+    );
+    response.audit_record["delivery_error_kind"] = json!(error_kind);
+    response
+}
+
+fn build_local_vision_event_notification_response(
+    stored: &StoredLocalVisionEvent,
+    target: Option<&NotificationTargetRecord>,
+    status: &str,
+    notification_id: Option<String>,
+    delivery_id: Option<String>,
+    delivery_record: Option<Value>,
+    message: &str,
+    audit_kind: &str,
+) -> LocalVisionEventNotificationResponse {
+    LocalVisionEventNotificationResponse {
+        event_id: stored.event.event_id.clone(),
+        status: status.to_string(),
+        notification_id,
+        delivery_id,
+        target_label: target.map(|target| target.label.clone()),
+        platform_hint: target.and_then(|target| non_empty_string(&target.platform_hint)),
+        message: redact_admin_string(message),
+        delivery_record,
+        audit_record: json!({
+            "audit_kind": audit_kind,
+            "status": status,
+            "metadata_only": true,
+            "secret_scan": "clean",
+            "event_id": stored.event.event_id,
+            "camera_id": stored.event.camera_id,
+            "event_type": stored.event.event_type,
+            "target_bound": target.is_some(),
+            "text_only": true,
+            "attachments_included": false,
+            "raw_image_included": false,
+            "local_paths_included": false,
+            "created_at": now_unix_string(),
+        }),
+    }
+}
+
+fn notification_delivery_record_summary(record: &NotificationDeliveryRecord) -> Value {
+    json!({
+        "delivery_id": record.delivery_id,
+        "notification_id": record.notification_id,
+        "trace_id": record.trace_id,
+        "ok": record.ok,
+        "status": serde_json::to_value(record.status).unwrap_or(Value::Null),
+        "platform": record.platform,
+        "retryable": record.retryable,
+        "error": record.error.as_ref().map(|error| json!({
+            "code": error.code,
+            "message": redact_admin_string(&error.message),
+        })),
+        "redacted": true,
+    })
+}
+
+fn classify_notification_delivery_error(
+    error: NotificationDeliveryError,
+) -> (&'static str, String, &'static str) {
+    match error {
+        NotificationDeliveryError::MissingConfiguration(message) => (
+            "blocked",
+            redact_admin_string(&message),
+            "missing_configuration",
+        ),
+        NotificationDeliveryError::Transport(message) => (
+            "failed",
+            redact_admin_string(&message),
+            "gateway_unreachable",
+        ),
+        NotificationDeliveryError::InvalidResponse(message) => {
+            ("failed", redact_admin_string(&message), "invalid_response")
+        }
+        NotificationDeliveryError::RequestRejected {
+            status_code,
+            envelope,
+        } => (
+            "failed",
+            redact_admin_string(&format!(
+                "HarborGate rejected the notification with HTTP {status_code}: {} ({})",
+                envelope.error.message, envelope.error.code
+            )),
+            "request_rejected",
+        ),
+    }
+}
+
+fn build_default_notification_target_readiness(
+    targets: &[NotificationTargetRecord],
+    gateway_status: Option<&Value>,
+) -> Value {
+    let target = default_notification_target_record(targets);
+    let gateway_connected = gateway_connected(gateway_status);
+    let gateway_configured = gateway_configured(gateway_status);
+    let status = if target.is_none() {
+        "not_configured"
+    } else if gateway_connected {
+        "available"
+    } else if gateway_configured {
+        "degraded"
+    } else {
+        "blocked"
+    };
+    json!({
+        "status": status,
+        "target_configured": target.is_some(),
+        "target_label": target.map(|target| target.label.clone()),
+        "platform_hint": target.and_then(|target| non_empty_string(&target.platform_hint)),
+        "gateway_configured": gateway_configured,
+        "gateway_connected": gateway_connected,
+        "route_key_redacted": target.is_some(),
+    })
+}
+
+fn build_redacted_gateway_delivery_observability(gateway_status: Option<&Value>) -> Value {
+    let Some(payload) = gateway_status else {
+        return json!({
+            "status": "unavailable",
+            "redacted": true,
+        });
+    };
+    let observability = payload
+        .get("delivery_observability")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "status": if observability.is_object() { "available" } else { "unavailable" },
+        "record_count": observability.get("record_count").and_then(Value::as_u64),
+        "redacted": true,
+    })
+}
+
+fn gateway_connected(gateway_status: Option<&Value>) -> bool {
+    gateway_status
+        .and_then(|value| value.get("connected").and_then(Value::as_bool))
+        .or_else(|| {
+            gateway_status
+                .and_then(|value| value.pointer("/bridge_provider/connected"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn gateway_configured(gateway_status: Option<&Value>) -> bool {
+    gateway_status
+        .and_then(|value| value.get("configured").and_then(Value::as_bool))
+        .or_else(|| {
+            gateway_status
+                .and_then(|value| value.pointer("/bridge_provider/configured"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
 }
 
 fn build_home_assistant_operator_audit(
@@ -14982,13 +15608,13 @@ impl Drop for FfmpegMjpegStream {
 mod tests {
     use super::{
         apply_bridge_provider_binding_projection, authorize_gateway_service_request,
-        build_admin_knowledge_search_request, build_device_credential_status,
-        build_feature_availability_response, build_files_browse_response,
-        build_harboros_im_capability_map, build_harboros_status_response,
-        build_hardware_readiness_response, build_home_assistant_operator_audit,
-        build_inference_health_alias_response, build_knowledge_index_job,
-        build_knowledge_index_status_response, build_local_model_catalog,
-        build_model_capabilities_response, build_rag_readiness_response,
+        build_admin_knowledge_search_request, build_default_notification_target_readiness,
+        build_device_credential_status, build_feature_availability_response,
+        build_files_browse_response, build_harboros_im_capability_map,
+        build_harboros_status_response, build_hardware_readiness_response,
+        build_home_assistant_operator_audit, build_inference_health_alias_response,
+        build_knowledge_index_job, build_knowledge_index_status_response,
+        build_local_model_catalog, build_model_capabilities_response, build_rag_readiness_response,
         build_redacted_diagnostics_bundle, build_release_readiness_response,
         build_rtsp_url_from_patch, camera_stream_url_with_credentials,
         default_model_download_target_path, default_model_download_target_path_in_root,
@@ -15012,22 +15638,22 @@ mod tests {
         parse_device_credentials_path, parse_device_evidence_path,
         parse_device_metadata_patch_path, parse_device_rtsp_check_path,
         parse_device_validation_run_path, parse_knowledge_index_job_cancel_path,
-        parse_member_default_delivery_surface_update_path, parse_member_role_update_path,
-        parse_model_download_cancel_path, parse_model_download_job_path, parse_model_endpoint_path,
-        parse_model_endpoint_test_path, parse_model_runtime_install_path,
-        parse_notification_target_delete_path, parse_optional_unix_seconds,
-        parse_share_link_revoke_path, parse_shared_camera_live_page_path,
-        parse_shared_camera_live_stream_path, percent_decode_path_segment,
-        probe_local_model_runtime, redact_account_management_snapshot,
+        parse_local_vision_event_notify_path, parse_member_default_delivery_surface_update_path,
+        parse_member_role_update_path, parse_model_download_cancel_path,
+        parse_model_download_job_path, parse_model_endpoint_path, parse_model_endpoint_test_path,
+        parse_model_runtime_install_path, parse_notification_target_delete_path,
+        parse_optional_unix_seconds, parse_share_link_revoke_path,
+        parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
+        percent_decode_path_segment, probe_local_model_runtime, redact_account_management_snapshot,
         redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
         redact_value_stream_credentials, release_item, request_identity_hints,
         resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
         run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
-        scan_request_task_args, url_encode_path_segment, validate_home_assistant_service_smoke,
-        AdminApi, HomeAssistantServiceSmokeRequest, KnowledgeSearchApiRequest,
-        LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
-        ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
+        scan_request_task_args, url_encode_path_segment, validate_home_assistant_service_fields,
+        validate_home_assistant_service_smoke, AdminApi, HomeAssistantServiceSmokeRequest,
+        KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
+        ModelRuntimeActivationRequest, ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
     };
     use harborbeacon_local_agent::control_plane::media::{
         MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
@@ -15044,7 +15670,7 @@ mod tests {
         default_model_route_policies, AdminConsoleState, AdminConsoleStore, AdminModelCenterState,
         BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord,
         HomeAssistantAdminState, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
-        RemoteViewConfig,
+        NotificationTargetRecord, RemoteViewConfig,
     };
     use harborbeacon_local_agent::runtime::hub::CameraHubService;
     use harborbeacon_local_agent::runtime::knowledge_index::{
@@ -15146,6 +15772,7 @@ mod tests {
             entity_id: "light.kitchen".to_string(),
             domain: "light".to_string(),
             service: "turn_on".to_string(),
+            fields: json!({}),
         };
         validate_home_assistant_service_smoke(&allowed, &state).expect("light turn_on is safe");
 
@@ -15153,6 +15780,7 @@ mod tests {
             entity_id: "homeassistant.restart".to_string(),
             domain: "homeassistant".to_string(),
             service: "restart".to_string(),
+            fields: json!({}),
         };
         let error =
             validate_home_assistant_service_smoke(&denied, &state).expect_err("restart blocked");
@@ -15165,11 +15793,68 @@ mod tests {
     }
 
     #[test]
+    fn home_assistant_service_action_fields_reject_secret_like_values() {
+        validate_home_assistant_service_fields(&json!({
+            "brightness": 80,
+            "transition": 1,
+        }))
+        .expect("low-risk fields are accepted");
+
+        let error = validate_home_assistant_service_fields(&json!({
+            "token": "secret",
+        }))
+        .expect_err("secret-like key blocked");
+        assert!(error.contains("secret-like keys"));
+
+        let error = validate_home_assistant_service_fields(&json!("not-object"))
+            .expect_err("non-object fields blocked");
+        assert!(error.contains("JSON object"));
+    }
+
+    #[test]
+    fn local_vision_event_notify_path_decodes_event_id() {
+        assert_eq!(
+            parse_local_vision_event_notify_path("/api/vision/events/event%3A1/notify"),
+            Some("event:1".to_string())
+        );
+        assert_eq!(
+            parse_local_vision_event_notify_path("/api/vision/events/event/1/notify"),
+            None
+        );
+    }
+
+    #[test]
+    fn notification_target_readiness_redacts_route_key() {
+        let targets = vec![NotificationTargetRecord {
+            target_id: "target-1".to_string(),
+            label: "Family".to_string(),
+            route_key: "gw_route_secret".to_string(),
+            platform_hint: "weixin".to_string(),
+            is_default: true,
+        }];
+        let readiness = build_default_notification_target_readiness(
+            &targets,
+            Some(&json!({
+                "configured": true,
+                "connected": true,
+                "delivery_observability": { "record_count": 2 },
+            })),
+        );
+        let text = serde_json::to_string(&readiness).expect("serialize readiness");
+
+        assert_eq!(readiness["status"], json!("available"));
+        assert_eq!(readiness["target_label"], json!("Family"));
+        assert_eq!(readiness["route_key_redacted"], json!(true));
+        assert!(!text.contains("gw_route_secret"));
+    }
+
+    #[test]
     fn home_assistant_operator_audit_is_metadata_only() {
         let request = HomeAssistantServiceSmokeRequest {
             entity_id: "light.kitchen".to_string(),
             domain: "light".to_string(),
             service: "turn_on".to_string(),
+            fields: json!({}),
         };
 
         let audit = build_home_assistant_operator_audit(
@@ -15231,6 +15916,10 @@ mod tests {
             &state,
             &home_assistant,
             &LocalModelRuntimeProjection::default(),
+            None,
+            None,
+            &[],
+            None,
         );
         let text = serde_json::to_string(&bundle).expect("serialize bundle");
 

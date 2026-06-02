@@ -203,6 +203,7 @@ impl HomeAssistantClient {
         domain: &str,
         service: &str,
         entity_id: &str,
+        fields: Option<&Value>,
     ) -> Result<HomeAssistantServiceCallResponse, String> {
         let domain = sanitize_service_path_component(domain, "domain")?;
         let service = sanitize_service_path_component(service, "service")?;
@@ -211,7 +212,12 @@ impl HomeAssistantClient {
             return Err("Home Assistant entity id is required".to_string());
         }
         let path = format!("/api/services/{domain}/{service}");
-        let body = json!({ "entity_id": entity_id });
+        let mut body = fields
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        body.insert("entity_id".to_string(), json!(entity_id));
+        let body = Value::Object(body);
         let value: Value = self.post_json(&path, &body)?;
         let changed_entity_count = value.as_array().map(Vec::len).unwrap_or(0);
         Ok(HomeAssistantServiceCallResponse {
