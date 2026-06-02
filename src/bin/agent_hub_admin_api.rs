@@ -23,9 +23,13 @@ use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCo
 use uuid::Uuid;
 
 use harborbeacon_local_agent::adapters::rtsp::{CommandRtspAdapter, RtspProbeAdapter};
+#[cfg(test)]
+use harborbeacon_local_agent::connectors::home_assistant::validate_home_assistant_service_fields as validate_home_assistant_service_fields_shared;
 use harborbeacon_local_agent::connectors::home_assistant::{
-    HomeAssistantClient, HomeAssistantClientConfig, HomeAssistantEntity,
-    HomeAssistantServiceCallResponse, HomeAssistantServiceDomain,
+    normalize_home_assistant_service_action_request,
+    validate_home_assistant_service_action_request, HomeAssistantClient, HomeAssistantClientConfig,
+    HomeAssistantEntity, HomeAssistantServiceActionRequest, HomeAssistantServiceCallResponse,
+    HomeAssistantServiceDomain,
 };
 use harborbeacon_local_agent::connectors::im_gateway::GatewayPlatformStatus;
 use harborbeacon_local_agent::connectors::notifications::{
@@ -388,19 +392,7 @@ struct HomeAssistantServicesResponse {
     services: Vec<HomeAssistantServiceDomain>,
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct HomeAssistantServiceSmokeRequest {
-    #[serde(default)]
-    entity_id: String,
-    #[serde(default)]
-    domain: String,
-    #[serde(default)]
-    service: String,
-    #[serde(default)]
-    fields: Value,
-}
-
-type HomeAssistantServiceActionRequest = HomeAssistantServiceSmokeRequest;
+type HomeAssistantServiceSmokeRequest = HomeAssistantServiceActionRequest;
 
 #[derive(Debug, Serialize)]
 struct HomeAssistantServiceSmokeResponse {
@@ -9934,90 +9926,19 @@ fn home_assistant_registry_entity(entity: HomeAssistantEntity) -> HomeAssistantR
 fn normalize_home_assistant_service_smoke_request(
     request: &HomeAssistantServiceSmokeRequest,
 ) -> HomeAssistantServiceSmokeRequest {
-    HomeAssistantServiceSmokeRequest {
-        entity_id: request.entity_id.trim().to_lowercase(),
-        domain: request.domain.trim().to_lowercase(),
-        service: request.service.trim().to_lowercase(),
-        fields: normalize_home_assistant_service_fields(&request.fields),
-    }
+    normalize_home_assistant_service_action_request(request)
 }
 
 fn validate_home_assistant_service_smoke(
     request: &HomeAssistantServiceSmokeRequest,
     state: &HomeAssistantAdminState,
 ) -> Result<(), String> {
-    if !state.enabled {
-        return Err("Home Assistant integration is disabled".to_string());
-    }
-    if request.entity_id.is_empty() || request.domain.is_empty() || request.service.is_empty() {
-        return Err("Home Assistant entity, domain, and service are required".to_string());
-    }
-    if !request
-        .entity_id
-        .chars()
-        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '.'))
-    {
-        return Err("Home Assistant entity id is outside the safe identifier shape".to_string());
-    }
-    if !request
-        .entity_id
-        .starts_with(&format!("{}.", request.domain))
-    {
-        return Err("Home Assistant entity id must match the requested domain".to_string());
-    }
-    if !state.exposed_domains.is_empty()
-        && !state
-            .exposed_domains
-            .iter()
-            .any(|domain| domain == &request.domain)
-    {
-        return Err("Home Assistant domain is not in the allowlisted sync scope".to_string());
-    }
-    if !home_assistant_service_is_allowlisted(&request.domain, &request.service) {
-        return Err("Home Assistant service is not allowlisted for safe smoke control".to_string());
-    }
-    validate_home_assistant_service_fields(&request.fields)?;
-    Ok(())
+    validate_home_assistant_service_action_request(request, state.enabled, &state.exposed_domains)
 }
 
-fn home_assistant_service_is_allowlisted(domain: &str, service: &str) -> bool {
-    match domain {
-        "light" | "switch" | "input_boolean" => {
-            matches!(service, "turn_on" | "turn_off" | "toggle")
-        }
-        "scene" => service == "turn_on",
-        _ => false,
-    }
-}
-
-fn normalize_home_assistant_service_fields(fields: &Value) -> Value {
-    if fields.is_null() {
-        return json!({});
-    }
-    fields.clone()
-}
-
+#[cfg(test)]
 fn validate_home_assistant_service_fields(fields: &Value) -> Result<(), String> {
-    if fields.is_null() {
-        return Ok(());
-    }
-    let Some(object) = fields.as_object() else {
-        return Err("Home Assistant service fields must be a JSON object".to_string());
-    };
-    for (key, value) in object {
-        if is_secret_key(key) {
-            return Err(
-                "Home Assistant service fields cannot include secret-like keys".to_string(),
-            );
-        }
-        let serialized = serde_json::to_string(value).unwrap_or_default();
-        if redact_admin_string(&serialized) != serialized {
-            return Err(
-                "Home Assistant service fields cannot include secret-like values".to_string(),
-            );
-        }
-    }
-    Ok(())
+    validate_home_assistant_service_fields_shared(fields)
 }
 
 fn find_recent_local_vision_event(
