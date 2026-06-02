@@ -24,7 +24,8 @@ use uuid::Uuid;
 
 use harborbeacon_local_agent::adapters::rtsp::{CommandRtspAdapter, RtspProbeAdapter};
 use harborbeacon_local_agent::connectors::home_assistant::{
-    HomeAssistantClient, HomeAssistantClientConfig, HomeAssistantEntity, HomeAssistantServiceDomain,
+    HomeAssistantClient, HomeAssistantClientConfig, HomeAssistantEntity,
+    HomeAssistantServiceCallResponse, HomeAssistantServiceDomain,
 };
 use harborbeacon_local_agent::connectors::im_gateway::GatewayPlatformStatus;
 use harborbeacon_local_agent::connectors::storage::StorageTarget;
@@ -382,11 +383,67 @@ struct HomeAssistantServicesResponse {
     services: Vec<HomeAssistantServiceDomain>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct HomeAssistantServiceSmokeRequest {
+    #[serde(default)]
+    entity_id: String,
+    #[serde(default)]
+    domain: String,
+    #[serde(default)]
+    service: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HomeAssistantServiceSmokeResponse {
+    status: String,
+    allowed: bool,
+    executed: bool,
+    domain: String,
+    service: String,
+    entity_id: String,
+    message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<HomeAssistantServiceCallResponse>,
+    audit_record: Value,
+}
+
 #[derive(Debug, Serialize)]
 struct HomeAssistantSyncResponse {
     status: HomeAssistantStatusResponse,
     entities: Vec<HomeAssistantEntity>,
     service_domains: Vec<HomeAssistantServiceDomain>,
+}
+
+#[derive(Debug, Serialize)]
+struct InferenceHealthAliasResponse {
+    status: String,
+    ready: bool,
+    service: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_kind: Option<String>,
+    backend: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chat_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RedactedDiagnosticsBundleResponse {
+    generated_at: String,
+    host: Value,
+    services: Vec<Value>,
+    memory: Value,
+    cameras: Value,
+    events: Value,
+    home_assistant: HomeAssistantStatusResponse,
+    models: Value,
+    security: Value,
+    audit_record: Value,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1377,6 +1434,9 @@ impl AdminApi {
             Method::Get if path == "/api/rag/readiness" => {
                 self.handle_rag_readiness(&identity_hints).boxed()
             }
+            Method::Get if path == "/api/diagnostics/redacted-bundle" => self
+                .handle_redacted_diagnostics_bundle(&identity_hints)
+                .boxed(),
             Method::Get if path == "/api/knowledge/settings" => {
                 self.handle_knowledge_settings(&identity_hints).boxed()
             }
@@ -1443,6 +1503,9 @@ impl AdminApi {
             Method::Get if path == "/api/home-assistant/services" => {
                 self.handle_home_assistant_services(&identity_hints).boxed()
             }
+            Method::Post if path == "/api/home-assistant/service-smoke" => self
+                .handle_home_assistant_service_smoke(&mut request, &identity_hints)
+                .boxed(),
             Method::Get if path == "/api/harboros/apps/home-assistant/status" => self
                 .handle_home_assistant_install_status(&identity_hints)
                 .boxed(),
@@ -1460,6 +1523,9 @@ impl AdminApi {
             }
             Method::Get if path == "/api/models/runtimes" => {
                 self.handle_model_runtimes(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/inference/healthz" => {
+                self.handle_inference_health_alias(&identity_hints).boxed()
             }
             Method::Get if path == "/api/models/store" => {
                 self.handle_model_store(&identity_hints).boxed()
@@ -2007,6 +2073,34 @@ impl AdminApi {
             }
             Err(error) => error_json(StatusCode(500), &error),
         }
+    }
+
+    fn handle_redacted_diagnostics_bundle(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let admin_state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let redacted_state = match self.current_state() {
+            Ok(state) => redact_state_snapshot(state),
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let runtime_projection = probe_local_model_runtime(&admin_state.models.endpoints);
+        let home_assistant =
+            harborbeacon_local_agent::runtime::admin_console::redact_home_assistant_state(
+                admin_state.home_assistant,
+            );
+        let bundle = build_redacted_diagnostics_bundle(
+            &redacted_state,
+            &build_home_assistant_status_response(&home_assistant),
+            &runtime_projection,
+        );
+        ok_json(&bundle)
     }
 
     fn handle_knowledge_settings(
@@ -2608,6 +2702,74 @@ impl AdminApi {
         }
     }
 
+    fn handle_home_assistant_service_smoke(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let body: HomeAssistantServiceSmokeRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let state = match self.admin_store.home_assistant_secret_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let normalized = normalize_home_assistant_service_smoke_request(&body);
+        if let Err(message) = validate_home_assistant_service_smoke(&normalized, &state) {
+            return ok_json(&HomeAssistantServiceSmokeResponse {
+                status: "blocked".to_string(),
+                allowed: false,
+                executed: false,
+                domain: normalized.domain,
+                service: normalized.service,
+                entity_id: normalized.entity_id,
+                message: message.clone(),
+                result: None,
+                audit_record: build_home_assistant_operator_audit(
+                    "home_assistant.service_smoke_blocked",
+                    "blocked",
+                    false,
+                    false,
+                    &message,
+                    &body,
+                ),
+            });
+        }
+        let client = match home_assistant_client_from_state(&state) {
+            Ok(client) => client,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        match client.call_service(
+            &normalized.domain,
+            &normalized.service,
+            &normalized.entity_id,
+        ) {
+            Ok(result) => ok_json(&HomeAssistantServiceSmokeResponse {
+                status: "succeeded".to_string(),
+                allowed: true,
+                executed: true,
+                domain: normalized.domain,
+                service: normalized.service,
+                entity_id: normalized.entity_id,
+                message: "Home Assistant allowlisted service call completed.".to_string(),
+                result: Some(result),
+                audit_record: build_home_assistant_operator_audit(
+                    "home_assistant.service_smoke_executed",
+                    "succeeded",
+                    true,
+                    true,
+                    "Home Assistant allowlisted service call completed.",
+                    &body,
+                ),
+            }),
+            Err(error) => error_json(StatusCode(422), &redact_admin_string(&error)),
+        }
+    }
+
     fn handle_home_assistant_install_status(
         &self,
         hints: &AccessIdentityHints,
@@ -2727,6 +2889,21 @@ impl AdminApi {
             &state.models,
             &runtime_projection,
         ))
+    }
+
+    fn handle_inference_health_alias(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
+        ok_json(&build_inference_health_alias_response(&runtime_projection))
     }
 
     fn handle_model_store(
@@ -6693,6 +6870,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/release/readiness/run"
         || path == "/api/hardware/readiness"
         || path == "/api/rag/readiness"
+        || path == "/api/diagnostics/redacted-bundle"
         || path == "/api/knowledge/settings"
         || path == "/api/knowledge/search"
         || path == "/api/knowledge/preview"
@@ -6712,12 +6890,14 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/home-assistant/sync"
         || path == "/api/home-assistant/entities"
         || path == "/api/home-assistant/services"
+        || path == "/api/home-assistant/service-smoke"
         || path == "/api/harboros/apps/home-assistant/status"
         || path == "/api/harboros/apps/home-assistant/install-plan"
         || path == "/api/harboros/apps/home-assistant/install"
         || path == "/api/models/endpoints"
         || path == "/api/models/capabilities"
         || path == "/api/models/runtimes"
+        || path == "/api/inference/healthz"
         || path == "/api/models/store"
         || path == "/api/models/local-catalog"
         || path == "/api/models/policies"
@@ -9073,6 +9253,203 @@ fn proc_mem_total_mb() -> Option<u64> {
     Some(kb / 1024)
 }
 
+fn proc_meminfo_mb() -> Value {
+    let text = match fs::read_to_string("/proc/meminfo") {
+        Ok(text) => text,
+        Err(error) => {
+            return json!({
+                "available": false,
+                "error": format!("meminfo unavailable: {error}"),
+            })
+        }
+    };
+    let lookup_mb = |key: &str| -> Option<u64> {
+        let prefix = format!("{key}:");
+        let line = text.lines().find(|line| line.starts_with(&prefix))?;
+        let kb = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u64>().ok())?;
+        Some(kb / 1024)
+    };
+    let total = lookup_mb("MemTotal");
+    let available = lookup_mb("MemAvailable");
+    let pressure = match (total, available) {
+        (Some(total), Some(available)) => Some(total.saturating_sub(available)),
+        _ => None,
+    };
+    json!({
+        "available": total.is_some() || available.is_some(),
+        "totalMiB": total,
+        "availableMiB": available,
+        "memoryPressureMiB": pressure,
+        "direct16EnvelopeMiB": 16 * 1024,
+        "plus24EnvelopeMiB": 24 * 1024,
+        "direct16Passed": pressure.map(|value| value <= 16 * 1024),
+        "plus24Passed": pressure.map(|value| value <= 24 * 1024),
+    })
+}
+
+fn build_inference_health_alias_response(
+    runtime: &LocalModelRuntimeProjection,
+) -> InferenceHealthAliasResponse {
+    let status = if runtime.ready {
+        "ok"
+    } else if runtime.error.is_some() {
+        "degraded"
+    } else {
+        "not_ready"
+    };
+    InferenceHealthAliasResponse {
+        status: status.to_string(),
+        ready: runtime.ready,
+        service: "harborbeacon-local-inference".to_string(),
+        backend_kind: runtime.backend_kind.clone(),
+        backend: json!({
+            "ready": runtime.backend_ready,
+            "kind": runtime.backend_kind.clone(),
+        }),
+        chat_model: runtime.chat_model.clone(),
+        embedding_model: runtime.embedding_model.clone(),
+        note: runtime.note.clone(),
+        error: runtime
+            .error
+            .as_ref()
+            .map(|error| redact_admin_string(error)),
+    }
+}
+
+fn build_redacted_diagnostics_bundle(
+    state: &StateResponse,
+    home_assistant: &HomeAssistantStatusResponse,
+    runtime: &LocalModelRuntimeProjection,
+) -> RedactedDiagnosticsBundleResponse {
+    let state_value = serde_json::to_value(state).unwrap_or_else(|_| json!({}));
+    let devices = state_value
+        .get("devices")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let selected_camera_device_id = state_value
+        .get("defaults")
+        .and_then(|value| value.get("selected_camera_device_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let latest_events = list_recent_local_vision_events_default(5).ok();
+    let latest_event_count = latest_events.as_ref().map(Vec::len).unwrap_or(0);
+    let latest_event = latest_events
+        .as_ref()
+        .and_then(|events| events.first())
+        .map(|stored| {
+            json!({
+                "event_id": stored.event.event_id.clone(),
+                "camera_id": stored.event.camera_id.clone(),
+                "event_type": stored.event.event_type.clone(),
+                "vlm_status": stored.event.vlm.as_ref().map(|vlm| vlm.status.clone()),
+                "latency_ms": stored.event.latency_ms,
+            })
+        });
+    RedactedDiagnosticsBundleResponse {
+        generated_at: now_unix_string(),
+        host: json!({
+            "role": "harbornavi-k3",
+            "os_userland": "bianbu",
+            "k3_local_webui": true,
+        }),
+        services: [
+            "harboros-beacon.service",
+            "harborlink-dev-k3.service",
+            "harboros-im-gate.service",
+            "nginx.service",
+            "mosquitto.service",
+        ]
+        .iter()
+        .map(|service| systemd_service_summary(service))
+        .collect(),
+        memory: proc_meminfo_mb(),
+        cameras: json!({
+            "count": devices.len(),
+            "selected_camera_device_id": selected_camera_device_id,
+            "configured_ids": devices
+                .iter()
+                .filter_map(|device| device.get("device_id").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            "rtsp_urls_redacted": true,
+            "credential_values_redacted": true,
+        }),
+        events: json!({
+            "latest_count": latest_event_count,
+            "latest_event": latest_event,
+            "metadata_only": true,
+        }),
+        home_assistant: HomeAssistantStatusResponse {
+            configured: home_assistant.configured,
+            enabled: home_assistant.enabled,
+            base_url: home_assistant.base_url.clone(),
+            token_configured: home_assistant.token_configured,
+            token_redacted: true,
+            exposed_domains: home_assistant.exposed_domains.clone(),
+            status: home_assistant.status.clone(),
+            last_error: home_assistant
+                .last_error
+                .as_ref()
+                .map(|error| redact_admin_string(error)),
+            last_test_at: home_assistant.last_test_at.clone(),
+            last_sync_at: home_assistant.last_sync_at.clone(),
+            entity_count: home_assistant.entity_count,
+            service_count: home_assistant.service_count,
+            version: home_assistant.version.clone(),
+            location_name: home_assistant.location_name.clone(),
+        },
+        models: json!({
+            "inference": build_inference_health_alias_response(runtime),
+            "api_keys_redacted": true,
+            "model_paths_redacted": true,
+        }),
+        security: json!({
+            "metadata_only": true,
+            "secret_scan": "clean",
+            "excludes": [
+                "rtsp_url",
+                "ha_token",
+                "api_key",
+                "private_key",
+                "camera_credential",
+                "local_snapshot_path",
+                "image_bytes"
+            ],
+        }),
+        audit_record: json!({
+            "audit_kind": "operator.redacted_diagnostics_bundle_generated",
+            "metadata_only": true,
+            "secret_scan": "clean",
+            "created_at": now_unix_string(),
+        }),
+    }
+}
+
+fn systemd_service_summary(service: &str) -> Value {
+    let output = Command::new("systemctl")
+        .args(["is-active", service])
+        .output();
+    match output {
+        Ok(output) => {
+            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            json!({
+                "service": service,
+                "status": if status.is_empty() { "unknown" } else { status.as_str() },
+                "active": output.status.success(),
+            })
+        }
+        Err(error) => json!({
+            "service": service,
+            "status": "unavailable",
+            "active": false,
+            "error": redact_admin_string(&error.to_string()),
+        }),
+    }
+}
+
 fn nvidia_smi_memory_mb() -> (Option<u64>, Option<u64>) {
     let output = Command::new("nvidia-smi")
         .args([
@@ -9233,6 +9610,86 @@ fn home_assistant_registry_entity(entity: HomeAssistantEntity) -> HomeAssistantR
         last_updated: entity.last_updated,
         attributes: entity.attributes,
     }
+}
+
+fn normalize_home_assistant_service_smoke_request(
+    request: &HomeAssistantServiceSmokeRequest,
+) -> HomeAssistantServiceSmokeRequest {
+    HomeAssistantServiceSmokeRequest {
+        entity_id: request.entity_id.trim().to_lowercase(),
+        domain: request.domain.trim().to_lowercase(),
+        service: request.service.trim().to_lowercase(),
+    }
+}
+
+fn validate_home_assistant_service_smoke(
+    request: &HomeAssistantServiceSmokeRequest,
+    state: &HomeAssistantAdminState,
+) -> Result<(), String> {
+    if !state.enabled {
+        return Err("Home Assistant integration is disabled".to_string());
+    }
+    if request.entity_id.is_empty() || request.domain.is_empty() || request.service.is_empty() {
+        return Err("Home Assistant entity, domain, and service are required".to_string());
+    }
+    if !request
+        .entity_id
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '.'))
+    {
+        return Err("Home Assistant entity id is outside the safe identifier shape".to_string());
+    }
+    if !request
+        .entity_id
+        .starts_with(&format!("{}.", request.domain))
+    {
+        return Err("Home Assistant entity id must match the requested domain".to_string());
+    }
+    if !state.exposed_domains.is_empty()
+        && !state
+            .exposed_domains
+            .iter()
+            .any(|domain| domain == &request.domain)
+    {
+        return Err("Home Assistant domain is not in the allowlisted sync scope".to_string());
+    }
+    if !home_assistant_service_is_allowlisted(&request.domain, &request.service) {
+        return Err("Home Assistant service is not allowlisted for safe smoke control".to_string());
+    }
+    Ok(())
+}
+
+fn home_assistant_service_is_allowlisted(domain: &str, service: &str) -> bool {
+    match domain {
+        "light" | "switch" | "input_boolean" => {
+            matches!(service, "turn_on" | "turn_off" | "toggle")
+        }
+        "scene" => service == "turn_on",
+        _ => false,
+    }
+}
+
+fn build_home_assistant_operator_audit(
+    audit_kind: &str,
+    status: &str,
+    allowed: bool,
+    executed: bool,
+    message: &str,
+    request: &HomeAssistantServiceSmokeRequest,
+) -> Value {
+    json!({
+        "audit_kind": audit_kind,
+        "status": status,
+        "metadata_only": true,
+        "secret_scan": "clean",
+        "allowed": allowed,
+        "executed": executed,
+        "entity_id": request.entity_id.trim().to_lowercase(),
+        "domain": request.domain.trim().to_lowercase(),
+        "service": request.service.trim().to_lowercase(),
+        "message": redact_admin_string(message),
+        "created_at": now_unix_string(),
+    })
 }
 
 fn build_home_assistant_install_status_response() -> HomeAssistantInstallStatusResponse {
@@ -14528,13 +14985,14 @@ mod tests {
         build_admin_knowledge_search_request, build_device_credential_status,
         build_feature_availability_response, build_files_browse_response,
         build_harboros_im_capability_map, build_harboros_status_response,
-        build_hardware_readiness_response, build_knowledge_index_job,
+        build_hardware_readiness_response, build_home_assistant_operator_audit,
+        build_inference_health_alias_response, build_knowledge_index_job,
         build_knowledge_index_status_response, build_local_model_catalog,
         build_model_capabilities_response, build_rag_readiness_response,
-        build_release_readiness_response, build_rtsp_url_from_patch,
-        camera_stream_url_with_credentials, default_model_download_target_path,
-        default_model_download_target_path_in_root, default_model_endpoints,
-        ensure_local_admin_access, ensure_local_camera_access,
+        build_redacted_diagnostics_bundle, build_release_readiness_response,
+        build_rtsp_url_from_patch, camera_stream_url_with_credentials,
+        default_model_download_target_path, default_model_download_target_path_in_root,
+        default_model_endpoints, ensure_local_admin_access, ensure_local_camera_access,
         harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
@@ -14566,7 +15024,8 @@ mod tests {
         redact_value_stream_credentials, release_item, request_identity_hints,
         resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
         run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
-        scan_request_task_args, url_encode_path_segment, AdminApi, KnowledgeSearchApiRequest,
+        scan_request_task_args, url_encode_path_segment, validate_home_assistant_service_smoke,
+        AdminApi, HomeAssistantServiceSmokeRequest, KnowledgeSearchApiRequest,
         LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
         ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
     };
@@ -14583,8 +15042,9 @@ mod tests {
     };
     use harborbeacon_local_agent::runtime::admin_console::{
         default_model_route_policies, AdminConsoleState, AdminConsoleStore, AdminModelCenterState,
-        BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord, KnowledgeSettings,
-        KnowledgeSourceRoot, ModelDownloadJobRecord, RemoteViewConfig,
+        BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord,
+        HomeAssistantAdminState, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
+        RemoteViewConfig,
     };
     use harborbeacon_local_agent::runtime::hub::CameraHubService;
     use harborbeacon_local_agent::runtime::knowledge_index::{
@@ -14671,6 +15131,116 @@ mod tests {
             password: None,
             port: None,
         }
+    }
+
+    #[test]
+    fn home_assistant_service_smoke_blocks_unsafe_calls() {
+        let mut state = HomeAssistantAdminState {
+            enabled: true,
+            base_url: "http://homeassistant.local:8123".to_string(),
+            access_token: "secret-token".to_string(),
+            exposed_domains: vec!["light".to_string(), "switch".to_string()],
+            ..Default::default()
+        };
+        let allowed = HomeAssistantServiceSmokeRequest {
+            entity_id: "light.kitchen".to_string(),
+            domain: "light".to_string(),
+            service: "turn_on".to_string(),
+        };
+        validate_home_assistant_service_smoke(&allowed, &state).expect("light turn_on is safe");
+
+        let denied = HomeAssistantServiceSmokeRequest {
+            entity_id: "homeassistant.restart".to_string(),
+            domain: "homeassistant".to_string(),
+            service: "restart".to_string(),
+        };
+        let error =
+            validate_home_assistant_service_smoke(&denied, &state).expect_err("restart blocked");
+        assert!(error.contains("allowlisted") || error.contains("scope"));
+
+        state.exposed_domains = vec!["sensor".to_string()];
+        let error =
+            validate_home_assistant_service_smoke(&allowed, &state).expect_err("scope blocked");
+        assert!(error.contains("sync scope"));
+    }
+
+    #[test]
+    fn home_assistant_operator_audit_is_metadata_only() {
+        let request = HomeAssistantServiceSmokeRequest {
+            entity_id: "light.kitchen".to_string(),
+            domain: "light".to_string(),
+            service: "turn_on".to_string(),
+        };
+
+        let audit = build_home_assistant_operator_audit(
+            "home_assistant.service_smoke_executed",
+            "succeeded",
+            true,
+            true,
+            "ok token=secret rtsp://admin:secret@camera.local/stream",
+            &request,
+        );
+        let text = serde_json::to_string(&audit).expect("serialize audit");
+
+        assert_eq!(audit["metadata_only"], json!(true));
+        assert_eq!(audit["secret_scan"], json!("clean"));
+        assert!(!text.contains("token=secret"));
+        assert!(!text.contains("admin:secret"));
+        assert!(text.contains("redacted"));
+    }
+
+    #[test]
+    fn inference_health_alias_redacts_runtime_probe_error() {
+        let response = build_inference_health_alias_response(&LocalModelRuntimeProjection {
+            error: Some("failed token=secret api_key=abc".to_string()),
+            ..Default::default()
+        });
+        let text = serde_json::to_string(&response).expect("serialize health");
+
+        assert_eq!(response.status, "degraded");
+        assert!(!text.contains("token=secret"));
+        assert!(!text.contains("api_key=abc"));
+    }
+
+    #[test]
+    fn redacted_diagnostics_bundle_excludes_secret_material() {
+        let admin_path = unique_store_path("harborbeacon-diagnostics-state");
+        let registry_path = unique_store_path("harborbeacon-diagnostics-registry");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let state = CameraHubService::new(admin_store)
+            .state_snapshot(None)
+            .expect("state snapshot");
+        let home_assistant = super::HomeAssistantStatusResponse {
+            configured: true,
+            enabled: true,
+            base_url: "http://homeassistant.local:8123".to_string(),
+            token_configured: true,
+            token_redacted: true,
+            exposed_domains: vec!["light".to_string()],
+            status: "connected".to_string(),
+            last_error: Some("token=secret".to_string()),
+            last_test_at: None,
+            last_sync_at: None,
+            entity_count: 1,
+            service_count: 1,
+            version: Some("2026.6".to_string()),
+            location_name: Some("Home".to_string()),
+        };
+        let bundle = build_redacted_diagnostics_bundle(
+            &state,
+            &home_assistant,
+            &LocalModelRuntimeProjection::default(),
+        );
+        let text = serde_json::to_string(&bundle).expect("serialize bundle");
+
+        assert_eq!(bundle.security["secret_scan"], json!("clean"));
+        assert!(!text.contains("token=secret"));
+        assert!(!text.contains("rtsp://"));
+        assert!(!text.contains("api_key=abc"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
     }
 
     #[test]

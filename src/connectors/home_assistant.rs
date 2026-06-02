@@ -93,6 +93,16 @@ pub struct HomeAssistantService {
     pub fields: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HomeAssistantServiceCallResponse {
+    pub domain: String,
+    pub service: String,
+    pub entity_id: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub changed_entity_count: usize,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RawHomeAssistantEntity {
     entity_id: String,
@@ -188,6 +198,31 @@ impl HomeAssistantClient {
         Ok(raw.into_iter().map(normalize_service_domain).collect())
     }
 
+    pub fn call_service(
+        &self,
+        domain: &str,
+        service: &str,
+        entity_id: &str,
+    ) -> Result<HomeAssistantServiceCallResponse, String> {
+        let domain = sanitize_service_path_component(domain, "domain")?;
+        let service = sanitize_service_path_component(service, "service")?;
+        let entity_id = entity_id.trim();
+        if entity_id.is_empty() {
+            return Err("Home Assistant entity id is required".to_string());
+        }
+        let path = format!("/api/services/{domain}/{service}");
+        let body = json!({ "entity_id": entity_id });
+        let value: Value = self.post_json(&path, &body)?;
+        let changed_entity_count = value.as_array().map(Vec::len).unwrap_or(0);
+        Ok(HomeAssistantServiceCallResponse {
+            domain,
+            service,
+            entity_id: entity_id.to_string(),
+            ok: true,
+            changed_entity_count,
+        })
+    }
+
     fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, String> {
         let url = self
             .base_url
@@ -197,6 +232,31 @@ impl HomeAssistantClient {
             .http
             .get(url)
             .bearer_auth(&self.access_token)
+            .send()
+            .map_err(|error| format!("Home Assistant request failed: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format_home_assistant_status_error(status));
+        }
+        response
+            .json::<T>()
+            .map_err(|error| format!("failed to parse Home Assistant response: {error}"))
+    }
+
+    fn post_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<T, String> {
+        let url = self
+            .base_url
+            .join(path.trim_start_matches('/'))
+            .map_err(|error| format!("invalid Home Assistant endpoint {path}: {error}"))?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(&self.access_token)
+            .json(body)
             .send()
             .map_err(|error| format!("Home Assistant request failed: {error}"))?;
         let status = response.status();
@@ -309,13 +369,29 @@ fn format_home_assistant_status_error(status: StatusCode) -> String {
     }
 }
 
+fn sanitize_service_path_component(value: &str, label: &str) -> Result<String, String> {
+    let trimmed = value.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return Err(format!("Home Assistant {label} is required"));
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err(format!(
+            "Home Assistant {label} contains unsupported characters"
+        ));
+    }
+    Ok(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::{
-        normalize_base_url, redact_home_assistant_token, token_is_redacted,
-        HomeAssistantClientConfig, HOME_ASSISTANT_TOKEN_REDACTION,
+        normalize_base_url, redact_home_assistant_token, sanitize_service_path_component,
+        token_is_redacted, HomeAssistantClientConfig, HOME_ASSISTANT_TOKEN_REDACTION,
     };
 
     #[test]
@@ -362,5 +438,15 @@ mod tests {
         assert_eq!(entity.domain, "light");
         assert_eq!(entity.display_name, "Kitchen");
         assert_eq!(entity.device_class.as_deref(), Some("light"));
+    }
+
+    #[test]
+    fn service_path_components_are_narrowly_validated() {
+        assert_eq!(
+            sanitize_service_path_component("Light", "domain").expect("valid"),
+            "light"
+        );
+        assert!(sanitize_service_path_component("../config", "domain").is_err());
+        assert!(sanitize_service_path_component("turn-on", "service").is_err());
     }
 }
