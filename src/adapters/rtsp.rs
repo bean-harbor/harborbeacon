@@ -677,25 +677,12 @@ impl CommandRtspAdapter {
             timeout,
             "ffmpeg for clip capture",
             |command, include_rw_timeout| {
-                command.args(["-y", "-rtsp_transport", "tcp"]);
-                if include_rw_timeout {
-                    command.args(["-rw_timeout", "10000000"]);
-                }
-                command.args([
-                    "-i",
-                    &request.stream_url,
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "0:a?",
-                    "-t",
+                command.args(Self::clip_capture_args(
+                    request,
                     &clip_length_seconds,
-                    "-c",
-                    "copy",
-                    "-movflags",
-                    "+faststart",
-                ]);
-                command.arg(&output_path);
+                    &output_path,
+                    include_rw_timeout,
+                ));
             },
         )?;
         if !output.status.success() {
@@ -729,6 +716,39 @@ impl CommandRtspAdapter {
             .to_string_lossy()
             .to_string();
         Ok(result)
+    }
+
+    fn clip_capture_args(
+        request: &ClipCaptureRequest,
+        clip_length_seconds: &str,
+        output_path: &Path,
+        include_rw_timeout: bool,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "-y".to_string(),
+            "-rtsp_transport".to_string(),
+            "tcp".to_string(),
+        ];
+        if include_rw_timeout {
+            args.extend(["-rw_timeout".to_string(), "10000000".to_string()]);
+        }
+        args.extend([
+            "-i".to_string(),
+            request.stream_url.clone(),
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            // Keep the K3 clip path video-only: TP-Link/Tapo RTSP often exposes
+            // G.711 A-law audio, which cannot be stream-copied into mp4.
+            "-an".to_string(),
+            "-t".to_string(),
+            clip_length_seconds.to_string(),
+            "-c:v".to_string(),
+            "copy".to_string(),
+            "-movflags".to_string(),
+            "+faststart".to_string(),
+            output_path.to_string_lossy().to_string(),
+        ]);
+        args
     }
 
     pub fn extract_keyframes(
@@ -1134,6 +1154,7 @@ fn escape_rtsp_userinfo(value: &str) -> String {
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::path::Path;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -1143,7 +1164,7 @@ mod tests {
     use super::{CommandRtspAdapter, RtspProbeAdapter};
     use crate::connectors::storage::StorageTarget;
     use crate::runtime::discovery::RtspProbeRequest;
-    use crate::runtime::media::{SnapshotCaptureRequest, SnapshotFormat};
+    use crate::runtime::media::{ClipCaptureRequest, SnapshotCaptureRequest, SnapshotFormat};
 
     fn spawn_snapshot_server(
         expected_auth_header: Option<String>,
@@ -1258,6 +1279,23 @@ mod tests {
             .expect_err("missing ffmpeg should fail");
 
         assert!(error.contains("ffmpeg is required"));
+    }
+
+    #[test]
+    fn clip_capture_args_drop_audio_for_mp4_container() {
+        let request = ClipCaptureRequest::new(
+            "cam-1",
+            "rtsp://192.168.1.30/live",
+            8,
+            StorageTarget::LocalDisk,
+        );
+        let args =
+            CommandRtspAdapter::clip_capture_args(&request, "8", Path::new("/tmp/clip.mp4"), true);
+
+        assert!(args.windows(2).any(|window| window == ["-map", "0:v:0"]));
+        assert!(args.iter().any(|arg| arg == "-an"));
+        assert!(args.windows(2).any(|window| window == ["-c:v", "copy"]));
+        assert!(!args.iter().any(|arg| arg == "0:a?"));
     }
 
     #[test]

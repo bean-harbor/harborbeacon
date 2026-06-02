@@ -93,6 +93,28 @@ pub struct HomeAssistantService {
     pub fields: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HomeAssistantServiceCallResponse {
+    pub domain: String,
+    pub service: String,
+    pub entity_id: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub changed_entity_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct HomeAssistantServiceActionRequest {
+    #[serde(default)]
+    pub entity_id: String,
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub service: String,
+    #[serde(default)]
+    pub fields: Value,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RawHomeAssistantEntity {
     entity_id: String,
@@ -188,6 +210,37 @@ impl HomeAssistantClient {
         Ok(raw.into_iter().map(normalize_service_domain).collect())
     }
 
+    pub fn call_service(
+        &self,
+        domain: &str,
+        service: &str,
+        entity_id: &str,
+        fields: Option<&Value>,
+    ) -> Result<HomeAssistantServiceCallResponse, String> {
+        let domain = sanitize_service_path_component(domain, "domain")?;
+        let service = sanitize_service_path_component(service, "service")?;
+        let entity_id = entity_id.trim();
+        if entity_id.is_empty() {
+            return Err("Home Assistant entity id is required".to_string());
+        }
+        let path = format!("/api/services/{domain}/{service}");
+        let mut body = fields
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        body.insert("entity_id".to_string(), json!(entity_id));
+        let body = Value::Object(body);
+        let value: Value = self.post_json(&path, &body)?;
+        let changed_entity_count = value.as_array().map(Vec::len).unwrap_or(0);
+        Ok(HomeAssistantServiceCallResponse {
+            domain,
+            service,
+            entity_id: entity_id.to_string(),
+            ok: true,
+            changed_entity_count,
+        })
+    }
+
     fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, String> {
         let url = self
             .base_url
@@ -197,6 +250,31 @@ impl HomeAssistantClient {
             .http
             .get(url)
             .bearer_auth(&self.access_token)
+            .send()
+            .map_err(|error| format!("Home Assistant request failed: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format_home_assistant_status_error(status));
+        }
+        response
+            .json::<T>()
+            .map_err(|error| format!("failed to parse Home Assistant response: {error}"))
+    }
+
+    fn post_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<T, String> {
+        let url = self
+            .base_url
+            .join(path.trim_start_matches('/'))
+            .map_err(|error| format!("invalid Home Assistant endpoint {path}: {error}"))?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(&self.access_token)
+            .json(body)
             .send()
             .map_err(|error| format!("Home Assistant request failed: {error}"))?;
         let status = response.status();
@@ -219,6 +297,96 @@ pub fn redact_home_assistant_token(value: &str) -> String {
     } else {
         HOME_ASSISTANT_TOKEN_REDACTION.to_string()
     }
+}
+
+pub fn normalize_home_assistant_service_action_request(
+    request: &HomeAssistantServiceActionRequest,
+) -> HomeAssistantServiceActionRequest {
+    HomeAssistantServiceActionRequest {
+        entity_id: request.entity_id.trim().to_lowercase(),
+        domain: request.domain.trim().to_lowercase(),
+        service: request.service.trim().to_lowercase(),
+        fields: normalize_home_assistant_service_fields(&request.fields),
+    }
+}
+
+pub fn validate_home_assistant_service_action_request(
+    request: &HomeAssistantServiceActionRequest,
+    enabled: bool,
+    exposed_domains: &[String],
+) -> Result<(), String> {
+    if !enabled {
+        return Err("Home Assistant integration is disabled".to_string());
+    }
+    if request.entity_id.is_empty() || request.domain.is_empty() || request.service.is_empty() {
+        return Err("Home Assistant entity, domain, and service are required".to_string());
+    }
+    if !request
+        .entity_id
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '.'))
+    {
+        return Err("Home Assistant entity id is outside the safe identifier shape".to_string());
+    }
+    if !request
+        .entity_id
+        .starts_with(&format!("{}.", request.domain))
+    {
+        return Err("Home Assistant entity id must match the requested domain".to_string());
+    }
+    if !exposed_domains.is_empty()
+        && !exposed_domains
+            .iter()
+            .any(|domain| domain.trim().eq_ignore_ascii_case(&request.domain))
+    {
+        return Err("Home Assistant domain is not in the allowlisted sync scope".to_string());
+    }
+    if !home_assistant_service_action_is_allowlisted(&request.domain, &request.service) {
+        return Err("Home Assistant service is not allowlisted for safe smoke control".to_string());
+    }
+    validate_home_assistant_service_fields(&request.fields)?;
+    Ok(())
+}
+
+pub fn home_assistant_service_action_is_allowlisted(domain: &str, service: &str) -> bool {
+    match (
+        domain.trim().to_lowercase().as_str(),
+        service.trim().to_lowercase().as_str(),
+    ) {
+        ("light" | "switch" | "input_boolean", "turn_on" | "turn_off" | "toggle") => true,
+        ("scene", "turn_on") => true,
+        _ => false,
+    }
+}
+
+pub fn normalize_home_assistant_service_fields(fields: &Value) -> Value {
+    if fields.is_null() {
+        return json!({});
+    }
+    fields.clone()
+}
+
+pub fn validate_home_assistant_service_fields(fields: &Value) -> Result<(), String> {
+    if fields.is_null() {
+        return Ok(());
+    }
+    let Some(object) = fields.as_object() else {
+        return Err("Home Assistant service fields must be a JSON object".to_string());
+    };
+    for (key, value) in object {
+        if home_assistant_secret_like_key(key) {
+            return Err(
+                "Home Assistant service fields cannot include secret-like keys".to_string(),
+            );
+        }
+        let serialized = serde_json::to_string(value).unwrap_or_default();
+        if home_assistant_secret_like_value(&serialized) {
+            return Err(
+                "Home Assistant service fields cannot include secret-like values".to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn normalize_base_url(value: &str) -> Result<Url, String> {
@@ -309,13 +477,64 @@ fn format_home_assistant_status_error(status: StatusCode) -> String {
     }
 }
 
+fn sanitize_service_path_component(value: &str, label: &str) -> Result<String, String> {
+    let trimmed = value.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return Err(format!("Home Assistant {label} is required"));
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err(format!(
+            "Home Assistant {label} contains unsupported characters"
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn home_assistant_secret_like_key(key: &str) -> bool {
+    let normalized = key.trim().to_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "private_key",
+        "access_key",
+        "credential",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn home_assistant_secret_like_value(value: &str) -> bool {
+    let normalized = value.trim().to_lowercase();
+    normalized.contains("bearer ")
+        || normalized.contains("authorization")
+        || normalized.contains("api_key")
+        || normalized.contains("apikey")
+        || normalized.contains("access_token")
+        || normalized.contains("private_key")
+        || normalized.contains("-----begin ")
+        || normalized.contains("rtsp://")
+}
+
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::{
-        normalize_base_url, redact_home_assistant_token, token_is_redacted,
-        HomeAssistantClientConfig, HOME_ASSISTANT_TOKEN_REDACTION,
+        home_assistant_service_action_is_allowlisted, normalize_base_url,
+        normalize_home_assistant_service_action_request, redact_home_assistant_token,
+        sanitize_service_path_component, token_is_redacted,
+        validate_home_assistant_service_action_request, validate_home_assistant_service_fields,
+        HomeAssistantClientConfig, HomeAssistantServiceActionRequest,
+        HOME_ASSISTANT_TOKEN_REDACTION,
     };
 
     #[test]
@@ -362,5 +581,76 @@ mod tests {
         assert_eq!(entity.domain, "light");
         assert_eq!(entity.display_name, "Kitchen");
         assert_eq!(entity.device_class.as_deref(), Some("light"));
+    }
+
+    #[test]
+    fn service_path_components_are_narrowly_validated() {
+        assert_eq!(
+            sanitize_service_path_component("Light", "domain").expect("valid"),
+            "light"
+        );
+        assert!(sanitize_service_path_component("../config", "domain").is_err());
+        assert!(sanitize_service_path_component("turn-on", "service").is_err());
+    }
+
+    #[test]
+    fn service_action_allowlist_is_low_risk_only() {
+        assert!(home_assistant_service_action_is_allowlisted(
+            "light", "turn_on"
+        ));
+        assert!(home_assistant_service_action_is_allowlisted(
+            "switch", "toggle"
+        ));
+        assert!(home_assistant_service_action_is_allowlisted(
+            "input_boolean",
+            "turn_off"
+        ));
+        assert!(home_assistant_service_action_is_allowlisted(
+            "scene", "turn_on"
+        ));
+        assert!(!home_assistant_service_action_is_allowlisted(
+            "lock", "unlock"
+        ));
+        assert!(!home_assistant_service_action_is_allowlisted(
+            "climate",
+            "set_temperature"
+        ));
+    }
+
+    #[test]
+    fn service_action_validation_rejects_scope_and_secret_fields() {
+        let request = HomeAssistantServiceActionRequest {
+            entity_id: "Light.Kitchen".to_string(),
+            domain: "LIGHT".to_string(),
+            service: "TURN_ON".to_string(),
+            fields: Value::Null,
+        };
+        let normalized = normalize_home_assistant_service_action_request(&request);
+        assert_eq!(normalized.entity_id, "light.kitchen");
+        assert_eq!(normalized.fields, json!({}));
+        validate_home_assistant_service_action_request(&normalized, true, &["light".to_string()])
+            .expect("low risk action allowed");
+
+        let unsafe_request = HomeAssistantServiceActionRequest {
+            entity_id: "lock.front_door".to_string(),
+            domain: "lock".to_string(),
+            service: "unlock".to_string(),
+            fields: json!({}),
+        };
+        assert!(validate_home_assistant_service_action_request(
+            &unsafe_request,
+            true,
+            &["light".to_string(), "lock".to_string()],
+        )
+        .is_err());
+
+        assert!(validate_home_assistant_service_fields(&json!({
+            "api_token": "secret"
+        }))
+        .is_err());
+        assert!(validate_home_assistant_service_fields(&json!({
+            "message": "Bearer abcdef"
+        }))
+        .is_err());
     }
 }

@@ -12,11 +12,17 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::adapters::rtsp::CommandRtspAdapter;
+use crate::connectors::home_assistant::{
+    normalize_home_assistant_service_action_request,
+    validate_home_assistant_service_action_request, HomeAssistantClient, HomeAssistantClientConfig,
+    HomeAssistantEntity, HomeAssistantServiceActionRequest,
+};
 use crate::connectors::notifications::{
     NotificationAttachment, NotificationAttachmentKind, NotificationContent, NotificationDelivery,
-    NotificationDeliveryError, NotificationDeliveryMode, NotificationDeliveryService,
-    NotificationDestination, NotificationDestinationKind, NotificationMetadata,
-    NotificationPayloadFormat, NotificationRequest, NotificationSource,
+    NotificationDeliveryError, NotificationDeliveryMode, NotificationDeliveryRecord,
+    NotificationDeliveryService, NotificationDestination, NotificationDestinationKind,
+    NotificationGatewayConfig, NotificationMetadata, NotificationPayloadFormat,
+    NotificationRequest, NotificationSource,
 };
 #[cfg(test)]
 use crate::connectors::notifications::{NotificationRecipient, NotificationRecipientIdType};
@@ -70,6 +76,10 @@ use crate::runtime::task_session::{
     session_state_value_from_conversation, PendingTaskCandidate, PendingTaskClipConfirmation,
     PendingTaskConnect, PendingTaskGeneralMessageLoop, RecentClipPlaybackState,
     TaskConversationState, TaskConversationStore,
+};
+use crate::runtime::vision_event::{
+    build_local_vision_notification_intent, list_recent_local_vision_events_default,
+    LocalVisionEventArtifact, SnapshotArtifact, StoredLocalVisionEvent,
 };
 
 const ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV: &str = "HARBOR_ALLOW_NON_HARBOROS_CAPTURE_ROOT";
@@ -458,6 +468,10 @@ enum GeneralMessagePlanKind {
     CameraRecordClip,
     KnowledgeSearch,
     RagAnswer,
+    HomeAssistantServiceAction,
+    VisionEventSummary,
+    VisionEventNotifyLatest,
+    SystemReadiness,
     #[allow(dead_code)]
     Unsupported,
 }
@@ -531,6 +545,10 @@ struct GeneralMessageSignals {
     explicit_clip: bool,
     explicit_search: bool,
     explicit_rag_answer: bool,
+    explicit_ha_action: bool,
+    explicit_event_summary: bool,
+    explicit_event_notify: bool,
+    explicit_system_readiness: bool,
     mentions_camera_context: bool,
     ambiguous_visual_request: bool,
     recent_camera_context: bool,
@@ -1786,6 +1804,38 @@ impl TaskApiService {
                 );
                 self.handle_rag_answer(&routed)
             }
+            GeneralMessagePlanKind::HomeAssistantServiceAction => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_home_assistant_action(request)
+            }
+            GeneralMessagePlanKind::VisionEventSummary => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_latest_vision_event(request)
+            }
+            GeneralMessagePlanKind::VisionEventNotifyLatest => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_notify_latest_vision_event(request)
+            }
+            GeneralMessagePlanKind::SystemReadiness => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_system_readiness(request)
+            }
             GeneralMessagePlanKind::Unsupported => {
                 if let Err(response) =
                     self.clear_general_message_loop_if_matches(request, prior_pending)
@@ -1810,6 +1860,631 @@ impl TaskApiService {
             build_clip_delivery_payload(recent_clip),
             vec![build_clip_delivery_artifact(recent_clip)],
             Vec::new(),
+        )
+    }
+
+    fn handle_general_message_latest_vision_event(&self, request: &TaskRequest) -> TaskResponse {
+        let stored = match latest_local_vision_event() {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                let message = "最近还没有可查看的摄像头事件。".to_string();
+                let event = self.serialize_event_record(&build_task_event_record(
+                    request,
+                    &step_id_for_request(request),
+                    "local_vision_event.summary_blocked",
+                    EventSeverity::Warning,
+                    json!({
+                        "status": "blocked",
+                        "reason": "no_recent_event",
+                        "metadata_only": true,
+                    }),
+                ));
+                return self.completed_with_context(
+                    request,
+                    "vision_event_store",
+                    RiskLevel::Low,
+                    message.clone(),
+                    json!({
+                        "reply_pack": {
+                            "kind": "vision_event_summary",
+                            "status": "blocked",
+                            "summary": message,
+                        }
+                    }),
+                    Vec::new(),
+                    vec![event],
+                    vec!["拍一张门口".to_string(), "录一段门口".to_string()],
+                );
+            }
+            Err(error) => {
+                let message = format!("读取最近摄像头事件失败：{}", redact_task_api_text(&error));
+                return self.failed(request, "vision_event_store", RiskLevel::Low, message);
+            }
+        };
+        let summary = build_redacted_vision_event_summary(&stored);
+        let message = latest_vision_event_reply(&stored);
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "local_vision_event.summary_read",
+            EventSeverity::Info,
+            json!({
+                "status": "summarized",
+                "metadata_only": true,
+                "secret_scan": "clean",
+                "event_id": stored.event.event_id,
+                "camera_id": stored.event.camera_id,
+                "raw_image_included": false,
+                "local_paths_included": false,
+            }),
+        ));
+        self.completed_with_context(
+            request,
+            "vision_event_store",
+            RiskLevel::Low,
+            message.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "vision_event_summary",
+                    "status": "summarized",
+                    "summary": message,
+                    "event": summary,
+                }
+            }),
+            Vec::new(),
+            vec![event],
+            vec![
+                "通知最新事件".to_string(),
+                "状态".to_string(),
+                "拍一张门口".to_string(),
+            ],
+        )
+    }
+
+    fn handle_general_message_notify_latest_vision_event(
+        &self,
+        request: &TaskRequest,
+    ) -> TaskResponse {
+        let stored = match latest_local_vision_event() {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                return self.general_message_vision_event_notification_response(
+                    request,
+                    None,
+                    None,
+                    "blocked",
+                    "最近还没有可通知的摄像头事件。",
+                    None,
+                    "no_recent_event",
+                    EventSeverity::Warning,
+                );
+            }
+            Err(error) => {
+                let message = format!("读取最近摄像头事件失败：{}", redact_task_api_text(&error));
+                return self.failed(request, "notification_delivery", RiskLevel::Low, message);
+            }
+        };
+        let state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return self.general_message_vision_event_notification_response(
+                    request,
+                    Some(&stored),
+                    None,
+                    "failed",
+                    &format!("读取默认通知目标失败：{}", redact_task_api_text(&error)),
+                    None,
+                    "state_unavailable",
+                    EventSeverity::Error,
+                );
+            }
+        };
+        let target = match default_notification_target_record(&state.notification_targets).cloned()
+        {
+            Some(target) => target,
+            None => {
+                return self.general_message_vision_event_notification_response(
+                    request,
+                    Some(&stored),
+                    None,
+                    "blocked",
+                    "还没有配置默认通知目标，最新事件没有发出。",
+                    None,
+                    "no_default_target",
+                    EventSeverity::Warning,
+                );
+            }
+        };
+        let intent = match build_local_vision_notification_intent(&stored, &target.route_key) {
+            Ok(intent) => intent,
+            Err(error) => {
+                return self.general_message_vision_event_notification_response(
+                    request,
+                    Some(&stored),
+                    Some(&target),
+                    "failed",
+                    &format!("生成事件通知失败：{}", redact_task_api_text(&error)),
+                    None,
+                    "intent_failed",
+                    EventSeverity::Error,
+                );
+            }
+        };
+        let service = match NotificationDeliveryService::new() {
+            Ok(service) => service,
+            Err(error) => {
+                return self.general_message_vision_event_notification_response(
+                    request,
+                    Some(&stored),
+                    Some(&target),
+                    "blocked",
+                    &format!(
+                        "HarborGate 通知通道不可用：{}",
+                        redact_task_api_text(&error)
+                    ),
+                    None,
+                    "gateway_unavailable",
+                    EventSeverity::Warning,
+                );
+            }
+        };
+        match service.deliver(&intent.notification_request) {
+            Ok(record) if record.ok => self.general_message_vision_event_notification_response(
+                request,
+                Some(&stored),
+                Some(&target),
+                "delivered",
+                "已把最新摄像头事件发送到默认通知目标。",
+                Some(notification_delivery_record_summary(&record)),
+                "delivered",
+                EventSeverity::Info,
+            ),
+            Ok(record) => self.general_message_vision_event_notification_response(
+                request,
+                Some(&stored),
+                Some(&target),
+                "failed",
+                "HarborGate 返回投递失败记录，最新事件没有确认送达。",
+                Some(notification_delivery_record_summary(&record)),
+                "delivery_record_failed",
+                EventSeverity::Error,
+            ),
+            Err(error) => {
+                let (status, message, reason, severity) =
+                    classify_task_notification_delivery_error(error);
+                self.general_message_vision_event_notification_response(
+                    request,
+                    Some(&stored),
+                    Some(&target),
+                    status,
+                    &message,
+                    None,
+                    reason,
+                    severity,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn general_message_vision_event_notification_response(
+        &self,
+        request: &TaskRequest,
+        stored: Option<&StoredLocalVisionEvent>,
+        target: Option<&NotificationTargetRecord>,
+        status: &str,
+        message: &str,
+        delivery_record: Option<Value>,
+        reason: &str,
+        severity: EventSeverity,
+    ) -> TaskResponse {
+        let event_type = match status {
+            "delivered" => "local_vision_event.notification_delivered",
+            "blocked" => "local_vision_event.notification_blocked",
+            _ => "local_vision_event.notification_failed",
+        };
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            event_type,
+            severity,
+            json!({
+                "status": status,
+                "reason": reason,
+                "metadata_only": true,
+                "secret_scan": "clean",
+                "event_id": stored.map(|stored| stored.event.event_id.clone()),
+                "camera_id": stored.map(|stored| stored.event.camera_id.clone()),
+                "target_bound": target.is_some(),
+                "target_label": target.map(|target| target.label.clone()),
+                "platform_hint": target.and_then(|target| non_empty_task_string(&target.platform_hint)),
+                "route_key_redacted": target.is_some(),
+                "text_only": true,
+                "attachments_included": false,
+                "raw_image_included": false,
+                "local_paths_included": false,
+            }),
+        ));
+        let redacted_message = redact_task_api_text(message);
+        self.completed_with_context(
+            request,
+            "notification_delivery",
+            RiskLevel::Low,
+            redacted_message.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "vision_event_notify_latest",
+                    "status": status,
+                    "summary": redacted_message,
+                    "event": stored.map(build_redacted_vision_event_summary),
+                    "target": {
+                        "configured": target.is_some(),
+                        "label": target.map(|target| target.label.clone()),
+                        "platform_hint": target.and_then(|target| non_empty_task_string(&target.platform_hint)),
+                        "route_key_redacted": target.is_some(),
+                    },
+                    "delivery_record": delivery_record,
+                }
+            }),
+            Vec::new(),
+            vec![event],
+            vec!["最近事件".to_string(), "状态".to_string()],
+        )
+    }
+
+    fn handle_general_message_home_assistant_action(&self, request: &TaskRequest) -> TaskResponse {
+        let Some(action) = infer_home_assistant_natural_action(request.intent.raw_text.as_str())
+        else {
+            return self.general_message_unsupported_response(request, None);
+        };
+        let action = match action {
+            HomeAssistantNaturalAction::Blocked { message } => {
+                return self.general_message_home_assistant_action_response(
+                    request,
+                    "blocked",
+                    false,
+                    false,
+                    &message,
+                    None,
+                    HomeAssistantServiceActionRequest::default(),
+                    "home_assistant.service_action_blocked",
+                    EventSeverity::Warning,
+                    None,
+                );
+            }
+            HomeAssistantNaturalAction::Request(action) => action,
+        };
+        let state = match self.admin_store.home_assistant_secret_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return self.general_message_home_assistant_action_response(
+                    request,
+                    "failed",
+                    false,
+                    false,
+                    &format!(
+                        "读取 Home Assistant 配置失败：{}",
+                        redact_task_api_text(&error)
+                    ),
+                    None,
+                    HomeAssistantServiceActionRequest {
+                        domain: action.domain.clone(),
+                        service: action.service.clone(),
+                        fields: json!({}),
+                        ..Default::default()
+                    },
+                    "home_assistant.service_action_failed",
+                    EventSeverity::Error,
+                    None,
+                );
+            }
+        };
+        let client = match home_assistant_client_from_admin_state(&state) {
+            Ok(client) => client,
+            Err(error) => {
+                return self.general_message_home_assistant_action_response(
+                    request,
+                    "blocked",
+                    false,
+                    false,
+                    &redact_task_api_text(&error),
+                    None,
+                    HomeAssistantServiceActionRequest {
+                        domain: action.domain.clone(),
+                        service: action.service.clone(),
+                        fields: json!({}),
+                        ..Default::default()
+                    },
+                    "home_assistant.service_action_blocked",
+                    EventSeverity::Warning,
+                    None,
+                );
+            }
+        };
+        let entities = match client.fetch_entities() {
+            Ok(entities) => entities,
+            Err(error) => {
+                return self.general_message_home_assistant_action_response(
+                    request,
+                    "failed",
+                    false,
+                    false,
+                    &format!(
+                        "读取 Home Assistant 实体失败：{}",
+                        redact_task_api_text(&error)
+                    ),
+                    None,
+                    HomeAssistantServiceActionRequest {
+                        domain: action.domain.clone(),
+                        service: action.service.clone(),
+                        fields: json!({}),
+                        ..Default::default()
+                    },
+                    "home_assistant.service_action_failed",
+                    EventSeverity::Error,
+                    None,
+                );
+            }
+        };
+        let entity = match resolve_home_assistant_action_entity(&action, &entities) {
+            HomeAssistantEntityResolution::Resolved(entity) => entity,
+            HomeAssistantEntityResolution::Clarify(candidates) => {
+                let message = format!(
+                    "{} 有多个可操作实体，请说得更具体一点。",
+                    home_assistant_domain_label(&action.domain)
+                );
+                let event = self.serialize_event_record(&build_task_event_record(
+                    request,
+                    &step_id_for_request(request),
+                    "home_assistant.service_action_clarification_required",
+                    EventSeverity::Warning,
+                    json!({
+                        "status": "blocked",
+                        "reason": "ambiguous_entity",
+                        "metadata_only": true,
+                        "domain": action.domain,
+                        "service": action.service,
+                        "candidate_count": candidates.len(),
+                        "executed": false,
+                    }),
+                ));
+                return self.completed_with_context(
+                    request,
+                    "home_assistant_connector",
+                    RiskLevel::Low,
+                    message.clone(),
+                    json!({
+                        "reply_pack": {
+                            "kind": "ha_action_clarify",
+                            "status": "blocked",
+                            "summary": message,
+                            "domain": action.domain,
+                            "service": action.service,
+                            "candidates": candidates.iter().take(5).map(redacted_home_assistant_entity_summary).collect::<Vec<_>>(),
+                        }
+                    }),
+                    Vec::new(),
+                    vec![event],
+                    home_assistant_entity_clarification_actions(&candidates, &action),
+                );
+            }
+            HomeAssistantEntityResolution::Missing(message) => {
+                return self.general_message_home_assistant_action_response(
+                    request,
+                    "blocked",
+                    false,
+                    false,
+                    &message,
+                    None,
+                    HomeAssistantServiceActionRequest {
+                        domain: action.domain.clone(),
+                        service: action.service.clone(),
+                        fields: json!({}),
+                        ..Default::default()
+                    },
+                    "home_assistant.service_action_blocked",
+                    EventSeverity::Warning,
+                    None,
+                );
+            }
+        };
+        let action_request =
+            normalize_home_assistant_service_action_request(&HomeAssistantServiceActionRequest {
+                entity_id: entity.entity_id.clone(),
+                domain: action.domain.clone(),
+                service: action.service.clone(),
+                fields: json!({}),
+            });
+        if let Err(message) = validate_home_assistant_service_action_request(
+            &action_request,
+            state.enabled,
+            &state.exposed_domains,
+        ) {
+            return self.general_message_home_assistant_action_response(
+                request,
+                "blocked",
+                false,
+                false,
+                &message,
+                None,
+                action_request,
+                "home_assistant.service_action_blocked",
+                EventSeverity::Warning,
+                Some(&entity),
+            );
+        }
+        match client.call_service(
+            &action_request.domain,
+            &action_request.service,
+            &action_request.entity_id,
+            Some(&action_request.fields),
+        ) {
+            Ok(result) => self.general_message_home_assistant_action_response(
+                request,
+                "succeeded",
+                true,
+                true,
+                &format!(
+                    "已执行：{} {}.{}。",
+                    entity.display_name, action_request.domain, action_request.service
+                ),
+                Some(json!(result)),
+                action_request,
+                "home_assistant.service_action_executed",
+                EventSeverity::Info,
+                Some(&entity),
+            ),
+            Err(error) => self.general_message_home_assistant_action_response(
+                request,
+                "failed",
+                true,
+                false,
+                &format!(
+                    "Home Assistant 动作执行失败：{}",
+                    redact_task_api_text(&error)
+                ),
+                None,
+                action_request,
+                "home_assistant.service_action_failed",
+                EventSeverity::Error,
+                Some(&entity),
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn general_message_home_assistant_action_response(
+        &self,
+        request: &TaskRequest,
+        status: &str,
+        allowed: bool,
+        executed: bool,
+        message: &str,
+        result: Option<Value>,
+        action_request: HomeAssistantServiceActionRequest,
+        audit_kind: &str,
+        severity: EventSeverity,
+        entity: Option<&HomeAssistantEntity>,
+    ) -> TaskResponse {
+        let redacted_message = redact_task_api_text(message);
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            audit_kind,
+            severity,
+            json!({
+                "audit_kind": audit_kind,
+                "status": status,
+                "metadata_only": true,
+                "secret_scan": "clean",
+                "allowed": allowed,
+                "executed": executed,
+                "entity_id": non_empty_task_string(&action_request.entity_id),
+                "entity_display_name": entity.map(|entity| entity.display_name.clone()),
+                "domain": non_empty_task_string(&action_request.domain),
+                "service": non_empty_task_string(&action_request.service),
+                "fields_empty": action_request.fields.as_object().map(|object| object.is_empty()).unwrap_or(true),
+                "message": redacted_message,
+            }),
+        ));
+        self.completed_with_context(
+            request,
+            "home_assistant_connector",
+            RiskLevel::Low,
+            redacted_message.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "ha_service_action",
+                    "status": status,
+                    "summary": redacted_message,
+                    "allowed": allowed,
+                    "executed": executed,
+                    "domain": non_empty_task_string(&action_request.domain),
+                    "service": non_empty_task_string(&action_request.service),
+                    "entity": entity.map(redacted_home_assistant_entity_summary),
+                    "fields": {},
+                    "result": result,
+                    "redacted": true,
+                }
+            }),
+            Vec::new(),
+            vec![event],
+            vec!["状态".to_string(), "最近事件".to_string()],
+        )
+    }
+
+    fn handle_general_message_system_readiness(&self, request: &TaskRequest) -> TaskResponse {
+        let state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return self.failed(
+                    request,
+                    "agentic_interpreter",
+                    RiskLevel::Low,
+                    format!("读取状态失败：{}", redact_task_api_text(&error)),
+                );
+            }
+        };
+        let gateway_status = fetch_task_gateway_status().ok();
+        let camera_count = self
+            .admin_store
+            .registry_store()
+            .load_devices()
+            .map(|devices| devices.len())
+            .unwrap_or(0);
+        let latest_event = latest_local_vision_event().ok().flatten();
+        let readiness = build_general_message_readiness_summary(
+            &state,
+            gateway_status.as_ref(),
+            camera_count,
+            latest_event.as_ref(),
+        );
+        let message =
+            format!(
+            "当前状态：微信 {}；默认通知目标 {}；HA {}（{} 个实体）；摄像头 {} 个，最近事件 {}。",
+            readiness["gateway"]["weixin"]["status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            readiness["default_notification_target"]["status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            readiness["home_assistant"]["status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            readiness["home_assistant"]["entity_count"]
+                .as_u64()
+                .unwrap_or(0),
+            camera_count,
+            if latest_event.is_some() { "可用" } else { "暂无" },
+        );
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "general_message.system_readiness_read",
+            EventSeverity::Info,
+            json!({
+                "status": "summarized",
+                "metadata_only": true,
+                "secret_scan": "clean",
+                "redacted": true,
+            }),
+        ));
+        self.completed_with_context(
+            request,
+            "agentic_interpreter",
+            RiskLevel::Low,
+            message.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "system_readiness",
+                    "summary": message,
+                    "readiness": readiness,
+                    "redacted": true,
+                }
+            }),
+            Vec::new(),
+            vec![event],
+            vec!["最近事件".to_string(), "通知最新事件".to_string()],
         )
     }
 
@@ -1838,6 +2513,10 @@ impl TaskApiService {
                     "capabilities": [
                         "camera_snapshot",
                         "camera_record_clip",
+                        "vision_event_summary",
+                        "vision_event_notify_latest",
+                        "ha_service_action",
+                        "system_readiness",
                         "knowledge_search",
                         "rag_answer",
                     ],
@@ -1846,9 +2525,11 @@ impl TaskApiService {
             }),
             Vec::new(),
             vec![
-                "帮我抓拍一下当前摄像头画面".to_string(),
-                "帮我录一段门口摄像头".to_string(),
-                "帮我找到和樱花有关的文件".to_string(),
+                "拍一张门口".to_string(),
+                "最近事件".to_string(),
+                "通知最新事件".to_string(),
+                "开灯".to_string(),
+                "状态".to_string(),
             ],
         )
     }
@@ -1876,6 +2557,10 @@ impl TaskApiService {
                     "capabilities": [
                         "camera_snapshot",
                         "camera_record_clip",
+                        "vision_event_summary",
+                        "vision_event_notify_latest",
+                        "ha_service_action",
+                        "system_readiness",
                         "knowledge_search",
                         "rag_answer",
                     ],
@@ -1884,9 +2569,11 @@ impl TaskApiService {
             }),
             Vec::new(),
             vec![
-                "帮我抓拍一下当前摄像头画面".to_string(),
-                "帮我录一段门口摄像头".to_string(),
-                "帮我找到和樱花有关的文件".to_string(),
+                "拍一张门口".to_string(),
+                "最近事件".to_string(),
+                "通知最新事件".to_string(),
+                "开灯".to_string(),
+                "状态".to_string(),
             ],
         )
     }
@@ -4976,7 +5663,11 @@ fn clip_confirmation_active_frame_decision(plan: &GeneralMessagePlan) -> ActiveF
         GeneralMessagePlanKind::CameraSnapshot
         | GeneralMessagePlanKind::CameraRecordClip
         | GeneralMessagePlanKind::KnowledgeSearch
-        | GeneralMessagePlanKind::RagAnswer => ActiveFrameDecision::Supersede,
+        | GeneralMessagePlanKind::RagAnswer
+        | GeneralMessagePlanKind::HomeAssistantServiceAction
+        | GeneralMessagePlanKind::VisionEventSummary
+        | GeneralMessagePlanKind::VisionEventNotifyLatest
+        | GeneralMessagePlanKind::SystemReadiness => ActiveFrameDecision::Supersede,
         GeneralMessagePlanKind::ConversationAct
             if plan.conversation_act == Some(GeneralMessageConversationAct::Cancel) =>
         {
@@ -7309,6 +8000,26 @@ fn conversation_key(request: &TaskRequest) -> Option<String> {
     .map(|value| value.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HomeAssistantNaturalAction {
+    Request(HomeAssistantNaturalActionRequest),
+    Blocked { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HomeAssistantNaturalActionRequest {
+    domain: String,
+    service: String,
+    entity_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum HomeAssistantEntityResolution {
+    Resolved(HomeAssistantEntity),
+    Clarify(Vec<HomeAssistantEntity>),
+    Missing(String),
+}
+
 fn normalize_command_text(text: &str) -> String {
     text.to_lowercase()
         .chars()
@@ -7316,6 +8027,656 @@ fn normalize_command_text(text: &str) -> String {
             !ch.is_whitespace() && !matches!(ch, '，' | '。' | ',' | '.' | '？' | '?' | '！' | '!')
         })
         .collect()
+}
+
+fn infer_home_assistant_natural_action(raw_text: &str) -> Option<HomeAssistantNaturalAction> {
+    let normalized = normalize_command_text(raw_text);
+    if normalized.is_empty() {
+        return None;
+    }
+    if looks_like_unsafe_home_assistant_request(&normalized) {
+        return Some(HomeAssistantNaturalAction::Blocked {
+            message: "这类 Home Assistant 动作不在低风险 allowlist 中，本次没有执行。".to_string(),
+        });
+    }
+    if matches_any(&normalized, &["场景", "scene"]) {
+        return Some(HomeAssistantNaturalAction::Request(
+            HomeAssistantNaturalActionRequest {
+                domain: "scene".to_string(),
+                service: "turn_on".to_string(),
+                entity_hint: infer_home_assistant_entity_hint(&normalized, "scene"),
+            },
+        ));
+    }
+    if matches_any(
+        &normalized,
+        &["inputboolean", "input_boolean", "布尔", "输入布尔"],
+    ) {
+        return power_home_assistant_action(&normalized, "input_boolean");
+    }
+    if matches_any(&normalized, &["灯", "电灯", "灯光", "light"]) {
+        return power_home_assistant_action(&normalized, "light");
+    }
+    if matches_any(&normalized, &["开关", "switch"]) {
+        return power_home_assistant_action(&normalized, "switch");
+    }
+    None
+}
+
+fn power_home_assistant_action(
+    normalized: &str,
+    domain: &str,
+) -> Option<HomeAssistantNaturalAction> {
+    let service = if matches_any(normalized, &["切换", "toggle", "反转"]) {
+        "toggle"
+    } else if matches_any(normalized, &["关闭", "关掉", "关灯", "关开关", "turnoff"]) {
+        "turn_off"
+    } else if matches_any(
+        normalized,
+        &["打开", "开启", "开灯", "打开开关", "开开关", "turnon"],
+    ) {
+        "turn_on"
+    } else {
+        return None;
+    };
+    Some(HomeAssistantNaturalAction::Request(
+        HomeAssistantNaturalActionRequest {
+            domain: domain.to_string(),
+            service: service.to_string(),
+            entity_hint: infer_home_assistant_entity_hint(normalized, domain),
+        },
+    ))
+}
+
+fn looks_like_unsafe_home_assistant_request(normalized: &str) -> bool {
+    matches_any(
+        normalized,
+        &[
+            "重启homeassistant",
+            "重启ha",
+            "重启系统",
+            "重启网关",
+            "解锁",
+            "开锁",
+            "开门",
+            "打开门锁",
+            "设置温度",
+            "设温度",
+            "调温度",
+            "打开空调",
+            "关闭空调",
+            "开空调",
+            "关空调",
+            "打开阀门",
+            "关闭阀门",
+        ],
+    )
+}
+
+fn infer_home_assistant_entity_hint(normalized: &str, domain: &str) -> Option<String> {
+    let tokens = [
+        "门口",
+        "玄关",
+        "客厅",
+        "厨房",
+        "卧室",
+        "书房",
+        "阳台",
+        "车库",
+        "测试",
+        "餐厅",
+        "kitchen",
+        "livingroom",
+        "frontdoor",
+        "porch",
+        "test",
+    ];
+    tokens
+        .iter()
+        .find(|token| normalized.contains(*token))
+        .map(|token| token.to_string())
+        .or_else(|| {
+            (domain == "scene" && normalized.contains("测试场景")).then(|| "测试".to_string())
+        })
+}
+
+fn resolve_home_assistant_action_entity(
+    action: &HomeAssistantNaturalActionRequest,
+    entities: &[HomeAssistantEntity],
+) -> HomeAssistantEntityResolution {
+    let domain_entities = entities
+        .iter()
+        .filter(|entity| entity.domain.eq_ignore_ascii_case(&action.domain))
+        .cloned()
+        .collect::<Vec<_>>();
+    if domain_entities.is_empty() {
+        return HomeAssistantEntityResolution::Missing(format!(
+            "没有找到 {} 实体，本次没有执行。",
+            home_assistant_domain_label(&action.domain)
+        ));
+    }
+    let matched = action
+        .entity_hint
+        .as_deref()
+        .map(|hint| {
+            let normalized_hint = normalize_command_text(hint);
+            domain_entities
+                .iter()
+                .filter(|entity| {
+                    let entity_text = normalize_command_text(&format!(
+                        "{}{}",
+                        entity.entity_id, entity.display_name
+                    ));
+                    entity_text.contains(&normalized_hint)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| domain_entities.clone());
+
+    if matched.len() == 1 {
+        return HomeAssistantEntityResolution::Resolved(matched[0].clone());
+    }
+    if matched.is_empty() && domain_entities.len() == 1 {
+        return HomeAssistantEntityResolution::Resolved(domain_entities[0].clone());
+    }
+    if matched.is_empty() {
+        return HomeAssistantEntityResolution::Missing(format!(
+            "没有找到匹配“{}”的 {} 实体，本次没有执行。",
+            action.entity_hint.clone().unwrap_or_default(),
+            home_assistant_domain_label(&action.domain)
+        ));
+    }
+    HomeAssistantEntityResolution::Clarify(matched)
+}
+
+fn redacted_home_assistant_entity_summary(entity: &HomeAssistantEntity) -> Value {
+    json!({
+        "entity_id": entity.entity_id,
+        "domain": entity.domain,
+        "display_name": entity.display_name,
+        "state": entity.state,
+        "redacted": true,
+    })
+}
+
+fn home_assistant_entity_clarification_actions(
+    candidates: &[HomeAssistantEntity],
+    action: &HomeAssistantNaturalActionRequest,
+) -> Vec<String> {
+    candidates
+        .iter()
+        .take(3)
+        .map(|entity| {
+            format!(
+                "{}{}",
+                home_assistant_service_verb(&action.service),
+                entity.display_name
+            )
+        })
+        .collect()
+}
+
+fn home_assistant_service_verb(service: &str) -> &'static str {
+    match service {
+        "turn_off" => "关闭",
+        "toggle" => "切换",
+        _ => "打开",
+    }
+}
+
+fn home_assistant_domain_label(domain: &str) -> &'static str {
+    match domain {
+        "light" => "灯",
+        "switch" => "开关",
+        "input_boolean" => "输入布尔",
+        "scene" => "场景",
+        _ => "Home Assistant",
+    }
+}
+
+fn home_assistant_client_from_admin_state(
+    state: &crate::runtime::admin_console::HomeAssistantAdminState,
+) -> Result<HomeAssistantClient, String> {
+    if !state.enabled {
+        return Err("Home Assistant integration is disabled".to_string());
+    }
+    let config = HomeAssistantClientConfig::new(&state.base_url, &state.access_token);
+    if !config.configured() {
+        return Err("Home Assistant base URL and access token are required".to_string());
+    }
+    HomeAssistantClient::new(config)
+}
+
+fn latest_local_vision_event() -> Result<Option<StoredLocalVisionEvent>, String> {
+    Ok(list_recent_local_vision_events_default(1)?
+        .into_iter()
+        .next())
+}
+
+fn build_redacted_vision_event_summary(stored: &StoredLocalVisionEvent) -> Value {
+    let event = &stored.event;
+    json!({
+        "event_id": event.event_id,
+        "summary": event.summary,
+        "labels": event.labels,
+        "confidence": event.confidence,
+        "camera_id": event.camera_id,
+        "event_type": event.event_type,
+        "started_at": event.started_at,
+        "received_at": stored.received_at,
+        "latency_ms": event.latency_ms,
+        "analyzer": event.analyzer,
+        "vlm": event.vlm.as_ref().map(|vlm| json!({
+            "status": vlm.status,
+            "summary": vlm.summary,
+            "tags": vlm.tags,
+            "labels": vlm.labels,
+            "artifact_count": vlm.artifacts.len(),
+            "artifacts": vlm.artifacts.iter().map(redacted_vision_event_artifact).collect::<Vec<_>>(),
+            "error": vlm.error.as_ref().map(|error| redact_task_api_text(error)),
+        })),
+        "snapshot_artifact": redacted_snapshot_artifact(&event.snapshot_artifact),
+        "raw_image_included": false,
+        "local_paths_included": false,
+        "redacted": true,
+    })
+}
+
+fn redacted_snapshot_artifact(artifact: &SnapshotArtifact) -> Value {
+    json!({
+        "artifact_id": artifact.artifact_id,
+        "mime_type": artifact.mime_type,
+        "byte_size": artifact.byte_size,
+        "sha256_present": artifact.sha256.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "source": artifact.source,
+        "path_redacted": artifact.path.as_ref().is_some(),
+    })
+}
+
+fn redacted_vision_event_artifact(artifact: &LocalVisionEventArtifact) -> Value {
+    json!({
+        "artifact_id": artifact.artifact_id,
+        "role": artifact.role,
+        "mime_type": artifact.mime_type,
+        "byte_size": artifact.byte_size,
+        "sha256_present": artifact.sha256.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "source": artifact.source,
+    })
+}
+
+fn latest_vision_event_reply(stored: &StoredLocalVisionEvent) -> String {
+    let event = &stored.event;
+    let labels = if event.labels.is_empty() {
+        "无标签".to_string()
+    } else {
+        event.labels.join("、")
+    };
+    let vlm_status = event
+        .vlm
+        .as_ref()
+        .map(|vlm| vlm.status.as_str())
+        .unwrap_or("not_available");
+    format!(
+        "最近事件：{}；标签：{}；置信度：{:.2}；摄像头：{}；时间：{}；延迟：{}ms；VLM：{}。",
+        event.summary,
+        labels,
+        event.confidence,
+        event.camera_id,
+        event.started_at,
+        event.latency_ms,
+        vlm_status
+    )
+}
+
+fn default_notification_target_record(
+    targets: &[NotificationTargetRecord],
+) -> Option<&NotificationTargetRecord> {
+    targets
+        .iter()
+        .find(|target| target.is_default && !target.route_key.trim().is_empty())
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|target| !target.route_key.trim().is_empty())
+        })
+}
+
+fn notification_delivery_record_summary(record: &NotificationDeliveryRecord) -> Value {
+    json!({
+        "delivery_id": record.delivery_id,
+        "notification_id": record.notification_id,
+        "trace_id": record.trace_id,
+        "ok": record.ok,
+        "status": serde_json::to_value(record.status).unwrap_or(Value::Null),
+        "platform": record.platform,
+        "retryable": record.retryable,
+        "error": record.error.as_ref().map(|error| json!({
+            "code": error.code,
+            "message": redact_task_api_text(&error.message),
+        })),
+        "redacted": true,
+    })
+}
+
+fn classify_task_notification_delivery_error(
+    error: NotificationDeliveryError,
+) -> (&'static str, String, &'static str, EventSeverity) {
+    match error {
+        NotificationDeliveryError::MissingConfiguration(message) => (
+            "blocked",
+            redact_task_api_text(&message),
+            "missing_configuration",
+            EventSeverity::Warning,
+        ),
+        NotificationDeliveryError::Transport(message) => (
+            "failed",
+            redact_task_api_text(&message),
+            "gateway_unreachable",
+            EventSeverity::Error,
+        ),
+        NotificationDeliveryError::InvalidResponse(message) => (
+            "failed",
+            redact_task_api_text(&message),
+            "invalid_response",
+            EventSeverity::Error,
+        ),
+        NotificationDeliveryError::RequestRejected {
+            status_code,
+            envelope,
+        } => (
+            "failed",
+            redact_task_api_text(&format!(
+                "HarborGate rejected the notification with HTTP {status_code}: {} ({})",
+                envelope.error.message, envelope.error.code
+            )),
+            "request_rejected",
+            EventSeverity::Error,
+        ),
+    }
+}
+
+fn build_general_message_readiness_summary(
+    state: &AdminConsoleState,
+    gateway_status: Option<&Value>,
+    camera_count: usize,
+    latest_event: Option<&StoredLocalVisionEvent>,
+) -> Value {
+    json!({
+        "gateway": {
+            "weixin": build_task_weixin_gateway_status(gateway_status),
+        },
+        "default_notification_target": build_task_default_notification_target_readiness(
+            &state.notification_targets,
+            gateway_status,
+        ),
+        "home_assistant": {
+            "configured": !state.home_assistant.base_url.trim().is_empty()
+                && !state.home_assistant.access_token.trim().is_empty(),
+            "enabled": state.home_assistant.enabled,
+            "status": state.home_assistant.last_status,
+            "token_configured": !state.home_assistant.access_token.trim().is_empty(),
+            "token_redacted": !state.home_assistant.access_token.trim().is_empty(),
+            "last_sync_at": state.home_assistant.last_sync_at,
+            "entity_count": state.home_assistant.entity_count,
+            "service_count": state.home_assistant.service_count,
+            "exposed_domains": state.home_assistant.exposed_domains,
+        },
+        "camera": {
+            "camera_count": camera_count,
+            "event_available": latest_event.is_some(),
+            "latest_event_id": latest_event.map(|stored| stored.event.event_id.clone()),
+            "latest_event_camera_id": latest_event.map(|stored| stored.event.camera_id.clone()),
+        },
+        "redacted": true,
+    })
+}
+
+fn build_task_default_notification_target_readiness(
+    targets: &[NotificationTargetRecord],
+    gateway_status: Option<&Value>,
+) -> Value {
+    let target = default_notification_target_record(targets);
+    let gateway_connected = task_gateway_connected(gateway_status);
+    let gateway_configured = task_gateway_configured(gateway_status);
+    let status = if target.is_none() {
+        "not_configured"
+    } else if gateway_connected {
+        "available"
+    } else if gateway_configured {
+        "degraded"
+    } else {
+        "blocked"
+    };
+    json!({
+        "status": status,
+        "target_configured": target.is_some(),
+        "target_label": target.map(|target| target.label.clone()),
+        "platform_hint": target.and_then(|target| non_empty_task_string(&target.platform_hint)),
+        "gateway_configured": gateway_configured,
+        "gateway_connected": gateway_connected,
+        "route_key_redacted": target.is_some(),
+    })
+}
+
+fn build_task_weixin_gateway_status(gateway_status: Option<&Value>) -> Value {
+    let Some(payload) = gateway_status else {
+        return json!({
+            "status": "unavailable",
+            "configured": false,
+            "connected": false,
+            "context_token_count": Value::Null,
+            "redacted": true,
+        });
+    };
+    let channel = find_gateway_channel(payload, "weixin");
+    let configured = channel
+        .and_then(|value| value.get("configured").and_then(Value::as_bool))
+        .or_else(|| {
+            payload
+                .pointer("/weixin/configured")
+                .and_then(Value::as_bool)
+        })
+        .or_else(|| {
+            payload
+                .pointer("/bridge_provider/configured")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false);
+    let connected = channel
+        .and_then(|value| value.get("connected").and_then(Value::as_bool))
+        .or_else(|| {
+            payload
+                .pointer("/weixin/connected")
+                .and_then(Value::as_bool)
+        })
+        .or_else(|| {
+            payload
+                .pointer("/bridge_provider/connected")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false);
+    let context_token_count = payload
+        .pointer("/context_tokens/count")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            payload
+                .pointer("/route_context/token_count")
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| {
+            payload
+                .pointer("/context_token_count")
+                .and_then(Value::as_u64)
+        });
+    json!({
+        "status": if connected {
+            "connected"
+        } else if configured {
+            "configured"
+        } else {
+            "not_configured"
+        },
+        "configured": configured,
+        "connected": connected,
+        "context_token_count": context_token_count,
+        "context_token_redacted": context_token_count.is_some(),
+        "redacted": true,
+    })
+}
+
+fn find_gateway_channel<'a>(payload: &'a Value, platform: &str) -> Option<&'a Value> {
+    payload
+        .get("channels")
+        .or_else(|| payload.pointer("/gateway_status/channels"))
+        .and_then(Value::as_array)
+        .and_then(|channels| {
+            channels.iter().find(|channel| {
+                channel
+                    .get("platform")
+                    .or_else(|| channel.get("name"))
+                    .or_else(|| channel.get("channel"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(platform))
+            })
+        })
+}
+
+fn task_gateway_connected(gateway_status: Option<&Value>) -> bool {
+    gateway_status
+        .and_then(|value| value.get("connected").and_then(Value::as_bool))
+        .or_else(|| {
+            gateway_status
+                .and_then(|value| value.pointer("/bridge_provider/connected"))
+                .and_then(Value::as_bool)
+        })
+        .or_else(|| {
+            find_gateway_channel(gateway_status?, "weixin")
+                .and_then(|value| value.get("connected"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn task_gateway_configured(gateway_status: Option<&Value>) -> bool {
+    gateway_status
+        .and_then(|value| value.get("configured").and_then(Value::as_bool))
+        .or_else(|| {
+            gateway_status
+                .and_then(|value| value.pointer("/bridge_provider/configured"))
+                .and_then(Value::as_bool)
+        })
+        .or_else(|| {
+            find_gateway_channel(gateway_status?, "weixin")
+                .and_then(|value| value.get("configured"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn fetch_task_gateway_status() -> Result<Value, String> {
+    let config = NotificationGatewayConfig::from_env()
+        .map_err(|error| format!("HarborGate status configuration error: {error}"))?;
+    let endpoint = gateway_status_endpoint(&config.base_url);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|error| format!("failed to build HarborGate status client: {error}"))?;
+    let response = client
+        .get(endpoint)
+        .header("Authorization", format!("Bearer {}", config.bearer_token))
+        .header("X-Contract-Version", "2.0")
+        .send()
+        .map_err(|error| format!("HarborGate status request failed: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| format!("failed to read HarborGate status response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "HarborGate status request failed with HTTP {}",
+            status.as_u16()
+        ));
+    }
+    serde_json::from_str::<Value>(&body)
+        .map_err(|error| format!("failed to parse HarborGate status response: {error}"))
+}
+
+fn gateway_status_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/api/gateway/status") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/api/gateway/status")
+    }
+}
+
+fn non_empty_task_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn redact_task_api_text(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_lowercase();
+    if lower.contains("rtsp://")
+        || lower.contains("bearer ")
+        || lower.contains("token=")
+        || lower.contains("password=")
+        || lower.contains("passwd=")
+        || lower.contains("api_key=")
+        || lower.contains("access_token=")
+        || lower.contains("-----begin ")
+    {
+        return "[redacted sensitive detail]".to_string();
+    }
+    trimmed.to_string()
+}
+
+fn looks_like_vision_event_notify_request(normalized: &str) -> bool {
+    matches_any(
+        normalized,
+        &[
+            "通知最新事件",
+            "通知最近事件",
+            "发送最新事件",
+            "转发最新事件",
+            "把最新事件发出去",
+            "发最新摄像头事件",
+        ],
+    )
+}
+
+fn looks_like_vision_event_summary_request(normalized: &str) -> bool {
+    matches_any(
+        normalized,
+        &[
+            "最近事件",
+            "最新事件",
+            "最新摄像头事件",
+            "摄像头事件",
+            "门口最近事件",
+            "有什么事件",
+        ],
+    )
+}
+
+fn looks_like_system_readiness_request(normalized: &str) -> bool {
+    matches_any(
+        normalized,
+        &[
+            "状态",
+            "诊断",
+            "微信状态",
+            "系统状态",
+            "当前状态",
+            "查看状态",
+            "健康状态",
+        ],
+    )
 }
 
 fn extract_general_message_signals(
@@ -7395,6 +8756,12 @@ fn extract_general_message_signals(
     let asks_capability =
         general_message_requests_capability_summary(request.intent.raw_text.as_str());
     let explicit_rag_answer = looks_like_rag_answer_request(&normalized) && !asks_capability;
+    let explicit_event_notify = looks_like_vision_event_notify_request(&normalized);
+    let explicit_event_summary =
+        !explicit_event_notify && looks_like_vision_event_summary_request(&normalized);
+    let explicit_system_readiness = looks_like_system_readiness_request(&normalized);
+    let explicit_ha_action =
+        infer_home_assistant_natural_action(request.intent.raw_text.as_str()).is_some();
     let mentions_camera_context = matches_any(
         &normalized,
         &[
@@ -7428,6 +8795,10 @@ fn extract_general_message_signals(
         explicit_clip,
         explicit_search,
         explicit_rag_answer,
+        explicit_ha_action,
+        explicit_event_summary,
+        explicit_event_notify,
+        explicit_system_readiness,
         mentions_camera_context,
         ambiguous_visual_request,
         recent_camera_context,
@@ -7487,6 +8858,58 @@ fn build_general_message_candidates(
                 query: None,
                 recent_clip: recent_clip.cloned(),
                 reason: "structured_signal_recent_clip_playback".to_string(),
+            },
+        );
+    }
+    if signals.explicit_event_notify {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::VisionEventNotifyLatest,
+                confidence: 99,
+                camera_hint: None,
+                query: None,
+                recent_clip: None,
+                reason: "structured_signal_vision_event_notify".to_string(),
+            },
+        );
+    }
+    if signals.explicit_event_summary {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::VisionEventSummary,
+                confidence: 98,
+                camera_hint: None,
+                query: None,
+                recent_clip: None,
+                reason: "structured_signal_vision_event_summary".to_string(),
+            },
+        );
+    }
+    if signals.explicit_system_readiness {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::SystemReadiness,
+                confidence: 98,
+                camera_hint: None,
+                query: None,
+                recent_clip: None,
+                reason: "structured_signal_system_readiness".to_string(),
+            },
+        );
+    }
+    if signals.explicit_ha_action {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::HomeAssistantServiceAction,
+                confidence: 98,
+                camera_hint: None,
+                query: None,
+                recent_clip: None,
+                reason: "structured_signal_home_assistant_service_action".to_string(),
             },
         );
     }
@@ -7833,10 +9256,11 @@ fn build_general_message_router_system_prompt() -> String {
     concat!(
         "You are a HarborBeacon router. Return exactly one lowercase label from this closed set ",
         "and nothing else: capability_summary, camera_snapshot, camera_record_clip, ",
+        "vision_event_summary, vision_event_notify_latest, ha_service_action, system_readiness, ",
         "knowledge_search, rag_answer, clarify, conversation_continue, conversation_boundary, ",
         "conversation_repair, conversation_cancel, conversation_clarify_continue. ",
-        "Choose a camera/search/answer label only for a clear supported tool request; otherwise choose ",
-        "a conversation_* label."
+        "Choose a tool label only for a clear supported request; otherwise choose a conversation_* label. ",
+        "Do not invent external weather, news, stock, or internet providers."
     )
     .to_string()
 }
@@ -7911,6 +9335,18 @@ fn parse_general_message_router_decision(
             }
             "rag_answer" | "rag.answer" | "answer" => {
                 return Some((GeneralMessagePlanKind::RagAnswer, None))
+            }
+            "ha_service_action" | "home_assistant_service_action" | "home_assistant_action" => {
+                return Some((GeneralMessagePlanKind::HomeAssistantServiceAction, None))
+            }
+            "vision_event_summary" | "event_summary" | "recent_event" => {
+                return Some((GeneralMessagePlanKind::VisionEventSummary, None))
+            }
+            "vision_event_notify_latest" | "event_notify" | "notify_latest_event" => {
+                return Some((GeneralMessagePlanKind::VisionEventNotifyLatest, None))
+            }
+            "system_readiness" | "status" | "diagnostics" => {
+                return Some((GeneralMessagePlanKind::SystemReadiness, None))
             }
             "conversation" | "conversation_continue" | "continue" => {
                 return Some((
@@ -8113,6 +9549,10 @@ fn build_general_message_renderer_prompt(
             GeneralMessagePlanKind::CameraRecordClip => "camera_record_clip",
             GeneralMessagePlanKind::KnowledgeSearch => "knowledge_search",
             GeneralMessagePlanKind::RagAnswer => "rag_answer",
+            GeneralMessagePlanKind::HomeAssistantServiceAction => "ha_service_action",
+            GeneralMessagePlanKind::VisionEventSummary => "vision_event_summary",
+            GeneralMessagePlanKind::VisionEventNotifyLatest => "vision_event_notify_latest",
+            GeneralMessagePlanKind::SystemReadiness => "system_readiness",
         },
         message = request.intent.raw_text,
         pending_loop = serde_json::to_string(&pending_loop.map(|pending| {
@@ -8251,8 +9691,15 @@ fn general_message_requests_local_first_architecture_summary(raw_text: &str) -> 
 
 fn general_message_supported_examples() -> Vec<String> {
     vec![
-        "帮我抓拍一下当前摄像头画面".to_string(),
-        "帮我录一段门口摄像头".to_string(),
+        "拍一张门口".to_string(),
+        "录一段门口".to_string(),
+        "最近事件".to_string(),
+        "通知最新事件".to_string(),
+        "开灯".to_string(),
+        "关灯".to_string(),
+        "切换开关".to_string(),
+        "执行测试场景".to_string(),
+        "状态".to_string(),
         "帮我找到和樱花有关的文件".to_string(),
         "根据资料回答樱花计划是什么".to_string(),
     ]
@@ -8267,13 +9714,13 @@ fn general_message_support_summary_for_request(raw_text: &str) -> String {
 }
 
 fn general_message_support_summary() -> String {
-    "我可以帮你抓拍最新画面、录一段短视频，也能搜索已经保存的内容。你想先试哪个？".to_string()
+    "我可以作为 K3 家庭入口：摄像头抓拍/短视频、最近事件、通知最新事件、低风险家居动作、状态诊断，也能搜索/问答已有知识库。".to_string()
 }
 
 fn general_message_unsupported_summary() -> String {
     let examples = general_message_supported_examples();
     format!(
-        "我暂时还不能稳定理解这类请求，但我可以帮你抓拍摄像头、录制短视频、搜索知识库内容。你可以直接说：{}。",
+        "这类请求我现在不处理；我不接公网天气、新闻、股票等外部实时信息。你可以直接说：{}。",
         examples.join("；")
     )
 }
@@ -8333,10 +9780,10 @@ fn general_message_conversation_summary(
         GeneralMessageConversationAct::Boundary => {
             let normalized = normalize_command_text(request.intent.raw_text.as_str());
             if matches_any(&normalized, &["天气", "温度", "下雨"]) {
-                return "天气这类实时信息我现在不直接处理；你可以继续告诉我要看什么或找什么。"
+                return "天气这类公网实时信息我现在不处理；我可以帮你看摄像头、查最近事件、通知默认目标、执行低风险家居动作或看状态。"
                     .to_string();
             }
-            "这件事我现在不直接处理；你可以继续告诉我要看什么或找什么。".to_string()
+            "这件事我现在不直接处理；我可以帮你看摄像头、查最近事件、通知默认目标、执行低风险家居动作或看状态。".to_string()
         }
         GeneralMessageConversationAct::Repair => {
             "收到，我重新理解；你可以换个说法告诉我要处理什么。".to_string()
@@ -8347,7 +9794,9 @@ fn general_message_conversation_summary(
                 let prompt = pending.last_clarification_prompt.trim();
                 (!prompt.is_empty()).then(|| format!("收到。{prompt}"))
             })
-            .unwrap_or_else(|| "收到。你可以继续补一句具体要拍、录还是找内容。".to_string()),
+            .unwrap_or_else(|| {
+                "收到。你可以继续补一句具体要拍、录、查事件、通知、开关设备还是看状态。".to_string()
+            }),
     }
 }
 
@@ -8528,6 +9977,18 @@ fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePlan> {
         }
         "knowledge_search" | "search" => (GeneralMessagePlanKind::KnowledgeSearch, None),
         "rag_answer" | "rag.answer" | "answer" => (GeneralMessagePlanKind::RagAnswer, None),
+        "ha_service_action" | "home_assistant_service_action" | "home_assistant_action" => {
+            (GeneralMessagePlanKind::HomeAssistantServiceAction, None)
+        }
+        "vision_event_summary" | "event_summary" | "recent_event" => {
+            (GeneralMessagePlanKind::VisionEventSummary, None)
+        }
+        "vision_event_notify_latest" | "event_notify" | "notify_latest_event" => {
+            (GeneralMessagePlanKind::VisionEventNotifyLatest, None)
+        }
+        "system_readiness" | "status" | "diagnostics" => {
+            (GeneralMessagePlanKind::SystemReadiness, None)
+        }
         "conversation" | "conversation_continue" | "continue" => (
             GeneralMessagePlanKind::ConversationAct,
             Some(payload_conversation_act.unwrap_or(GeneralMessageConversationAct::Continue)),
@@ -8673,6 +10134,51 @@ fn fallback_general_message_plan(
             query: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a capability summary request".to_string()),
+        });
+    }
+
+    if looks_like_vision_event_notify_request(&normalized) {
+        return Some(GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::VisionEventNotifyLatest,
+            conversation_act: None,
+            reply_text: None,
+            camera_hint: None,
+            query: None,
+            recent_clip: None,
+            reason: Some("fallback rule inferred a latest event notification request".to_string()),
+        });
+    }
+    if looks_like_vision_event_summary_request(&normalized) {
+        return Some(GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::VisionEventSummary,
+            conversation_act: None,
+            reply_text: None,
+            camera_hint: None,
+            query: None,
+            recent_clip: None,
+            reason: Some("fallback rule inferred a recent event summary request".to_string()),
+        });
+    }
+    if looks_like_system_readiness_request(&normalized) {
+        return Some(GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::SystemReadiness,
+            conversation_act: None,
+            reply_text: None,
+            camera_hint: None,
+            query: None,
+            recent_clip: None,
+            reason: Some("fallback rule inferred a system readiness request".to_string()),
+        });
+    }
+    if infer_home_assistant_natural_action(raw_text).is_some() {
+        return Some(GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::HomeAssistantServiceAction,
+            conversation_act: None,
+            reply_text: None,
+            camera_hint: None,
+            query: None,
+            recent_clip: None,
+            reason: Some("fallback rule inferred a Home Assistant service action".to_string()),
         });
     }
 
@@ -9623,21 +11129,25 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        artifact_kind_from_name, build_artifact_records, build_knowledge_search_artifacts,
-        conversation_key, delivery_hints_from_task_response, effective_autonomy_level,
+        artifact_kind_from_name, build_artifact_records, build_general_message_readiness_summary,
+        build_knowledge_search_artifacts, build_redacted_vision_event_summary, conversation_key,
+        delivery_hints_from_task_response, effective_autonomy_level,
         effective_autonomy_level_for_task_run, effective_requires_approval,
         ensure_safe_capture_root, env_flag_enabled, fallback_general_message_plan,
         format_pending_candidates, general_message_requests_capability_summary,
-        infer_query_from_raw_text, knowledge_modalities, normalize_command_text,
-        notification_delivery_outcome, parse_general_message_plan, pending_candidates_from_results,
-        protocol_string, resolve_notification_recipient, room_aliases,
-        should_route_general_message_to_knowledge, GeneralMessageConversationAct,
-        GeneralMessagePlanKind, PendingTaskCandidate, TaskApiService, TaskArtifact, TaskIntent,
-        TaskMessage, TaskRequest, TaskRequestAcceptance, TaskResponse, TaskResultEnvelope,
-        TaskSource, TaskStatus, TaskTurnActor, TaskTurnBlock, TaskTurnContinuation,
-        TaskTurnConversation, TaskTurnEnvelope, TaskTurnInput, TaskTurnTransport,
-        ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV, KNOWLEDGE_DOMAIN, KNOWLEDGE_OP_SEARCH,
+        infer_home_assistant_natural_action, infer_query_from_raw_text, knowledge_modalities,
+        normalize_command_text, notification_delivery_outcome, parse_general_message_plan,
+        pending_candidates_from_results, protocol_string, resolve_home_assistant_action_entity,
+        resolve_notification_recipient, room_aliases, should_route_general_message_to_knowledge,
+        GeneralMessageConversationAct, GeneralMessagePlanKind, HomeAssistantEntityResolution,
+        HomeAssistantNaturalAction, HomeAssistantNaturalActionRequest, PendingTaskCandidate,
+        TaskApiService, TaskArtifact, TaskIntent, TaskMessage, TaskRequest, TaskRequestAcceptance,
+        TaskResponse, TaskResultEnvelope, TaskSource, TaskStatus, TaskTurnActor, TaskTurnBlock,
+        TaskTurnContinuation, TaskTurnConversation, TaskTurnEnvelope, TaskTurnInput,
+        TaskTurnTransport, ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV, KNOWLEDGE_DOMAIN,
+        KNOWLEDGE_OP_SEARCH,
     };
+    use crate::connectors::home_assistant::HomeAssistantEntity;
     use crate::connectors::notifications::{
         NotificationContent, NotificationDelivery, NotificationDeliveryError,
         NotificationDeliveryMode, NotificationDestination, NotificationDestinationKind,
@@ -9657,7 +11167,7 @@ mod tests {
     use crate::orchestrator::contracts::RiskLevel;
     use crate::runtime::admin_console::{
         AdminConsoleState, AdminConsoleStore, IdentityBindingRecord, KnowledgeSettings,
-        KnowledgeSourceRoot, RemoteViewConfig,
+        KnowledgeSourceRoot, NotificationTargetRecord, RemoteViewConfig,
     };
     use crate::runtime::hub::HubScanResultItem;
     use crate::runtime::knowledge::{
@@ -9672,6 +11182,10 @@ mod tests {
     use crate::runtime::task_session::{
         PendingTaskClipConfirmation, PendingTaskConnect, RecentClipPlaybackState,
         TaskConversationState, TaskConversationStore,
+    };
+    use crate::runtime::vision_event::{
+        LocalVisionEvent, LocalVisionEventArtifact, LocalVisionEventVlmSummary, SnapshotArtifact,
+        StoredLocalVisionEvent,
     };
 
     static RETRIEVAL_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -14144,6 +15658,30 @@ mod tests {
                 .kind,
             GeneralMessagePlanKind::CameraRecordClip
         );
+        assert_eq!(
+            fallback_general_message_plan("最近事件", None)
+                .expect("event summary plan")
+                .kind,
+            GeneralMessagePlanKind::VisionEventSummary
+        );
+        assert_eq!(
+            fallback_general_message_plan("通知最新事件", None)
+                .expect("event notify plan")
+                .kind,
+            GeneralMessagePlanKind::VisionEventNotifyLatest
+        );
+        assert_eq!(
+            fallback_general_message_plan("状态", None)
+                .expect("system readiness plan")
+                .kind,
+            GeneralMessagePlanKind::SystemReadiness
+        );
+        assert_eq!(
+            fallback_general_message_plan("开灯", None)
+                .expect("HA action plan")
+                .kind,
+            GeneralMessagePlanKind::HomeAssistantServiceAction
+        );
         let video_search_plan = fallback_general_message_plan("帮我找录像里出现快递箱的片段", None)
             .expect("video search plan");
         assert_eq!(
@@ -14167,6 +15705,191 @@ mod tests {
             .expect("rag answer plan");
         assert_eq!(rag_plan.kind, GeneralMessagePlanKind::RagAnswer);
         assert_eq!(rag_plan.query.as_deref(), Some("樱花计划"));
+    }
+
+    #[test]
+    fn general_message_home_assistant_short_phrases_are_closed_and_low_risk() {
+        let light = infer_home_assistant_natural_action("开灯").expect("light action");
+        assert_eq!(
+            light,
+            HomeAssistantNaturalAction::Request(HomeAssistantNaturalActionRequest {
+                domain: "light".to_string(),
+                service: "turn_on".to_string(),
+                entity_hint: None,
+            })
+        );
+        let switch = infer_home_assistant_natural_action("切换开关").expect("switch action");
+        assert_eq!(
+            switch,
+            HomeAssistantNaturalAction::Request(HomeAssistantNaturalActionRequest {
+                domain: "switch".to_string(),
+                service: "toggle".to_string(),
+                entity_hint: None,
+            })
+        );
+        let scene = infer_home_assistant_natural_action("执行测试场景").expect("scene action");
+        assert_eq!(
+            scene,
+            HomeAssistantNaturalAction::Request(HomeAssistantNaturalActionRequest {
+                domain: "scene".to_string(),
+                service: "turn_on".to_string(),
+                entity_hint: Some("测试".to_string()),
+            })
+        );
+        assert!(matches!(
+            infer_home_assistant_natural_action("解锁门锁"),
+            Some(HomeAssistantNaturalAction::Blocked { .. })
+        ));
+        assert!(infer_home_assistant_natural_action("深圳天气怎么样").is_none());
+    }
+
+    #[test]
+    fn home_assistant_entity_resolution_directs_unique_and_clarifies_many() {
+        let kitchen = HomeAssistantEntity {
+            entity_id: "light.kitchen".to_string(),
+            domain: "light".to_string(),
+            state: "off".to_string(),
+            display_name: "厨房灯".to_string(),
+            area_id: None,
+            device_class: None,
+            last_changed: None,
+            last_updated: None,
+            attributes: json!({"token": "must-not-leak"}),
+        };
+        let porch = HomeAssistantEntity {
+            entity_id: "light.porch".to_string(),
+            domain: "light".to_string(),
+            state: "on".to_string(),
+            display_name: "门口灯".to_string(),
+            area_id: None,
+            device_class: None,
+            last_changed: None,
+            last_updated: None,
+            attributes: json!({}),
+        };
+        let action = HomeAssistantNaturalActionRequest {
+            domain: "light".to_string(),
+            service: "turn_on".to_string(),
+            entity_hint: Some("门口".to_string()),
+        };
+        assert_eq!(
+            resolve_home_assistant_action_entity(&action, &[kitchen.clone(), porch.clone()]),
+            HomeAssistantEntityResolution::Resolved(porch.clone())
+        );
+        let ambiguous_action = HomeAssistantNaturalActionRequest {
+            entity_hint: None,
+            ..action
+        };
+        assert!(matches!(
+            resolve_home_assistant_action_entity(
+                &ambiguous_action,
+                &[kitchen.clone(), porch.clone()]
+            ),
+            HomeAssistantEntityResolution::Clarify(candidates) if candidates.len() == 2
+        ));
+        assert_eq!(
+            resolve_home_assistant_action_entity(&ambiguous_action, &[kitchen.clone()]),
+            HomeAssistantEntityResolution::Resolved(kitchen)
+        );
+    }
+
+    #[test]
+    fn vision_event_summary_redacts_artifact_paths() {
+        let stored = StoredLocalVisionEvent {
+            received_at: "2026-06-02T01:02:03Z".to_string(),
+            event: LocalVisionEvent {
+                event_id: "event-1".to_string(),
+                camera_id: "front-door".to_string(),
+                event_type: "motion".to_string(),
+                confidence: 0.91,
+                labels: vec!["person".to_string()],
+                summary: "门口有人经过".to_string(),
+                snapshot_artifact: SnapshotArtifact {
+                    artifact_id: Some("artifact-1".to_string()),
+                    path: Some(
+                        "/mnt/software/harborbeacon-agent-ci/secret/snapshot.jpg".to_string(),
+                    ),
+                    mime_type: Some("image/jpeg".to_string()),
+                    byte_size: Some(1234),
+                    sha256: Some("abcdef".to_string()),
+                    source: Some("local_snapshot".to_string()),
+                },
+                started_at: "2026-06-02T01:02:02Z".to_string(),
+                analyzer: "local-vlm".to_string(),
+                latency_ms: 42,
+                metrics: json!({}),
+                vlm: Some(LocalVisionEventVlmSummary {
+                    status: "completed".to_string(),
+                    summary: "门口有人".to_string(),
+                    tags: vec!["person".to_string()],
+                    labels: vec!["person".to_string()],
+                    derived_text: String::new(),
+                    artifacts: vec![LocalVisionEventArtifact {
+                        artifact_id: Some("vlm-artifact".to_string()),
+                        role: "annotated_snapshot".to_string(),
+                        mime_type: Some("image/jpeg".to_string()),
+                        byte_size: Some(222),
+                        sha256: Some("123456".to_string()),
+                        source: Some("vlm".to_string()),
+                    }],
+                    ingest_metadata: json!({}),
+                    vlm_metrics: json!({}),
+                    error: Some("rtsp://admin:secret@camera.local/stream".to_string()),
+                }),
+            },
+            audit_record: json!({}),
+            ha_mqtt_payload: json!({}),
+        };
+
+        let summary = build_redacted_vision_event_summary(&stored);
+        let text = serde_json::to_string(&summary).expect("serialize summary");
+
+        assert_eq!(summary["snapshot_artifact"]["path_redacted"], json!(true));
+        assert_eq!(summary["snapshot_artifact"]["sha256_present"], json!(true));
+        assert!(!text.contains("/mnt/software"));
+        assert!(!text.contains("rtsp://"));
+        assert!(!text.contains("admin:secret"));
+        assert!(text.contains("redacted"));
+    }
+
+    #[test]
+    fn system_readiness_summary_redacts_gate_and_ha_secrets() {
+        let mut state = AdminConsoleState::default();
+        state.home_assistant.enabled = true;
+        state.home_assistant.base_url = "http://homeassistant.local:8123".to_string();
+        state.home_assistant.access_token = "ha-secret-token".to_string();
+        state.home_assistant.last_status = "synced".to_string();
+        state.home_assistant.entity_count = 7;
+        state.notification_targets = vec![NotificationTargetRecord {
+            target_id: "target-1".to_string(),
+            label: "Weixin".to_string(),
+            route_key: "gw_route_secret".to_string(),
+            platform_hint: "weixin".to_string(),
+            is_default: true,
+        }];
+        let gateway_status = json!({
+            "channels": [{
+                "platform": "weixin",
+                "configured": true,
+                "connected": true,
+                "context_token": "secret-context-token"
+            }],
+            "context_tokens": { "count": 1 },
+        });
+
+        let readiness =
+            build_general_message_readiness_summary(&state, Some(&gateway_status), 2, None);
+        let text = serde_json::to_string(&readiness).expect("serialize readiness");
+
+        assert_eq!(readiness["gateway"]["weixin"]["status"], json!("connected"));
+        assert_eq!(
+            readiness["default_notification_target"]["route_key_redacted"],
+            json!(true)
+        );
+        assert_eq!(readiness["home_assistant"]["token_redacted"], json!(true));
+        assert!(!text.contains("gw_route_secret"));
+        assert!(!text.contains("ha-secret-token"));
+        assert!(!text.contains("secret-context-token"));
     }
 
     #[test]
@@ -14200,6 +15923,20 @@ mod tests {
         .expect("rag answer plan");
         assert_eq!(rag_plan.kind, GeneralMessagePlanKind::RagAnswer);
         assert_eq!(rag_plan.query.as_deref(), Some("樱花计划"));
+
+        let ha_plan = parse_general_message_plan(r#"{"decision":"ha_service_action"}"#)
+            .expect("HA action plan");
+        assert_eq!(
+            ha_plan.kind,
+            GeneralMessagePlanKind::HomeAssistantServiceAction
+        );
+        let notify_plan =
+            parse_general_message_plan(r#"{"decision":"vision_event_notify_latest"}"#)
+                .expect("event notify plan");
+        assert_eq!(
+            notify_plan.kind,
+            GeneralMessagePlanKind::VisionEventNotifyLatest
+        );
     }
 
     #[test]
@@ -14273,15 +16010,25 @@ mod tests {
             response.result.data["reply_pack"]["examples"]
                 .as_array()
                 .map(Vec::len),
-            Some(4)
+            Some(11)
         );
+        assert!(response.result.data["reply_pack"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .any(|capability| capability.as_str() == Some("ha_service_action")));
+        assert!(response.result.data["reply_pack"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .any(|capability| capability.as_str() == Some("vision_event_notify_latest")));
         assert!(response.result.data["reply_pack"]["examples"]
             .as_array()
             .expect("examples")
             .iter()
-            .any(|example| example.as_str() == Some("根据资料回答樱花计划是什么")));
-        assert!(response.result.message.contains("抓拍最新画面"));
-        assert!(response.result.message.contains("已经保存的内容"));
+            .any(|example| example.as_str() == Some("通知最新事件")));
+        assert!(response.result.message.contains("K3 家庭入口"));
+        assert!(response.result.message.contains("低风险家居动作"));
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
@@ -14426,6 +16173,8 @@ mod tests {
             "conversation_boundary"
         );
         assert!(response.result.message.contains("天气"));
+        assert!(response.result.message.contains("公网实时信息"));
+        assert!(response.result.message.contains("低风险家居动作"));
         assert!(!response.result.message.contains("我暂时还不能稳定理解"));
 
         cleanup_task_api_service(admin_path, registry_path, conversation_path);
@@ -14977,7 +16726,7 @@ mod tests {
         assert_eq!(response.executor_used, "agentic_interpreter");
         assert_eq!(
             response.result.message,
-            "我可以帮你抓拍最新画面、录一段短视频，也能搜索已经保存的内容。你想先试哪个？"
+            "我可以作为 K3 家庭入口：摄像头抓拍/短视频、最近事件、通知最新事件、低风险家居动作、状态诊断，也能搜索/问答已有知识库。"
         );
         assert_eq!(
             response.result.data["reply_pack"]["summary"],
