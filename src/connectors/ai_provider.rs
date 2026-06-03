@@ -371,11 +371,13 @@ impl OpenAiCompatibleEmbeddingClient {
 
 fn openai_compatible_headers(api_key: &str) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {api_key}"))
-            .map_err(|e| format!("invalid OpenAI-compatible auth header: {e}"))?,
-    );
+    if !api_key.trim().is_empty() {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .map_err(|e| format!("invalid OpenAI-compatible auth header: {e}"))?,
+        );
+    }
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok(headers)
 }

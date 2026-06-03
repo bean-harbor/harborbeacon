@@ -595,6 +595,24 @@ impl TaskConversationStore {
         Ok(file.task_steps.get(step_id).cloned())
     }
 
+    pub fn recent_task_steps(&self, limit: usize) -> Result<Vec<TaskStepRun>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let file = self.load_file()?;
+        let mut steps = file.task_steps.values().cloned().collect::<Vec<_>>();
+        steps.sort_by(|left, right| {
+            left.ended_at
+                .cmp(&right.ended_at)
+                .then(left.started_at.cmp(&right.started_at))
+                .then(left.step_id.cmp(&right.step_id))
+        });
+        if steps.len() > limit {
+            steps = steps.split_off(steps.len() - limit);
+        }
+        Ok(steps)
+    }
+
     pub fn save_task_step(&self, task_step: &TaskStepRun) -> Result<(), String> {
         if task_step.step_id.trim().is_empty() {
             return Err("step_id 不能为空".to_string());
