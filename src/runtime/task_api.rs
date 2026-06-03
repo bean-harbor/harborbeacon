@@ -74,8 +74,9 @@ use crate::runtime::registry::ResolvedCameraTarget;
 use crate::runtime::remote_view;
 use crate::runtime::task_session::{
     session_state_value_from_conversation, PendingTaskCandidate, PendingTaskClipConfirmation,
-    PendingTaskConnect, PendingTaskGeneralMessageLoop, RecentClipPlaybackState,
-    TaskConversationState, TaskConversationStore,
+    PendingTaskConnect, PendingTaskGeneralMessageLoop, PendingTaskHomeAssistantCandidate,
+    PendingTaskHomeAssistantClarification, RecentClipPlaybackState, TaskConversationState,
+    TaskConversationStore,
 };
 use crate::runtime::vision_event::{
     build_local_vision_notification_intent, list_recent_local_vision_events_default,
@@ -1692,6 +1693,10 @@ impl TaskApiService {
             );
         }
 
+        if let Some(response) = self.handle_home_assistant_clarification_frame(request, &pending) {
+            return response;
+        }
+
         let (plan, trace) = match self.general_message_plan(request, Some(&pending)) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1710,6 +1715,376 @@ impl TaskApiService {
         };
         let mut response = self.execute_general_message_plan(request, plan, Some(&pending));
         attach_general_message_controller_trace(&mut response, &trace, turn_started.elapsed());
+        response
+    }
+
+    fn handle_home_assistant_clarification_frame(
+        &self,
+        request: &TaskRequest,
+        pending: &PendingTaskGeneralMessageLoop,
+    ) -> Option<TaskResponse> {
+        let pending_ha = pending.home_assistant.as_ref()?;
+        if active_frame_cancel_requested(request.intent.raw_text.as_str()) {
+            return Some(self.cancel_home_assistant_clarification(request, pending, pending_ha));
+        }
+
+        if infer_home_assistant_natural_action(request.intent.raw_text.as_str()).is_some() {
+            if let Err(response) =
+                self.clear_general_message_loop_if_matches(request, Some(pending))
+            {
+                return Some(response);
+            }
+            return Some(self.handle_general_message_home_assistant_action(request));
+        }
+
+        let selected = match resolve_pending_home_assistant_candidate_selection(
+            pending_ha,
+            request.intent.raw_text.as_str(),
+        ) {
+            PendingHomeAssistantCandidateSelection::Selected(candidate) => candidate,
+            PendingHomeAssistantCandidateSelection::Ambiguous(candidates) => {
+                return Some(
+                    self.general_message_home_assistant_pending_selection_response(
+                        request,
+                        pending,
+                        pending_ha,
+                        candidates.as_slice(),
+                        "ambiguous_candidate_reply",
+                        "我还不能唯一确定是哪一个，请回复序号、完整名称，或“取消”。",
+                    ),
+                );
+            }
+            PendingHomeAssistantCandidateSelection::Missing => {
+                return Some(
+                    self.general_message_home_assistant_pending_selection_response(
+                        request,
+                        pending,
+                        pending_ha,
+                        pending_ha.candidates.as_slice(),
+                        "missing_candidate_reply",
+                        "我没有在候选里匹配到这个回复，请回复：第一个 / 名称 / 取消。",
+                    ),
+                );
+            }
+        };
+
+        Some(self.execute_home_assistant_clarified_action(request, pending, pending_ha, &selected))
+    }
+
+    fn cancel_home_assistant_clarification(
+        &self,
+        request: &TaskRequest,
+        pending: &PendingTaskGeneralMessageLoop,
+        pending_ha: &PendingTaskHomeAssistantClarification,
+    ) -> TaskResponse {
+        if let Err(response) = self.clear_general_message_loop_if_matches(request, Some(pending)) {
+            return response;
+        }
+        let message = "好的，这次 Home Assistant 动作先不执行。".to_string();
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "home_assistant.service_action_clarification_cancelled",
+            EventSeverity::Info,
+            json!({
+                "status": "cancelled",
+                "metadata_only": true,
+                "secret_scan": "clean",
+                "domain": pending_ha.domain,
+                "service": pending_ha.service,
+                "candidate_count": pending_ha.candidates.len(),
+                "executed": false,
+            }),
+        ));
+        self.completed_with_context(
+            request,
+            "agentic_interpreter",
+            RiskLevel::Low,
+            message.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "ha_action_cancel",
+                    "status": "cancelled",
+                    "summary": message,
+                    "domain": pending_ha.domain,
+                    "service": pending_ha.service,
+                    "executed": false,
+                    "redacted": true,
+                }
+            }),
+            Vec::new(),
+            vec![event],
+            vec!["状态".to_string(), "最近事件".to_string()],
+        )
+    }
+
+    fn general_message_home_assistant_pending_selection_response(
+        &self,
+        request: &TaskRequest,
+        pending: &PendingTaskGeneralMessageLoop,
+        pending_ha: &PendingTaskHomeAssistantClarification,
+        candidates: &[PendingTaskHomeAssistantCandidate],
+        reason: &str,
+        message: &str,
+    ) -> TaskResponse {
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "home_assistant.service_action_clarification_required",
+            EventSeverity::Warning,
+            json!({
+                "status": "needs_input",
+                "reason": reason,
+                "metadata_only": true,
+                "secret_scan": "clean",
+                "domain": pending_ha.domain,
+                "service": pending_ha.service,
+                "candidate_count": candidates.len(),
+                "executed": false,
+            }),
+        ));
+        self.needs_input_with_context(
+            request,
+            "agentic_interpreter",
+            RiskLevel::Low,
+            message.to_string(),
+            vec!["home_assistant_entity".to_string()],
+            pending.resume_token.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "ha_action_clarify",
+                    "status": "needs_input",
+                    "summary": message,
+                    "domain": pending_ha.domain,
+                    "service": pending_ha.service,
+                    "candidates": candidates.iter().map(redacted_pending_home_assistant_candidate_summary).collect::<Vec<_>>(),
+                    "redacted": true,
+                },
+                "home_assistant_clarification": {
+                    "kind": "home_assistant.service_action_clarification",
+                    "reason": reason,
+                    "candidate_count": candidates.len(),
+                    "redacted": true,
+                }
+            }),
+            vec![event],
+            home_assistant_pending_clarification_actions(candidates),
+        )
+    }
+
+    fn execute_home_assistant_clarified_action(
+        &self,
+        request: &TaskRequest,
+        pending: &PendingTaskGeneralMessageLoop,
+        pending_ha: &PendingTaskHomeAssistantClarification,
+        selected: &PendingTaskHomeAssistantCandidate,
+    ) -> TaskResponse {
+        let action = HomeAssistantNaturalActionRequest {
+            domain: pending_ha.domain.clone(),
+            service: pending_ha.service.clone(),
+            entity_hint: pending_ha.entity_hint.clone(),
+        };
+        let state = match self.admin_store.home_assistant_secret_state() {
+            Ok(state) => state,
+            Err(error) => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, Some(pending))
+                {
+                    return response;
+                }
+                return self.general_message_home_assistant_action_response(
+                    request,
+                    "failed",
+                    false,
+                    false,
+                    &format!(
+                        "读取 Home Assistant 配置失败：{}",
+                        redact_task_api_text(&error)
+                    ),
+                    None,
+                    HomeAssistantServiceActionRequest {
+                        domain: pending_ha.domain.clone(),
+                        service: pending_ha.service.clone(),
+                        fields: json!({}),
+                        ..Default::default()
+                    },
+                    "home_assistant.service_action_failed",
+                    EventSeverity::Error,
+                    None,
+                );
+            }
+        };
+        let client = match home_assistant_client_from_admin_state(&state) {
+            Ok(client) => client,
+            Err(error) => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, Some(pending))
+                {
+                    return response;
+                }
+                return self.general_message_home_assistant_action_response(
+                    request,
+                    "blocked",
+                    false,
+                    false,
+                    &redact_task_api_text(&error),
+                    None,
+                    HomeAssistantServiceActionRequest {
+                        domain: pending_ha.domain.clone(),
+                        service: pending_ha.service.clone(),
+                        fields: json!({}),
+                        ..Default::default()
+                    },
+                    "home_assistant.service_action_blocked",
+                    EventSeverity::Warning,
+                    None,
+                );
+            }
+        };
+        let entities = match client.fetch_entities() {
+            Ok(entities) => entities,
+            Err(error) => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, Some(pending))
+                {
+                    return response;
+                }
+                return self.general_message_home_assistant_action_response(
+                    request,
+                    "failed",
+                    false,
+                    false,
+                    &format!(
+                        "读取 Home Assistant 实体失败：{}",
+                        redact_task_api_text(&error)
+                    ),
+                    None,
+                    HomeAssistantServiceActionRequest {
+                        domain: pending_ha.domain.clone(),
+                        service: pending_ha.service.clone(),
+                        fields: json!({}),
+                        ..Default::default()
+                    },
+                    "home_assistant.service_action_failed",
+                    EventSeverity::Error,
+                    None,
+                );
+            }
+        };
+        let Some(entity) = entities
+            .iter()
+            .find(|entity| entity.entity_id.eq_ignore_ascii_case(&selected.entity_id))
+            .cloned()
+        else {
+            let refreshed_candidates = entities
+                .iter()
+                .filter(|entity| entity.domain.eq_ignore_ascii_case(&pending_ha.domain))
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>();
+            if refreshed_candidates.is_empty() {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, Some(pending))
+                {
+                    return response;
+                }
+                return self.general_message_home_assistant_action_response(
+                    request,
+                    "blocked",
+                    false,
+                    false,
+                    "候选实体已经不可用，本次没有执行。",
+                    None,
+                    HomeAssistantServiceActionRequest {
+                        domain: pending_ha.domain.clone(),
+                        service: pending_ha.service.clone(),
+                        fields: json!({}),
+                        ..Default::default()
+                    },
+                    "home_assistant.service_action_blocked",
+                    EventSeverity::Warning,
+                    None,
+                );
+            }
+            return self.general_message_home_assistant_clarification_response(
+                request,
+                &action,
+                refreshed_candidates.as_slice(),
+                "candidate_stale",
+                Some(pending),
+            );
+        };
+
+        let action_request =
+            normalize_home_assistant_service_action_request(&HomeAssistantServiceActionRequest {
+                entity_id: entity.entity_id.clone(),
+                domain: pending_ha.domain.clone(),
+                service: pending_ha.service.clone(),
+                fields: json!({}),
+            });
+        if let Err(message) = validate_home_assistant_service_action_request(
+            &action_request,
+            state.enabled,
+            &state.exposed_domains,
+        ) {
+            if let Err(response) =
+                self.clear_general_message_loop_if_matches(request, Some(pending))
+            {
+                return response;
+            }
+            return self.general_message_home_assistant_action_response(
+                request,
+                "blocked",
+                false,
+                false,
+                &message,
+                None,
+                action_request,
+                "home_assistant.service_action_blocked",
+                EventSeverity::Warning,
+                Some(&entity),
+            );
+        }
+        if let Err(response) = self.clear_general_message_loop_if_matches(request, Some(pending)) {
+            return response;
+        }
+        let response = match client.call_service(
+            &action_request.domain,
+            &action_request.service,
+            &action_request.entity_id,
+            Some(&action_request.fields),
+        ) {
+            Ok(result) => self.general_message_home_assistant_action_response(
+                request,
+                "succeeded",
+                true,
+                true,
+                &format!(
+                    "已执行：{} {}.{}。",
+                    entity.display_name, action_request.domain, action_request.service
+                ),
+                Some(json!(result)),
+                action_request,
+                "home_assistant.service_action_executed",
+                EventSeverity::Info,
+                Some(&entity),
+            ),
+            Err(error) => self.general_message_home_assistant_action_response(
+                request,
+                "failed",
+                true,
+                false,
+                &format!(
+                    "Home Assistant 动作执行失败：{}",
+                    redact_task_api_text(&error)
+                ),
+                None,
+                action_request,
+                "home_assistant.service_action_failed",
+                EventSeverity::Error,
+                Some(&entity),
+            ),
+        };
         response
     }
 
@@ -2229,43 +2604,12 @@ impl TaskApiService {
         let entity = match resolve_home_assistant_action_entity(&action, &entities) {
             HomeAssistantEntityResolution::Resolved(entity) => entity,
             HomeAssistantEntityResolution::Clarify(candidates) => {
-                let message = format!(
-                    "{} 有多个可操作实体，请说得更具体一点。",
-                    home_assistant_domain_label(&action.domain)
-                );
-                let event = self.serialize_event_record(&build_task_event_record(
+                return self.general_message_home_assistant_clarification_response(
                     request,
-                    &step_id_for_request(request),
-                    "home_assistant.service_action_clarification_required",
-                    EventSeverity::Warning,
-                    json!({
-                        "status": "blocked",
-                        "reason": "ambiguous_entity",
-                        "metadata_only": true,
-                        "domain": action.domain,
-                        "service": action.service,
-                        "candidate_count": candidates.len(),
-                        "executed": false,
-                    }),
-                ));
-                return self.completed_with_context(
-                    request,
-                    "home_assistant_connector",
-                    RiskLevel::Low,
-                    message.clone(),
-                    json!({
-                        "reply_pack": {
-                            "kind": "ha_action_clarify",
-                            "status": "blocked",
-                            "summary": message,
-                            "domain": action.domain,
-                            "service": action.service,
-                            "candidates": candidates.iter().take(5).map(redacted_home_assistant_entity_summary).collect::<Vec<_>>(),
-                        }
-                    }),
-                    Vec::new(),
-                    vec![event],
-                    home_assistant_entity_clarification_actions(&candidates, &action),
+                    &action,
+                    &candidates,
+                    "ambiguous_entity",
+                    None,
                 );
             }
             HomeAssistantEntityResolution::Missing(message) => {
@@ -2350,6 +2694,94 @@ impl TaskApiService {
                 Some(&entity),
             ),
         }
+    }
+
+    fn general_message_home_assistant_clarification_response(
+        &self,
+        request: &TaskRequest,
+        action: &HomeAssistantNaturalActionRequest,
+        candidates: &[HomeAssistantEntity],
+        reason: &str,
+        prior_pending: Option<&PendingTaskGeneralMessageLoop>,
+    ) -> TaskResponse {
+        let pending_candidates = pending_home_assistant_candidates_from_entities(candidates);
+        let message = home_assistant_clarification_prompt(action, pending_candidates.as_slice());
+        let resume_token = prior_pending
+            .map(|pending| pending.resume_token.clone())
+            .filter(|token| !token.trim().is_empty())
+            .unwrap_or_else(ensure_resume_token);
+        let pending_ha = PendingTaskHomeAssistantClarification {
+            domain: action.domain.clone(),
+            service: action.service.clone(),
+            entity_hint: action.entity_hint.clone(),
+            candidates: pending_candidates,
+        };
+        let mut conversation = self.load_or_create_conversation(request);
+        conversation.set_general_message_loop(Some(PendingTaskGeneralMessageLoop {
+            resume_token: resume_token.clone(),
+            original_goal: prior_pending
+                .map(|pending| pending.original_goal.clone())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| request.intent.raw_text.trim().to_string()),
+            latest_user_intent_text: request.intent.raw_text.trim().to_string(),
+            last_clarification_prompt: message.clone(),
+            selected_candidate_action: None,
+            camera_hint: prior_pending.and_then(|pending| pending.camera_hint.clone()),
+            query: prior_pending.and_then(|pending| pending.query.clone()),
+            home_assistant: Some(pending_ha.clone()),
+        }));
+        if let Err(error) = self.save_conversation(request, &conversation) {
+            return self.failed(
+                request,
+                "agentic_interpreter",
+                RiskLevel::Low,
+                format!("无法保存 Home Assistant 澄清状态: {error}"),
+            );
+        }
+
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "home_assistant.service_action_clarification_required",
+            EventSeverity::Warning,
+            json!({
+                "status": "needs_input",
+                "reason": reason,
+                "metadata_only": true,
+                "secret_scan": "clean",
+                "domain": action.domain,
+                "service": action.service,
+                "candidate_count": pending_ha.candidates.len(),
+                "executed": false,
+            }),
+        ));
+        self.needs_input_with_context(
+            request,
+            "agentic_interpreter",
+            RiskLevel::Low,
+            message.clone(),
+            vec!["home_assistant_entity".to_string()],
+            resume_token,
+            json!({
+                "reply_pack": {
+                    "kind": "ha_action_clarify",
+                    "status": "needs_input",
+                    "summary": message,
+                    "domain": action.domain,
+                    "service": action.service,
+                    "candidates": pending_ha.candidates.iter().map(redacted_pending_home_assistant_candidate_summary).collect::<Vec<_>>(),
+                    "redacted": true,
+                },
+                "home_assistant_clarification": {
+                    "kind": "home_assistant.service_action_clarification",
+                    "reason": reason,
+                    "candidate_count": pending_ha.candidates.len(),
+                    "redacted": true,
+                }
+            }),
+            vec![event],
+            home_assistant_pending_clarification_actions(&pending_ha.candidates),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2661,6 +3093,7 @@ impl TaskApiService {
                 .and_then(|pending| pending.selected_candidate_action.clone()),
             camera_hint: plan.camera_hint.clone(),
             query: plan.query.clone(),
+            home_assistant: None,
         }));
         if let Err(error) = self.save_conversation(request, &conversation) {
             return self.failed(
@@ -8020,6 +8453,13 @@ enum HomeAssistantEntityResolution {
     Missing(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingHomeAssistantCandidateSelection {
+    Selected(PendingTaskHomeAssistantCandidate),
+    Ambiguous(Vec<PendingTaskHomeAssistantCandidate>),
+    Missing,
+}
+
 fn normalize_command_text(text: &str) -> String {
     text.to_lowercase()
         .chars()
@@ -8159,16 +8599,10 @@ fn resolve_home_assistant_action_entity(
         .entity_hint
         .as_deref()
         .map(|hint| {
-            let normalized_hint = normalize_command_text(hint);
+            let hint_terms = normalized_home_assistant_hint_terms(hint);
             domain_entities
                 .iter()
-                .filter(|entity| {
-                    let entity_text = normalize_command_text(&format!(
-                        "{}{}",
-                        entity.entity_id, entity.display_name
-                    ));
-                    entity_text.contains(&normalized_hint)
-                })
+                .filter(|entity| home_assistant_entity_matches_terms(entity, &hint_terms))
                 .cloned()
                 .collect::<Vec<_>>()
         })
@@ -8196,33 +8630,211 @@ fn redacted_home_assistant_entity_summary(entity: &HomeAssistantEntity) -> Value
         "domain": entity.domain,
         "display_name": entity.display_name,
         "state": entity.state,
+        "area_id": entity.area_id,
+        "device_class": entity.device_class,
         "redacted": true,
     })
 }
 
-fn home_assistant_entity_clarification_actions(
+fn pending_home_assistant_candidates_from_entities(
     candidates: &[HomeAssistantEntity],
-    action: &HomeAssistantNaturalActionRequest,
-) -> Vec<String> {
+) -> Vec<PendingTaskHomeAssistantCandidate> {
     candidates
         .iter()
-        .take(3)
-        .map(|entity| {
-            format!(
-                "{}{}",
-                home_assistant_service_verb(&action.service),
-                entity.display_name
-            )
+        .take(5)
+        .map(|entity| PendingTaskHomeAssistantCandidate {
+            entity_id: entity.entity_id.clone(),
+            domain: entity.domain.clone(),
+            display_name: entity.display_name.clone(),
+            state: entity.state.clone(),
+            area_id: entity.area_id.clone(),
+            device_class: entity.device_class.clone(),
         })
         .collect()
 }
 
-fn home_assistant_service_verb(service: &str) -> &'static str {
-    match service {
-        "turn_off" => "关闭",
-        "toggle" => "切换",
-        _ => "打开",
+fn redacted_pending_home_assistant_candidate_summary(
+    candidate: &PendingTaskHomeAssistantCandidate,
+) -> Value {
+    json!({
+        "entity_id": candidate.entity_id,
+        "domain": candidate.domain,
+        "display_name": candidate.display_name,
+        "state": candidate.state,
+        "area_id": candidate.area_id,
+        "device_class": candidate.device_class,
+        "redacted": true,
+    })
+}
+
+fn home_assistant_pending_clarification_actions(
+    candidates: &[PendingTaskHomeAssistantCandidate],
+) -> Vec<String> {
+    let mut actions = vec!["第一个".to_string(), "取消".to_string()];
+    actions.extend(
+        candidates
+            .iter()
+            .take(3)
+            .map(|candidate| candidate.display_name.clone())
+            .filter(|name| !name.trim().is_empty()),
+    );
+    actions
+}
+
+fn home_assistant_clarification_prompt(
+    action: &HomeAssistantNaturalActionRequest,
+    candidates: &[PendingTaskHomeAssistantCandidate],
+) -> String {
+    let candidate_lines = candidates
+        .iter()
+        .enumerate()
+        .map(|entity| {
+            format!(
+                "{}. {} ({})",
+                entity.0 + 1,
+                entity.1.display_name,
+                entity.1.entity_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+    if candidate_lines.is_empty() {
+        return format!(
+            "{} 有多个可操作实体，请回复更具体的名称，或“取消”。",
+            home_assistant_domain_label(&action.domain)
+        );
     }
+    format!(
+        "{} 有多个可操作实体，请回复：第一个 / 名称 / 取消。{}",
+        home_assistant_domain_label(&action.domain),
+        candidate_lines
+    )
+}
+
+fn resolve_pending_home_assistant_candidate_selection(
+    pending: &PendingTaskHomeAssistantClarification,
+    raw_text: &str,
+) -> PendingHomeAssistantCandidateSelection {
+    let normalized = normalize_command_text(raw_text);
+    if normalized.is_empty() {
+        return PendingHomeAssistantCandidateSelection::Missing;
+    }
+    if let Some(index) = parse_home_assistant_candidate_ordinal(&normalized) {
+        return pending
+            .candidates
+            .get(index.saturating_sub(1))
+            .cloned()
+            .map(PendingHomeAssistantCandidateSelection::Selected)
+            .unwrap_or(PendingHomeAssistantCandidateSelection::Missing);
+    }
+
+    let matches = pending
+        .candidates
+        .iter()
+        .filter(|candidate| pending_home_assistant_candidate_matches(candidate, &normalized))
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => PendingHomeAssistantCandidateSelection::Missing,
+        1 => PendingHomeAssistantCandidateSelection::Selected(matches[0].clone()),
+        _ => PendingHomeAssistantCandidateSelection::Ambiguous(matches),
+    }
+}
+
+fn parse_home_assistant_candidate_ordinal(normalized: &str) -> Option<usize> {
+    match normalized {
+        "1" | "一" | "第一个" | "第一" | "第1个" | "第1" | "1号" => Some(1),
+        "2" | "二" | "第二个" | "第二" | "第2个" | "第2" | "2号" => Some(2),
+        "3" | "三" | "第三个" | "第三" | "第3个" | "第3" | "3号" => Some(3),
+        "4" | "四" | "第四个" | "第四" | "第4个" | "第4" | "4号" => Some(4),
+        "5" | "五" | "第五个" | "第五" | "第5个" | "第5" | "5号" => Some(5),
+        _ => None,
+    }
+}
+
+fn pending_home_assistant_candidate_matches(
+    candidate: &PendingTaskHomeAssistantCandidate,
+    normalized_reply: &str,
+) -> bool {
+    let reply_terms = normalized_home_assistant_hint_terms(normalized_reply);
+    let candidate_text = normalize_command_text(&format!(
+        "{}{}{}{}",
+        candidate.entity_id,
+        candidate.display_name,
+        candidate.area_id.as_deref().unwrap_or_default(),
+        candidate.device_class.as_deref().unwrap_or_default()
+    ));
+    reply_terms
+        .iter()
+        .any(|term| candidate_text == *term || candidate_text.contains(term))
+}
+
+fn home_assistant_entity_matches_terms(entity: &HomeAssistantEntity, terms: &[String]) -> bool {
+    let entity_text = normalize_command_text(&format!(
+        "{}{}{}{}",
+        entity.entity_id,
+        entity.display_name,
+        entity.area_id.as_deref().unwrap_or_default(),
+        entity.device_class.as_deref().unwrap_or_default()
+    ));
+    terms
+        .iter()
+        .any(|term| entity_text == *term || entity_text.contains(term))
+}
+
+fn normalized_home_assistant_hint_terms(hint: &str) -> Vec<String> {
+    let normalized = normalize_command_text(hint);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    let mut terms = Vec::new();
+    push_unique_normalized_term(&mut terms, &normalized);
+    for alias in home_assistant_hint_aliases(&normalized) {
+        push_unique_normalized_term(&mut terms, alias);
+    }
+    terms
+}
+
+fn push_unique_normalized_term(terms: &mut Vec<String>, raw: &str) {
+    let normalized = normalize_command_text(raw);
+    if !normalized.is_empty() && !terms.iter().any(|term| term == &normalized) {
+        terms.push(normalized);
+    }
+}
+
+fn home_assistant_hint_aliases(normalized: &str) -> Vec<&'static str> {
+    let mut aliases = Vec::new();
+    if normalized.contains("测试") {
+        aliases.extend(["test", "harbordocktest"]);
+    }
+    if normalized.contains("门口") {
+        aliases.extend(["frontdoor", "porch", "entry", "entrance"]);
+    }
+    if normalized.contains("玄关") {
+        aliases.extend(["entry", "entrance", "foyer", "porch"]);
+    }
+    if normalized.contains("客厅") {
+        aliases.extend(["livingroom", "living", "lounge"]);
+    }
+    if normalized.contains("厨房") {
+        aliases.push("kitchen");
+    }
+    if normalized.contains("卧室") {
+        aliases.push("bedroom");
+    }
+    if normalized.contains("书房") {
+        aliases.extend(["study", "office"]);
+    }
+    if normalized.contains("阳台") {
+        aliases.push("balcony");
+    }
+    if normalized.contains("车库") {
+        aliases.push("garage");
+    }
+    if normalized.contains("餐厅") {
+        aliases.extend(["diningroom", "dining"]);
+    }
+    aliases
 }
 
 fn home_assistant_domain_label(domain: &str) -> &'static str {
@@ -9714,7 +10326,7 @@ fn general_message_support_summary_for_request(raw_text: &str) -> String {
 }
 
 fn general_message_support_summary() -> String {
-    "我可以作为 K3 家庭入口：摄像头抓拍/短视频、最近事件、通知最新事件、低风险家居动作、状态诊断，也能搜索/问答已有知识库。".to_string()
+    "我可以作为 K3 家庭入口：摄像头抓拍/短视频、最近事件、通知最新事件、低风险家居动作、状态诊断，也能搜索/问答已有知识库；遇到多个家居实体时我会先让你选择，不会猜着执行。".to_string()
 }
 
 fn general_message_unsupported_summary() -> String {
@@ -11122,11 +11734,13 @@ fn stable_prefixed_id(prefix: &str, payload: &str, length: usize) -> String {
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use base64::Engine as _;
     use serde_json::{json, Value};
+    use tiny_http::{Header, Method, Response, Server};
 
     use super::{
         artifact_kind_from_name, build_artifact_records, build_general_message_readiness_summary,
@@ -11166,8 +11780,8 @@ mod tests {
     };
     use crate::orchestrator::contracts::RiskLevel;
     use crate::runtime::admin_console::{
-        AdminConsoleState, AdminConsoleStore, IdentityBindingRecord, KnowledgeSettings,
-        KnowledgeSourceRoot, NotificationTargetRecord, RemoteViewConfig,
+        AdminConsoleState, AdminConsoleStore, HomeAssistantConfigUpdate, IdentityBindingRecord,
+        KnowledgeSettings, KnowledgeSourceRoot, NotificationTargetRecord, RemoteViewConfig,
     };
     use crate::runtime::hub::HubScanResultItem;
     use crate::runtime::knowledge::{
@@ -11529,6 +12143,115 @@ mod tests {
         let _ = fs::remove_file(conversation_path);
     }
 
+    fn configure_mock_home_assistant(service: &TaskApiService, base_url: &str) {
+        service
+            .clone()
+            .admin_store
+            .save_home_assistant_config(HomeAssistantConfigUpdate {
+                enabled: true,
+                base_url: base_url.to_string(),
+                access_token: Some("ha-test-token".to_string()),
+                exposed_domains: vec!["light".to_string(), "input_boolean".to_string()],
+            })
+            .expect("save HA config");
+    }
+
+    fn start_mock_home_assistant_server(
+        states_sequence: Vec<Value>,
+        expected_requests: usize,
+    ) -> (String, Arc<Mutex<Vec<Value>>>, thread::JoinHandle<()>) {
+        let server = Server::http("127.0.0.1:0").expect("HA mock server");
+        let base_url = format!("http://{}", server.server_addr());
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        let post_records = posts.clone();
+        let json_header =
+            Header::from_bytes(b"Content-Type", b"application/json").expect("json header");
+        let server_thread = thread::spawn(move || {
+            let mut state_index = 0usize;
+            for _ in 0..expected_requests {
+                let mut request = server.recv().expect("HA request");
+                let method = request.method().clone();
+                let url = request.url().to_string();
+                match (method, url.as_str()) {
+                    (Method::Get, "/api/states") => {
+                        let index = state_index.min(states_sequence.len().saturating_sub(1));
+                        state_index = state_index.saturating_add(1);
+                        let body = states_sequence
+                            .get(index)
+                            .cloned()
+                            .unwrap_or_else(|| json!([]))
+                            .to_string();
+                        request
+                            .respond(Response::from_string(body).with_header(json_header.clone()))
+                            .expect("states response");
+                    }
+                    (Method::Post, path) if path.starts_with("/api/services/") => {
+                        let mut body = String::new();
+                        request
+                            .as_reader()
+                            .read_to_string(&mut body)
+                            .expect("read service body");
+                        let body_json =
+                            serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({}));
+                        post_records
+                            .lock()
+                            .expect("post records")
+                            .push(json!({ "path": path, "body": body_json }));
+                        request
+                            .respond(Response::from_string("[]").with_header(json_header.clone()))
+                            .expect("service response");
+                    }
+                    _ => {
+                        request
+                            .respond(Response::from_string("not found").with_status_code(404))
+                            .expect("not found response");
+                    }
+                }
+            }
+        });
+        (base_url, posts, server_thread)
+    }
+
+    fn home_assistant_light_entities() -> Value {
+        json!([
+            home_assistant_entity_state(
+                "light.kitchen",
+                "off",
+                "厨房灯",
+                Some("kitchen"),
+                Some("light")
+            ),
+            home_assistant_entity_state(
+                "light.porch",
+                "on",
+                "门口灯",
+                Some("porch"),
+                Some("light")
+            )
+        ])
+    }
+
+    fn home_assistant_entity_state(
+        entity_id: &str,
+        state: &str,
+        friendly_name: &str,
+        area_id: Option<&str>,
+        device_class: Option<&str>,
+    ) -> Value {
+        json!({
+            "entity_id": entity_id,
+            "state": state,
+            "attributes": {
+                "friendly_name": friendly_name,
+                "area_id": area_id,
+                "device_class": device_class,
+                "access_token": "must-not-leak",
+            },
+            "last_changed": "2026-06-03T01:00:00Z",
+            "last_updated": "2026-06-03T01:00:00Z"
+        })
+    }
+
     fn general_message_test_request(prefix: &str, raw_text: &str, args: Value) -> TaskRequest {
         TaskRequest {
             task_id: format!("task-{prefix}"),
@@ -11557,6 +12280,22 @@ mod tests {
                 attachments: Vec::new(),
             }),
         }
+    }
+
+    fn general_message_followup_request(
+        prefix: &str,
+        raw_text: &str,
+        first_request: &TaskRequest,
+        resume_token: &str,
+    ) -> TaskRequest {
+        let mut request = general_message_test_request(
+            prefix,
+            raw_text,
+            json!({ "continuation_token": resume_token }),
+        );
+        request.source.session_id = first_request.source.session_id.clone();
+        request.source.conversation_id = first_request.source.conversation_id.clone();
+        request
     }
 
     fn general_message_turn_envelope(
@@ -15791,6 +16530,312 @@ mod tests {
             resolve_home_assistant_action_entity(&ambiguous_action, &[kitchen.clone()]),
             HomeAssistantEntityResolution::Resolved(kitchen)
         );
+
+        let scene_action = HomeAssistantNaturalActionRequest {
+            domain: "scene".to_string(),
+            service: "turn_on".to_string(),
+            entity_hint: Some("测试".to_string()),
+        };
+        let scene_on = HomeAssistantEntity {
+            entity_id: "scene.harbordock_test_on".to_string(),
+            domain: "scene".to_string(),
+            state: "2026-05-09T00:32:28+00:00".to_string(),
+            display_name: "HarborDock Test On".to_string(),
+            area_id: None,
+            device_class: None,
+            last_changed: None,
+            last_updated: None,
+            attributes: json!({}),
+        };
+        let scene_off = HomeAssistantEntity {
+            entity_id: "scene.harbordock_test_off".to_string(),
+            domain: "scene".to_string(),
+            state: "2026-05-09T00:32:29+00:00".to_string(),
+            display_name: "HarborDock Test Off".to_string(),
+            area_id: None,
+            device_class: None,
+            last_changed: None,
+            last_updated: None,
+            attributes: json!({}),
+        };
+        assert!(matches!(
+            resolve_home_assistant_action_entity(&scene_action, &[scene_on, scene_off]),
+            HomeAssistantEntityResolution::Clarify(candidates) if candidates.len() == 2
+        ));
+    }
+
+    #[test]
+    fn general_message_home_assistant_ambiguous_entities_need_input_and_persist_candidates() {
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-ha-clarify");
+        let (base_url, _posts, server_thread) =
+            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 1);
+        configure_mock_home_assistant(&service, &base_url);
+        let request = general_message_test_request("ha_clarify", "开灯", Value::Null);
+
+        let response = service.handle_task(request.clone());
+
+        assert_eq!(response.status, TaskStatus::NeedsInput);
+        assert_eq!(response.executor_used, "agentic_interpreter");
+        assert_eq!(
+            response.result.data["reply_pack"]["kind"],
+            "ha_action_clarify"
+        );
+        assert_eq!(response.result.data["reply_pack"]["status"], "needs_input");
+        assert!(response.result.message.contains("第一个"));
+        assert_eq!(
+            response.result.data["reply_pack"]["candidates"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        let payload = serde_json::to_string(&response.result.data).expect("serialize response");
+        assert!(!payload.contains("must-not-leak"));
+        assert!(!payload.contains("ha-test-token"));
+
+        let loaded = conversation_store
+            .load_for_session(
+                &request.source.session_id,
+                Some(&request.source.conversation_id),
+            )
+            .expect("load conversation")
+            .expect("conversation");
+        let pending = loaded.general_message_loop().expect("pending HA clarify");
+        let pending_ha = pending.home_assistant.expect("pending HA payload");
+        assert_eq!(pending_ha.domain, "light");
+        assert_eq!(pending_ha.service, "turn_on");
+        assert_eq!(pending_ha.candidates.len(), 2);
+        assert!(response.result.events.iter().any(|event| {
+            event["event_type"] == "home_assistant.service_action_clarification_required"
+                && event["payload"]["status"] == "needs_input"
+        }));
+
+        server_thread.join().expect("HA server");
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_home_assistant_clarification_ordinal_executes_selected_entity() {
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-ha-ordinal");
+        let (base_url, posts, server_thread) =
+            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 3);
+        configure_mock_home_assistant(&service, &base_url);
+        let first_request = general_message_test_request("ha_ordinal", "开灯", Value::Null);
+        let first = service.handle_task(first_request.clone());
+        let resume_token = first.resume_token.clone().expect("resume token");
+        let followup = general_message_followup_request(
+            "ha_ordinal_followup",
+            "第一个",
+            &first_request,
+            &resume_token,
+        );
+
+        let response = service.handle_task(followup);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.data["reply_pack"]["status"], "succeeded");
+        assert_eq!(
+            response.result.data["reply_pack"]["entity"]["entity_id"],
+            "light.kitchen"
+        );
+        assert_eq!(response.result.data["reply_pack"]["fields"], json!({}));
+        let post_records = posts.lock().expect("posts");
+        assert_eq!(post_records.len(), 1);
+        assert_eq!(post_records[0]["path"], "/api/services/light/turn_on");
+        assert_eq!(post_records[0]["body"]["entity_id"], "light.kitchen");
+        assert_eq!(
+            post_records[0]["body"]
+                .as_object()
+                .map(serde_json::Map::len),
+            Some(1)
+        );
+        drop(post_records);
+        let loaded = conversation_store
+            .load_for_session(
+                &first_request.source.session_id,
+                Some(&first_request.source.conversation_id),
+            )
+            .expect("load conversation")
+            .expect("conversation");
+        assert!(loaded.general_message_loop().is_none());
+
+        server_thread.join().expect("HA server");
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_home_assistant_clarification_name_executes_selected_entity() {
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-ha-name");
+        let (base_url, posts, server_thread) =
+            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 3);
+        configure_mock_home_assistant(&service, &base_url);
+        let first_request = general_message_test_request("ha_name", "开灯", Value::Null);
+        let first = service.handle_task(first_request.clone());
+        let resume_token = first.resume_token.clone().expect("resume token");
+        let followup = general_message_followup_request(
+            "ha_name_followup",
+            "门口灯",
+            &first_request,
+            &resume_token,
+        );
+
+        let response = service.handle_task(followup);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.data["reply_pack"]["status"], "succeeded");
+        assert_eq!(
+            response.result.data["reply_pack"]["entity"]["entity_id"],
+            "light.porch"
+        );
+        let post_records = posts.lock().expect("posts");
+        assert_eq!(post_records.len(), 1);
+        assert_eq!(post_records[0]["body"]["entity_id"], "light.porch");
+        drop(post_records);
+        let loaded = conversation_store
+            .load_for_session(
+                &first_request.source.session_id,
+                Some(&first_request.source.conversation_id),
+            )
+            .expect("load conversation")
+            .expect("conversation");
+        assert!(loaded.general_message_loop().is_none());
+
+        server_thread.join().expect("HA server");
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_home_assistant_clarification_cancel_clears_pending_without_execution() {
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-ha-cancel");
+        let (base_url, posts, server_thread) =
+            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 1);
+        configure_mock_home_assistant(&service, &base_url);
+        let first_request = general_message_test_request("ha_cancel", "开灯", Value::Null);
+        let first = service.handle_task(first_request.clone());
+        let resume_token = first.resume_token.clone().expect("resume token");
+        server_thread.join().expect("HA server");
+        let followup = general_message_followup_request(
+            "ha_cancel_followup",
+            "取消",
+            &first_request,
+            &resume_token,
+        );
+
+        let response = service.handle_task(followup);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(
+            response.result.data["reply_pack"]["kind"],
+            "ha_action_cancel"
+        );
+        assert_eq!(posts.lock().expect("posts").len(), 0);
+        let loaded = conversation_store
+            .load_for_session(
+                &first_request.source.session_id,
+                Some(&first_request.source.conversation_id),
+            )
+            .expect("load conversation")
+            .expect("conversation");
+        assert!(loaded.general_message_loop().is_none());
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_home_assistant_clarification_stale_candidate_keeps_frame() {
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-ha-stale");
+        let only_porch = json!([home_assistant_entity_state(
+            "light.porch",
+            "on",
+            "门口灯",
+            Some("porch"),
+            Some("light")
+        )]);
+        let (base_url, posts, server_thread) =
+            start_mock_home_assistant_server(vec![home_assistant_light_entities(), only_porch], 2);
+        configure_mock_home_assistant(&service, &base_url);
+        let first_request = general_message_test_request("ha_stale", "开灯", Value::Null);
+        let first = service.handle_task(first_request.clone());
+        let resume_token = first.resume_token.clone().expect("resume token");
+        let followup = general_message_followup_request(
+            "ha_stale_followup",
+            "第一个",
+            &first_request,
+            &resume_token,
+        );
+
+        let response = service.handle_task(followup);
+
+        assert_eq!(response.status, TaskStatus::NeedsInput);
+        assert_eq!(
+            response.result.data["home_assistant_clarification"]["reason"],
+            "candidate_stale"
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["candidates"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(posts.lock().expect("posts").len(), 0);
+        let loaded = conversation_store
+            .load_for_session(
+                &first_request.source.session_id,
+                Some(&first_request.source.conversation_id),
+            )
+            .expect("load conversation")
+            .expect("conversation");
+        let pending = loaded.general_message_loop().expect("pending");
+        assert_eq!(
+            pending
+                .home_assistant
+                .as_ref()
+                .map(|pending_ha| pending_ha.candidates.len()),
+            Some(1)
+        );
+
+        server_thread.join().expect("HA server");
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_home_assistant_unsafe_followup_blocks_and_clears_pending() {
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-ha-unsafe-followup");
+        let (base_url, posts, server_thread) =
+            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 1);
+        configure_mock_home_assistant(&service, &base_url);
+        let first_request = general_message_test_request("ha_unsafe_followup", "开灯", Value::Null);
+        let first = service.handle_task(first_request.clone());
+        let resume_token = first.resume_token.clone().expect("resume token");
+        server_thread.join().expect("HA server");
+        let followup = general_message_followup_request(
+            "ha_unsafe_followup_reply",
+            "解锁门锁",
+            &first_request,
+            &resume_token,
+        );
+
+        let response = service.handle_task(followup);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.data["reply_pack"]["status"], "blocked");
+        assert_eq!(response.result.data["reply_pack"]["executed"], false);
+        assert_eq!(posts.lock().expect("posts").len(), 0);
+        let loaded = conversation_store
+            .load_for_session(
+                &first_request.source.session_id,
+                Some(&first_request.source.conversation_id),
+            )
+            .expect("load conversation")
+            .expect("conversation");
+        assert!(loaded.general_message_loop().is_none());
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
     }
 
     #[test]
@@ -16724,10 +17769,8 @@ mod tests {
 
         assert_eq!(response.status, TaskStatus::Completed);
         assert_eq!(response.executor_used, "agentic_interpreter");
-        assert_eq!(
-            response.result.message,
-            "我可以作为 K3 家庭入口：摄像头抓拍/短视频、最近事件、通知最新事件、低风险家居动作、状态诊断，也能搜索/问答已有知识库。"
-        );
+        assert!(response.result.message.contains("K3 家庭入口"));
+        assert!(response.result.message.contains("不会猜着执行"));
         assert_eq!(
             response.result.data["reply_pack"]["summary"],
             response.result.message
