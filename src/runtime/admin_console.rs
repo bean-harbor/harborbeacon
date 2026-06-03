@@ -2950,6 +2950,14 @@ fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
     {
         return;
     }
+    if endpoint.model_endpoint_id == "llm-local-openai-compatible" {
+        ensure_model_endpoint_tag(endpoint, "assistant_input_parser");
+        ensure_model_endpoint_tag(endpoint, "k3_nsp");
+        ensure_model_endpoint_tag(endpoint, "semantic_router");
+        set_model_endpoint_metadata_bool(endpoint, "semantic_router", true);
+        set_model_endpoint_metadata_bool(endpoint, "local_only", true);
+        set_model_endpoint_metadata_bool(endpoint, "cloud_fallback_allowed", false);
+    }
 
     let base_url = model_endpoint_metadata_string(endpoint, "base_url");
     let healthz_url = model_endpoint_metadata_string(endpoint, "healthz_url");
@@ -2999,6 +3007,14 @@ fn normalize_builtin_local_model_api_endpoint(endpoint: &mut ModelEndpoint) {
             "legacy_model_api_migrated_from_healthz_url",
             value.to_string(),
         );
+    }
+}
+
+fn ensure_model_endpoint_tag(endpoint: &mut ModelEndpoint, tag: &str) {
+    if !endpoint.capability_tags.iter().any(|value| value == tag) {
+        endpoint.capability_tags.push(tag.to_string());
+        endpoint.capability_tags.sort();
+        endpoint.capability_tags.dedup();
     }
 }
 
@@ -3269,7 +3285,13 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
             endpoint_kind: ModelEndpointKind::Local,
             provider_key: "openai_compatible".to_string(),
             model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
-            capability_tags: vec!["chat".to_string(), "local_first".to_string()],
+            capability_tags: vec![
+                "assistant_input_parser".to_string(),
+                "chat".to_string(),
+                "k3_nsp".to_string(),
+                "local_first".to_string(),
+                "semantic_router".to_string(),
+            ],
             cost_policy: json!({"cost_hint": "local_or_sidecar"}),
             status: ModelEndpointStatus::Degraded,
             metadata: json!({
@@ -3278,6 +3300,9 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "healthz_url": local_healthz_url.clone(),
                 "api_key": local_api_key.clone(),
                 "api_key_configured": true,
+                "semantic_router": true,
+                "local_only": true,
+                "cloud_fallback_allowed": false,
             }),
         },
         ModelEndpoint {

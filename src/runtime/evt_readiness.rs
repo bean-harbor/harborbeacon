@@ -4,24 +4,30 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use reqwest::blocking::Client;
 use serde_json::{json, Value};
 
+use crate::control_plane::models::{ModelEndpoint, ModelKind};
 use crate::control_plane::models::{ModelEndpointKind, ModelEndpointStatus, PrivacyLevel};
 use crate::runtime::admin_console::{
-    AdminConsoleState, AdminConsoleStore, NotificationTargetRecord,
+    AdminConsoleState, AdminConsoleStore, AdminModelCenterState, NotificationTargetRecord,
 };
+use crate::runtime::model_center::wire_semantic_router_resident_endpoint;
 use crate::runtime::vision_event::list_recent_local_vision_events_default;
 
 pub const EVT_READINESS_PROFILE: &str = "k3-direct-72h-readiness";
 pub const EVT_READINESS_EVIDENCE_KIND: &str = "evt_readiness_v1";
+const SEMANTIC_ROUTER_SERVICE: &str = "semantic-router.service";
+const SEMANTIC_ROUTER_HEALTHZ_URL_ENV: &str = "HARBOR_SEMANTIC_ROUTER_HEALTHZ_URL";
+const DEFAULT_SEMANTIC_ROUTER_HEALTHZ_URL: &str = "http://127.0.0.1:4176/healthz";
 const EVT_SERVICES: [&str; 5] = [
     "harboros-beacon.service",
     "harboros-im-gate.service",
     "nginx.service",
     "harborlink-dev-k3.service",
-    "semantic-router.service",
+    SEMANTIC_ROUTER_SERVICE,
 ];
 
 pub fn build_evt_readiness_report(
@@ -129,10 +135,36 @@ pub fn run_evt_preflight_report(
         json!({
             "check": "semantic_router_local_only",
             "status": readiness
-                .pointer("/models/semantic_router/status")
+                .pointer("/models/semantic_router/local_only")
+                .and_then(Value::as_bool)
+                .map(|ready| if ready { "passed" } else { "blocked" })
+                .unwrap_or("unknown"),
+            "metadata": readiness
+                .pointer("/models/semantic_router")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        }),
+        json!({
+            "check": "semantic_router_service",
+            "status": readiness
+                .pointer("/models/semantic_router/service/status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown"),
-            "metadata": readiness.get("models").cloned().unwrap_or_else(|| json!({})),
+            "metadata": readiness
+                .pointer("/models/semantic_router/service")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        }),
+        json!({
+            "check": "semantic_router_endpoint",
+            "status": readiness
+                .pointer("/models/semantic_router/endpoint/status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            "metadata": readiness
+                .pointer("/models/semantic_router/endpoint")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         }),
         json!({
             "check": "secret_scan",
@@ -217,6 +249,7 @@ pub fn evt_readiness_workflow_summary(readiness: &Value) -> Value {
             .unwrap_or("degraded"),
         "blockers": readiness.get("blockers").cloned().unwrap_or_else(|| json!([])),
         "warnings": readiness.get("warnings").cloned().unwrap_or_else(|| json!([])),
+        "semantic_router": evt_semantic_router_workflow_summary(readiness),
         "generated_at": readiness
             .get("generated_at")
             .and_then(Value::as_str)
@@ -384,6 +417,13 @@ fn build_evt_readiness_from_state(
     {
         warnings.push("semantic_router_not_active".to_string());
     }
+    if !models
+        .pointer("/semantic_router/endpoint_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        warnings.push("semantic_router_endpoint_not_ready".to_string());
+    }
     if security
         .pointer("/secret_scan/total_count")
         .and_then(Value::as_u64)
@@ -548,19 +588,19 @@ fn evt_model_policy_readiness(state: &AdminConsoleState) -> Value {
         .route_policies
         .iter()
         .find(|policy| policy.route_policy_id == "semantic.router");
-    let active_local = state.models.endpoints.iter().find(|endpoint| {
-        endpoint.status == ModelEndpointStatus::Active
-            && endpoint.endpoint_kind == ModelEndpointKind::Local
-            && (endpoint
-                .capability_tags
-                .iter()
-                .any(|tag| matches_semantic_router_tag(tag))
-                || endpoint
-                    .metadata
-                    .get("semantic_router")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false))
-    });
+    let mut runtime_models = state.models.clone();
+    wire_semantic_router_resident_endpoint(&mut runtime_models);
+    let service = systemd_service_summary(SEMANTIC_ROUTER_SERVICE);
+    let service_active = service
+        .get("active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let endpoint = semantic_router_endpoint_candidate(&runtime_models);
+    let endpoint_health = semantic_router_endpoint_health(endpoint);
+    let endpoint_ready = endpoint_health
+        .get("ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let local_only = policy
         .map(|policy| {
             policy.privacy_level == PrivacyLevel::StrictLocal
@@ -570,28 +610,216 @@ fn evt_model_policy_readiness(state: &AdminConsoleState) -> Value {
                     .all(|item| !item.to_ascii_lowercase().contains("cloud"))
         })
         .unwrap_or(true);
+    let available = local_only && service_active && endpoint_ready;
     json!({
         "semantic_router": {
-            "status": if active_local.is_some() {
+            "status": if available {
                 "active"
-            } else if policy.is_some() {
+            } else if endpoint_ready {
+                "endpoint_ready"
+            } else if endpoint.is_some() {
                 "configured"
+            } else if service_active {
+                "service_active"
+            } else if policy.is_some() {
+                "policy_configured"
             } else {
                 "unknown"
             },
-            "available": active_local.is_some(),
+            "available": available,
+            "service_active": service_active,
+            "endpoint_ready": endpoint_ready,
+            "service": service,
+            "endpoint": endpoint_health,
+            "resident_service": {
+                "service": SEMANTIC_ROUTER_SERVICE,
+                "required_for_evt": true,
+                "loopback_only": true,
+                "healthz_url_redacted": true,
+            },
             "local_only": local_only,
             "cloud_fallback_allowed": !local_only,
             "policy_configured": policy.is_some(),
-            "endpoint_id": active_local.map(|endpoint| endpoint.model_endpoint_id.clone()),
-            "model_name": active_local.map(|endpoint| endpoint.model_name.clone()),
-            "provider_key": active_local.map(|endpoint| endpoint.provider_key.clone()),
+            "endpoint_id": endpoint.map(|endpoint| endpoint.model_endpoint_id.clone()),
+            "model_name": endpoint.map(|endpoint| endpoint.model_name.clone()),
+            "provider_key": endpoint.map(|endpoint| endpoint.provider_key.clone()),
         },
         "model_policy": {
             "semantic_router_policy": "semantic.router",
             "local_only": local_only,
             "cloud_fallback_allowed": !local_only,
         },
+        "redacted": true,
+    })
+}
+
+fn semantic_router_endpoint_candidate(state: &AdminModelCenterState) -> Option<&ModelEndpoint> {
+    let mut candidates = state
+        .endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint.model_kind == ModelKind::Llm
+                && endpoint.endpoint_kind == ModelEndpointKind::Local
+                && endpoint.status != ModelEndpointStatus::Disabled
+        })
+        .filter(|endpoint| semantic_router_endpoint_rank(endpoint).0 < 3)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        semantic_router_endpoint_rank(left).cmp(&semantic_router_endpoint_rank(right))
+    });
+    candidates.into_iter().next()
+}
+
+fn semantic_router_endpoint_rank(endpoint: &ModelEndpoint) -> (u8, u8, String) {
+    let is_default = endpoint.model_endpoint_id == "llm-local-openai-compatible";
+    let semantic = endpoint
+        .capability_tags
+        .iter()
+        .any(|tag| matches_semantic_router_tag(tag))
+        || endpoint
+            .metadata
+            .get("semantic_router")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let category = if semantic && !is_default {
+        0
+    } else if semantic {
+        1
+    } else if is_default {
+        2
+    } else {
+        3
+    };
+    let status = match endpoint.status {
+        ModelEndpointStatus::Active => 0,
+        ModelEndpointStatus::Degraded => 1,
+        ModelEndpointStatus::Disabled => 2,
+    };
+    (category, status, endpoint.model_endpoint_id.clone())
+}
+
+fn semantic_router_endpoint_health(endpoint: Option<&ModelEndpoint>) -> Value {
+    let Some(endpoint) = endpoint else {
+        return json!({
+            "status": "no_endpoint",
+            "ready": false,
+            "model_name": Value::Null,
+            "base_url_redacted": true,
+            "healthz_url_redacted": true,
+            "redacted": true,
+        });
+    };
+    let healthz_url = endpoint
+        .metadata
+        .get("healthz_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            env::var(SEMANTIC_ROUTER_HEALTHZ_URL_ENV)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_SEMANTIC_ROUTER_HEALTHZ_URL.to_string());
+    let client = match Client::builder().timeout(Duration::from_secs(3)).build() {
+        Ok(client) => client,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "ready": false,
+                "model_name": endpoint.model_name.clone(),
+                "error": redact_evt_text(&error.to_string()),
+                "base_url_redacted": true,
+                "healthz_url_redacted": true,
+                "redacted": true,
+            })
+        }
+    };
+    let response = match client.get(healthz_url).send() {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "ready": false,
+                "model_name": endpoint.model_name.clone(),
+                "error": redact_evt_text(&error.to_string()),
+                "base_url_redacted": true,
+                "healthz_url_redacted": true,
+                "redacted": true,
+            })
+        }
+    };
+    let http_status = response.status().as_u16();
+    let body = match response.text() {
+        Ok(body) => body,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "ready": false,
+                "http_status": http_status,
+                "model_name": endpoint.model_name.clone(),
+                "error": redact_evt_text(&error.to_string()),
+                "base_url_redacted": true,
+                "healthz_url_redacted": true,
+                "redacted": true,
+            })
+        }
+    };
+    let payload = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({}));
+    let service_ready = payload
+        .get("ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let backend_ready = payload
+        .pointer("/backend/ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ready = (200..300).contains(&http_status) && service_ready && backend_ready;
+    json!({
+        "status": if ready {
+            "ready"
+        } else if (200..300).contains(&http_status) {
+            "degraded"
+        } else {
+            "unavailable"
+        },
+        "ready": ready,
+        "http_status": http_status,
+        "service_ready": service_ready,
+        "backend_ready": backend_ready,
+        "backend_kind": payload.pointer("/backend/kind").cloned().unwrap_or(Value::Null),
+        "model_loaded": payload.pointer("/backend/model_loaded").cloned().unwrap_or(Value::Null),
+        "service_reported": payload.get("service").cloned().unwrap_or(Value::Null),
+        "health_status": payload.get("status").cloned().unwrap_or(Value::Null),
+        "model_name": endpoint.model_name.clone(),
+        "base_url_redacted": true,
+        "healthz_url_redacted": true,
+        "bind_redacted": true,
+        "redacted": true,
+    })
+}
+
+fn evt_semantic_router_workflow_summary(readiness: &Value) -> Value {
+    let router = readiness
+        .pointer("/models/semantic_router")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "kind": "semantic_router_resident",
+        "status": router.get("status").cloned().unwrap_or(Value::Null),
+        "service_active": router.get("service_active").cloned().unwrap_or(Value::Null),
+        "endpoint_ready": router.get("endpoint_ready").cloned().unwrap_or(Value::Null),
+        "local_only": router.get("local_only").cloned().unwrap_or(Value::Null),
+        "cloud_fallback_allowed": router
+            .get("cloud_fallback_allowed")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "backend_kind": router.pointer("/endpoint/backend_kind").cloned().unwrap_or(Value::Null),
+        "model_loaded": router.pointer("/endpoint/model_loaded").cloned().unwrap_or(Value::Null),
+        "model_name": router.get("model_name").cloned().unwrap_or(Value::Null),
+        "urls_redacted": true,
         "redacted": true,
     })
 }
@@ -1016,7 +1244,44 @@ fn command_exists(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::thread;
+    use std::time::Duration as StdDuration;
+
+    use tiny_http::{Response, Server};
+
+    use crate::control_plane::models::{
+        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
+    };
     use crate::runtime::admin_console::{AdminConsoleState, NotificationTargetRecord};
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var(key).ok();
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.as_ref() {
+                env::set_var(self.key, previous);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn evt_test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn evt_long_run_requests_are_blocked() {
@@ -1027,6 +1292,7 @@ mod tests {
 
     #[test]
     fn readiness_redacts_gateway_target_route_key() {
+        let _env_lock = evt_test_env_lock().lock().expect("env lock");
         let mut state = AdminConsoleState::default();
         state.notification_targets.push(NotificationTargetRecord {
             target_id: "target-1".to_string(),
@@ -1048,6 +1314,87 @@ mod tests {
         assert!(!text.contains("homeassistant.local"));
         assert!(text.contains("\"route_key_redacted\":true"));
         assert!(text.contains("\"token_redacted\":true"));
+    }
+
+    #[test]
+    fn readiness_records_semantic_router_endpoint_health_without_urls() {
+        let _env_lock = evt_test_env_lock().lock().expect("env lock");
+        let server = Server::http("127.0.0.1:0").expect("health server");
+        let healthz_url = format!("http://{}/healthz", server.server_addr());
+        let _healthz = EnvVarGuard::set(SEMANTIC_ROUTER_HEALTHZ_URL_ENV, &healthz_url);
+        let server_thread = thread::spawn(move || {
+            if let Ok(Some(request)) = server.recv_timeout(StdDuration::from_secs(3)) {
+                let _ = request.respond(Response::from_string(
+                    r#"{"service":"harbor-model-api","status":"ok","backend":{"kind":"candle","ready":true,"model_loaded":false},"chat_model":"Qwen/Qwen2.5-0.5B-Instruct","ready":true}"#,
+                ));
+            }
+        });
+
+        let mut state = AdminConsoleState::default();
+        state.models.endpoints.push(ModelEndpoint {
+            model_endpoint_id: "llm-local-semantic-router".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Llm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+            capability_tags: vec!["semantic_router".to_string(), "k3_nsp".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "healthz_url": healthz_url,
+                "api_key": "secret-router-token",
+                "semantic_router": true,
+                "local_only": true,
+            }),
+        });
+
+        let readiness = build_evt_readiness_from_state(&state, 1, None);
+        server_thread.join().expect("health server joined");
+
+        assert_eq!(
+            readiness["models"]["semantic_router"]["endpoint_ready"],
+            json!(true)
+        );
+        assert_eq!(
+            readiness["models"]["semantic_router"]["endpoint"]["backend_kind"],
+            json!("candle")
+        );
+        assert_eq!(
+            readiness["models"]["semantic_router"]["endpoint"]["healthz_url_redacted"],
+            json!(true)
+        );
+        let text = serde_json::to_string(&readiness).expect("readiness json");
+        assert!(!text.contains("/healthz"));
+        assert!(!text.contains("secret-router-token"));
+        assert!(!text.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn semantic_router_cloud_fallback_blocks_evt_readiness() {
+        let _env_lock = evt_test_env_lock().lock().expect("env lock");
+        let mut state = AdminConsoleState::default();
+        let router = state
+            .models
+            .route_policies
+            .iter_mut()
+            .find(|policy| policy.route_policy_id == "semantic.router")
+            .expect("router policy");
+        router.privacy_level = PrivacyLevel::AllowRedactedCloud;
+        router.fallback_order = vec!["local".to_string(), "cloud".to_string()];
+
+        let readiness = build_evt_readiness_from_state(&state, 1, None);
+
+        assert_eq!(
+            readiness["models"]["semantic_router"]["local_only"],
+            json!(false)
+        );
+        assert!(readiness["blockers"]
+            .as_array()
+            .expect("blockers")
+            .iter()
+            .any(|value| value == "semantic_router_not_local_only"));
     }
 
     #[test]

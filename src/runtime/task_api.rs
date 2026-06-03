@@ -10360,7 +10360,10 @@ fn build_general_message_router_system_prompt() -> String {
         "actions. Examples: latest camera status to my default contact => ",
         "{\"decision\":\"vision_event_notify_latest\",\"confidence\":0.95}; ",
         "run the home test scene => {\"decision\":\"ha_service_action\",\"confidence\":0.95,",
-        "\"home_assistant\":{\"domain\":\"scene\",\"service\":\"turn_on\",\"entity_hint\":\"test\"}}."
+        "\"home_assistant\":{\"domain\":\"scene\",\"service\":\"turn_on\",\"entity_hint\":\"test\"}}; ",
+        "压测前状态怎么样 => {\"decision\":\"evt_readiness\",\"confidence\":0.95}; ",
+        "帮我做一下EVT预检 => {\"decision\":\"evt_preflight\",\"confidence\":0.95}; ",
+        "生成压测证据 => {\"decision\":\"evt_evidence_bundle\",\"confidence\":0.95}."
     )
     .to_string()
 }
@@ -17675,6 +17678,10 @@ mod tests {
         assert!(prompt.contains("4h or 72h stress test"));
         assert!(prompt.contains("default notification"));
         assert!(prompt.contains("\"domain\":\"scene\",\"service\":\"turn_on\""));
+        assert!(prompt.contains("帮我做一下EVT预检"));
+        assert!(prompt.contains("\"decision\":\"evt_preflight\""));
+        assert!(prompt.contains("生成压测证据"));
+        assert!(prompt.contains("\"decision\":\"evt_evidence_bundle\""));
     }
 
     #[test]
