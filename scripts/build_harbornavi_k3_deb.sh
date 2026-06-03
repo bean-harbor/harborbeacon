@@ -56,10 +56,10 @@ cp "${cargo_release_dir}/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/har
 cp "${cargo_release_dir}/harbornavi-k3-multi-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-multi-vision-smoke"
 cp "${cargo_release_dir}/harbornavi-ha-mqtt-event-contract-smoke" "$pkg_dir/usr/bin/harbornavi-ha-mqtt-event-contract-smoke"
 chmod 0755 "$pkg_dir/usr/bin/harboros-beacon" "$pkg_dir/usr/bin/harbornavi-k3-local-vision-smoke" "$pkg_dir/usr/bin/harbornavi-k3-multi-vision-smoke" "$pkg_dir/usr/bin/harbornavi-ha-mqtt-event-contract-smoke"
-cp scripts/harbornavi_k3_yolov8_analyzer.py "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
+sed 's/\r$//' scripts/harbornavi_k3_yolov8_analyzer.py > "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
 chmod 0755 "$pkg_dir/usr/lib/harboros-beacon/harbornavi_k3_yolov8_analyzer.py"
 
-cp debian/harboros-beacon.service "$pkg_dir/etc/systemd/system/harboros-beacon.service"
+sed 's/\r$//' debian/harboros-beacon.service > "$pkg_dir/etc/systemd/system/harboros-beacon.service"
 
 sed \
   -e "s/VERSION_PLACEHOLDER/${debian_version}/g" \
@@ -69,8 +69,8 @@ sed \
   > "$pkg_dir/DEBIAN/control"
 printf 'X-HarborNavi-Version: %s\n' "$release_label" >> "$pkg_dir/DEBIAN/control"
 
-cp debian/postinst "$pkg_dir/DEBIAN/postinst"
-cp debian/prerm "$pkg_dir/DEBIAN/prerm"
+sed 's/\r$//' debian/postinst > "$pkg_dir/DEBIAN/postinst"
+sed 's/\r$//' debian/prerm > "$pkg_dir/DEBIAN/prerm"
 chmod 0755 "$pkg_dir/DEBIAN/postinst" "$pkg_dir/DEBIAN/prerm"
 
 cat > "$pkg_dir/usr/share/doc/harboros-beacon/harbornavi-k3-package.txt" <<EOF

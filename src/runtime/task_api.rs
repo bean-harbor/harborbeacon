@@ -85,9 +85,10 @@ use crate::runtime::vision_event::{
 
 const ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV: &str = "HARBOR_ALLOW_NON_HARBOROS_CAPTURE_ROOT";
 const GENERAL_MESSAGE_RECAP_LIMIT: usize = 3;
-const GENERAL_MESSAGE_TURN_BUDGET_MS: u64 = 12_000;
-const GENERAL_MESSAGE_ROUTER_BUDGET_MS: u64 = 3_500;
-const GENERAL_MESSAGE_ROUTER_MAX_TOKENS: u32 = 8;
+const GENERAL_MESSAGE_TURN_BUDGET_MS: u64 = 24_000;
+const GENERAL_MESSAGE_ROUTER_BUDGET_MS: u64 = 12_000;
+const GENERAL_MESSAGE_ROUTER_MAX_TOKENS: u32 = 220;
+const GENERAL_MESSAGE_NSP_MIN_CONFIDENCE: u8 = 60;
 const GENERAL_MESSAGE_RENDERER_BUDGET_MS: u64 = 1_800;
 const GENERAL_MESSAGE_RENDERER_MAX_TOKENS: u32 = 48;
 const RAG_DOMAIN: &str = "rag";
@@ -513,13 +514,16 @@ struct GeneralMessagePlan {
     kind: GeneralMessagePlanKind,
     conversation_act: Option<GeneralMessageConversationAct>,
     reply_text: Option<String>,
+    canonical_phrase: Option<String>,
     camera_hint: Option<String>,
     query: Option<String>,
+    home_assistant_action: Option<HomeAssistantNaturalAction>,
+    confidence: Option<u8>,
     recent_clip: Option<RecentClipPlaybackState>,
     reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 struct GeneralMessagePlanPayload {
     #[serde(default)]
     decision: String,
@@ -530,11 +534,35 @@ struct GeneralMessagePlanPayload {
     #[serde(default)]
     reply_text: Option<String>,
     #[serde(default)]
+    canonical_phrase: Option<String>,
+    #[serde(default)]
+    confidence: Option<Value>,
+    #[serde(default)]
     camera_hint: Option<String>,
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    entity_hint: Option<String>,
+    #[serde(default)]
+    home_assistant: Option<GeneralMessageHomeAssistantPlanPayload>,
+    #[serde(default)]
+    ha: Option<GeneralMessageHomeAssistantPlanPayload>,
+    #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+struct GeneralMessageHomeAssistantPlanPayload {
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    entity_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -590,6 +618,11 @@ struct GeneralMessageControllerTrace {
     renderer_latency_ms: Option<u64>,
     fallback_reason: Option<String>,
     candidate_count: usize,
+    nsp_schema_valid: bool,
+    nsp_local_only: bool,
+    nsp_decision: Option<String>,
+    nsp_confidence: Option<u8>,
+    nsp_canonical_phrase: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1734,7 +1767,7 @@ impl TaskApiService {
             {
                 return Some(response);
             }
-            return Some(self.handle_general_message_home_assistant_action(request));
+            return Some(self.handle_general_message_home_assistant_action(request, None));
         }
 
         let selected = match resolve_pending_home_assistant_candidate_selection(
@@ -2101,10 +2134,7 @@ impl TaskApiService {
                 {
                     return response;
                 }
-                self.general_message_capability_summary_response(
-                    request,
-                    plan.reply_text.as_deref(),
-                )
+                self.general_message_capability_summary_response(request, None)
             }
             GeneralMessagePlanKind::Clarify => {
                 self.general_message_clarification_response(request, &plan, prior_pending)
@@ -2185,7 +2215,10 @@ impl TaskApiService {
                 {
                     return response;
                 }
-                self.handle_general_message_home_assistant_action(request)
+                self.handle_general_message_home_assistant_action(
+                    request,
+                    plan.home_assistant_action.as_ref(),
+                )
             }
             GeneralMessagePlanKind::VisionEventSummary => {
                 if let Err(response) =
@@ -2507,8 +2540,14 @@ impl TaskApiService {
         )
     }
 
-    fn handle_general_message_home_assistant_action(&self, request: &TaskRequest) -> TaskResponse {
-        let Some(action) = infer_home_assistant_natural_action(request.intent.raw_text.as_str())
+    fn handle_general_message_home_assistant_action(
+        &self,
+        request: &TaskRequest,
+        nsp_action: Option<&HomeAssistantNaturalAction>,
+    ) -> TaskResponse {
+        let Some(action) = nsp_action
+            .cloned()
+            .or_else(|| infer_home_assistant_natural_action(request.intent.raw_text.as_str()))
         else {
             return self.general_message_unsupported_response(request, None);
         };
@@ -3191,20 +3230,6 @@ impl TaskApiService {
             ..Default::default()
         };
 
-        if let Some(mut plan) =
-            resolve_deterministic_general_message_plan(request, &candidates, pending_loop)
-        {
-            trace.controller_stage = deterministic_stage_for_plan(&plan).to_string();
-            maybe_render_general_message_reply(
-                request,
-                pending_loop,
-                &admin_state.models,
-                &mut plan,
-                &mut trace,
-            );
-            return Ok((plan, trace));
-        }
-
         if should_try_general_message_router_llm(&signals, pending_loop) {
             let router_started = Instant::now();
             let router_prompt =
@@ -3224,72 +3249,47 @@ impl TaskApiService {
                 &router_options,
             );
             trace.router_llm = true;
+            trace.nsp_local_only = true;
             trace.router_latency_ms = Some(router_started.elapsed().as_millis() as u64);
             if router_result.available {
-                if let Some((kind, conversation_act)) =
-                    parse_general_message_router_decision(&router_result.text)
-                {
-                    let mut plan = plan_from_router_decision(
-                        kind,
-                        conversation_act,
-                        request,
-                        selected_camera.as_deref(),
-                        pending_loop,
-                    );
-                    trace.controller_stage = "router_llm".to_string();
-                    maybe_render_general_message_reply(
-                        request,
-                        pending_loop,
-                        &admin_state.models,
-                        &mut plan,
-                        &mut trace,
-                    );
-                    return Ok((plan, trace));
-                }
-                trace.fallback_reason = Some("router_invalid_label".to_string());
-                if llm_selected_endpoint_kind(&router_result) != Some("cloud") {
-                    if let Some(cloud_model_state) = cloud_only_llm_model_state_for_policy(
-                        &admin_state.models,
-                        "semantic.router",
-                    ) {
-                        let cloud_result = run_llm_text_with_state_and_options(
-                            &router_prompt,
-                            &cloud_model_state,
-                            &router_options,
+                if let Some(mut plan) = parse_general_message_plan(&router_result.text) {
+                    enforce_general_message_nsp_hard_guards(request, &mut plan);
+                    trace.nsp_schema_valid = general_message_nsp_schema_valid(&plan);
+                    record_general_message_nsp_plan_trace(&mut trace, &plan);
+                    if let Some(reason) = general_message_nsp_validation_failure(request, &plan) {
+                        trace.fallback_reason = Some(reason);
+                    } else {
+                        trace.controller_stage = "nsp_router".to_string();
+                        maybe_render_general_message_reply(
+                            request,
+                            pending_loop,
+                            &admin_state.models,
+                            &mut plan,
+                            &mut trace,
                         );
-                        if cloud_result.available {
-                            if let Some((kind, conversation_act)) =
-                                parse_general_message_router_decision(&cloud_result.text)
-                            {
-                                let mut plan = plan_from_router_decision(
-                                    kind,
-                                    conversation_act,
-                                    request,
-                                    selected_camera.as_deref(),
-                                    pending_loop,
-                                );
-                                trace.controller_stage = "router_cloud_fallback".to_string();
-                                trace.fallback_reason =
-                                    Some("router_invalid_label_cloud_retry".to_string());
-                                maybe_render_general_message_reply(
-                                    request,
-                                    pending_loop,
-                                    &admin_state.models,
-                                    &mut plan,
-                                    &mut trace,
-                                );
-                                return Ok((plan, trace));
-                            }
-                        }
-                        trace.fallback_reason = Some(format!(
-                            "router_invalid_label; cloud_retry={}",
-                            cloud_result.summary
-                        ));
+                        return Ok((plan, trace));
                     }
+                } else {
+                    trace.nsp_schema_valid = false;
+                    trace.fallback_reason = Some("nsp_invalid_json_or_decision".to_string());
                 }
             } else {
                 trace.fallback_reason = Some(router_result.summary);
             }
+        }
+
+        if let Some(mut plan) =
+            resolve_deterministic_general_message_plan(request, &candidates, pending_loop)
+        {
+            trace.controller_stage = deterministic_stage_for_plan(&plan).to_string();
+            maybe_render_general_message_reply(
+                request,
+                pending_loop,
+                &admin_state.models,
+                &mut plan,
+                &mut trace,
+            );
+            return Ok((plan, trace));
         }
 
         if let Some(mut plan) = fallback_general_message_plan(
@@ -3317,10 +3317,13 @@ impl TaskApiService {
                 pending_loop,
             )),
             reply_text: None,
+            canonical_phrase: None,
             camera_hint: pending_loop.and_then(|pending| pending.camera_hint.clone()),
             query: pending_loop
                 .and_then(|pending| pending.query.clone())
                 .or_else(|| infer_query_from_raw_text(request.intent.raw_text.as_str())),
+            home_assistant_action: None,
+            confidence: None,
             recent_clip: None,
             reason: Some("no_supported_candidate".to_string()),
         };
@@ -9245,7 +9248,74 @@ fn redact_task_api_text(value: &str) -> String {
     {
         return "[redacted sensitive detail]".to_string();
     }
-    trimmed.to_string()
+    redact_local_path_occurrences(trimmed)
+}
+
+fn redact_local_path_occurrences(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let remaining = &value[index..];
+        if remaining.starts_with('/') && is_local_path_boundary(value, index) {
+            let end = consume_local_path(value, index);
+            if end > index + 1 {
+                output.push_str("[redacted local path]");
+                index = end;
+                continue;
+            }
+        }
+        if looks_like_windows_absolute_path(value, index) && is_local_path_boundary(value, index) {
+            let end = consume_local_path(value, index);
+            if end > index + 2 {
+                output.push_str("[redacted local path]");
+                index = end;
+                continue;
+            }
+        }
+        let ch = remaining.chars().next().unwrap_or_default();
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+    output
+}
+
+fn is_local_path_boundary(value: &str, index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    value[..index]
+        .chars()
+        .last()
+        .map(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '(' | '[' | '{'))
+        .unwrap_or(true)
+}
+
+fn looks_like_windows_absolute_path(value: &str, index: usize) -> bool {
+    let bytes = value.as_bytes();
+    bytes
+        .get(index)
+        .copied()
+        .map(|byte| byte.is_ascii_alphabetic())
+        .unwrap_or(false)
+        && bytes.get(index + 1) == Some(&b':')
+        && matches!(bytes.get(index + 2), Some(b'\\' | b'/'))
+}
+
+fn consume_local_path(value: &str, start: usize) -> usize {
+    let mut saw_separator = false;
+    for (offset, ch) in value[start..].char_indices() {
+        if matches!(ch, '/' | '\\') {
+            saw_separator = true;
+        }
+        if ch.is_whitespace() || matches!(ch, '"' | '\'' | ')' | ']' | '}' | ',' | ';') {
+            return if saw_separator { start + offset } else { start };
+        }
+    }
+    if saw_separator {
+        value.len()
+    } else {
+        start
+    }
 }
 
 fn looks_like_vision_event_notify_request(normalized: &str) -> bool {
@@ -9842,8 +9912,11 @@ fn plan_from_general_message_candidate(candidate: &GeneralMessageCandidate) -> G
         kind: candidate.kind.clone(),
         conversation_act: None,
         reply_text: None,
+        canonical_phrase: None,
         camera_hint: candidate.camera_hint.clone(),
         query: candidate.query.clone(),
+        home_assistant_action: None,
+        confidence: Some(candidate.confidence),
         recent_clip: candidate.recent_clip.clone(),
         reason: Some(candidate.reason.clone()),
     }
@@ -9857,6 +9930,146 @@ fn deterministic_stage_for_plan(plan: &GeneralMessagePlan) -> &'static str {
     }
 }
 
+fn record_general_message_nsp_plan_trace(
+    trace: &mut GeneralMessageControllerTrace,
+    plan: &GeneralMessagePlan,
+) {
+    trace.nsp_decision = Some(general_message_plan_decision_label(plan).to_string());
+    trace.nsp_confidence = plan.confidence;
+    trace.nsp_canonical_phrase = plan.canonical_phrase.clone();
+}
+
+fn general_message_nsp_validation_failure(
+    request: &TaskRequest,
+    plan: &GeneralMessagePlan,
+) -> Option<String> {
+    if general_message_external_boundary_hard_guard(request.intent.raw_text.as_str())
+        && general_message_plan_is_actionable_tool(plan.kind)
+    {
+        return Some("nsp_boundary_hard_guard".to_string());
+    }
+    if !general_message_nsp_schema_valid(plan) {
+        return Some("nsp_schema_invalid".to_string());
+    }
+    if general_message_plan_is_actionable_tool(plan.kind)
+        && plan.confidence.unwrap_or(0) < GENERAL_MESSAGE_NSP_MIN_CONFIDENCE
+    {
+        return Some("nsp_low_confidence".to_string());
+    }
+    None
+}
+
+fn enforce_general_message_nsp_hard_guards(request: &TaskRequest, plan: &mut GeneralMessagePlan) {
+    if !general_message_external_boundary_hard_guard(request.intent.raw_text.as_str()) {
+        return;
+    }
+    if matches!(
+        (plan.kind, plan.conversation_act),
+        (
+            GeneralMessagePlanKind::ConversationAct,
+            Some(GeneralMessageConversationAct::Boundary)
+        )
+    ) {
+        return;
+    }
+    plan.kind = GeneralMessagePlanKind::ConversationAct;
+    plan.conversation_act = Some(GeneralMessageConversationAct::Boundary);
+    plan.home_assistant_action = None;
+    plan.camera_hint = None;
+    plan.query = None;
+    plan.reply_text = None;
+    plan.canonical_phrase = Some("边界拒绝".to_string());
+    plan.confidence = plan.confidence.or(Some(100));
+    plan.reason = Some("nsp_boundary_hard_guard".to_string());
+}
+
+fn general_message_nsp_schema_valid(plan: &GeneralMessagePlan) -> bool {
+    if general_message_plan_is_actionable_tool(plan.kind) && plan.confidence.is_none() {
+        return false;
+    }
+    if plan.kind == GeneralMessagePlanKind::HomeAssistantServiceAction
+        && plan.home_assistant_action.is_none()
+    {
+        return false;
+    }
+    true
+}
+
+fn general_message_plan_is_actionable_tool(kind: GeneralMessagePlanKind) -> bool {
+    matches!(
+        kind,
+        GeneralMessagePlanKind::CameraReplayRecentClip
+            | GeneralMessagePlanKind::CameraSnapshot
+            | GeneralMessagePlanKind::CameraRecordClip
+            | GeneralMessagePlanKind::KnowledgeSearch
+            | GeneralMessagePlanKind::RagAnswer
+            | GeneralMessagePlanKind::HomeAssistantServiceAction
+            | GeneralMessagePlanKind::VisionEventSummary
+            | GeneralMessagePlanKind::VisionEventNotifyLatest
+            | GeneralMessagePlanKind::SystemReadiness
+    )
+}
+
+fn general_message_external_boundary_hard_guard(raw_text: &str) -> bool {
+    let normalized = normalize_command_text(raw_text).to_ascii_lowercase();
+    if [
+        "天气",
+        "气温",
+        "下雨",
+        "新闻",
+        "股票",
+        "股价",
+        "行情",
+        "解锁",
+        "开锁",
+        "门锁",
+        "空调",
+        "暖气",
+        "阀门",
+        "燃气",
+        "煤气",
+        "插座大功率",
+        "temperature",
+        "weather",
+        "news",
+        "stock",
+        "unlock",
+        "lock",
+        "hvac",
+        "valve",
+    ]
+    .iter()
+    .any(|keyword| normalized.contains(keyword))
+    {
+        return true;
+    }
+    matches!(
+        infer_general_message_conversation_act(raw_text, None),
+        GeneralMessageConversationAct::Boundary
+    )
+}
+
+fn general_message_plan_decision_label(plan: &GeneralMessagePlan) -> &'static str {
+    match plan.kind {
+        GeneralMessagePlanKind::Clarify => "clarify",
+        GeneralMessagePlanKind::CapabilitySummary => "capability_summary",
+        GeneralMessagePlanKind::CameraReplayRecentClip => "camera_replay_recent_clip",
+        GeneralMessagePlanKind::CameraSnapshot => "camera_snapshot",
+        GeneralMessagePlanKind::CameraRecordClip => "camera_record_clip",
+        GeneralMessagePlanKind::KnowledgeSearch => "knowledge_search",
+        GeneralMessagePlanKind::RagAnswer => "rag_answer",
+        GeneralMessagePlanKind::HomeAssistantServiceAction => "ha_service_action",
+        GeneralMessagePlanKind::VisionEventSummary => "vision_event_summary",
+        GeneralMessagePlanKind::VisionEventNotifyLatest => "vision_event_notify_latest",
+        GeneralMessagePlanKind::SystemReadiness => "system_readiness",
+        GeneralMessagePlanKind::ConversationAct => plan
+            .conversation_act
+            .map(GeneralMessageConversationAct::reply_pack_kind)
+            .unwrap_or("conversation_continue"),
+        GeneralMessagePlanKind::Unsupported => "unsupported",
+    }
+}
+
 fn should_try_general_message_router_llm(
     signals: &GeneralMessageSignals,
     _pending_loop: Option<&PendingTaskGeneralMessageLoop>,
@@ -9866,13 +10079,37 @@ fn should_try_general_message_router_llm(
 
 fn build_general_message_router_system_prompt() -> String {
     concat!(
-        "You are a HarborBeacon router. Return exactly one lowercase label from this closed set ",
-        "and nothing else: capability_summary, camera_snapshot, camera_record_clip, ",
+        "/no_think\n",
+        "You are HarborBeacon's local-only Natural Semantic Parser (NSP). ",
+        "Return exactly one valid JSON object and no markdown. Schema: ",
+        "{\"decision\":\"...\",\"confidence\":0.95,\"canonical_phrase\":\"...\",",
+        "\"camera_hint\":null,\"query\":null,",
+        "\"home_assistant\":{\"domain\":null,\"service\":null,\"entity_hint\":null},",
+        "\"conversation_act\":null,\"reply_text\":null,\"reason\":\"...\"}. ",
+        "Closed decisions: capability_summary, camera_snapshot, camera_record_clip, ",
         "vision_event_summary, vision_event_notify_latest, ha_service_action, system_readiness, ",
         "knowledge_search, rag_answer, clarify, conversation_continue, conversation_boundary, ",
         "conversation_repair, conversation_cancel, conversation_clarify_continue. ",
-        "Choose a tool label only for a clear supported request; otherwise choose a conversation_* label. ",
-        "Do not invent external weather, news, stock, or internet providers."
+        "For ha_service_action, fill only domain/service/entity_hint. Allowed HA outputs are ",
+        "light/switch/input_boolean turn_on/turn_off/toggle and scene turn_on. ",
+        "Never extract arbitrary service fields. Use confidence 0.75-0.99 for clear decisions; ",
+        "do not copy 0.0 unless the request is genuinely unclear. Chinese semantic rules: ",
+        "asking what Harbor/K3 can do means capability_summary; asking status/diagnostics/health ",
+        "of the home, WeChat entry, K3, HA, camera, or gateway means system_readiness; asking to ",
+        "look/check/see the door/front/current camera means camera_snapshot; asking for a short ",
+        "recording/video/clip means camera_record_clip; asking what the camera recently saw means ",
+        "vision_event_summary; asking to send/share/notify the latest camera situation means ",
+        "vision_event_notify_latest, including requests to send it to the default notification ",
+        "target/contact; asking to run/activate/execute a scene/routine means ha_service_action ",
+        "with domain scene, service turn_on, and entity_hint copied as a short scene description; ",
+        "asking to turn on/off/toggle a light, switch, or input_boolean means ha_service_action ",
+        "with safe slots only. Do not classify supported K3 camera/event/status/HA requests as ",
+        "conversation_boundary just because the wording is natural. Choose conversation_boundary ",
+        "for weather, news, stocks, internet realtime requests, locks, HVAC, valves, or unsafe ",
+        "actions. Examples: latest camera status to my default contact => ",
+        "{\"decision\":\"vision_event_notify_latest\",\"confidence\":0.95}; ",
+        "run the home test scene => {\"decision\":\"ha_service_action\",\"confidence\":0.95,",
+        "\"home_assistant\":{\"domain\":\"scene\",\"service\":\"turn_on\",\"entity_hint\":\"test\"}}."
     )
     .to_string()
 }
@@ -9887,8 +10124,9 @@ fn build_general_message_router_prompt(
             "User message: {message}\n",
             "Recent session recap (newest first, max {limit}): {session_recap}\n",
             "Pending loop context: {pending_loop}\n",
-            "Choose the single best label. If the message is not a clear supported tool request, ",
-            "choose the best conversation_* act instead of unsupported.\n"
+            "Translate the user's natural language into one safe HarborBeacon decision. ",
+            "If the message is not a clear supported tool request, choose the best conversation_* act. ",
+            "Use confidence 0.0-1.0. Do not include secrets or transport identifiers.\n"
         ),
         message = request.intent.raw_text,
         limit = GENERAL_MESSAGE_RECAP_LIMIT,
@@ -9995,54 +10233,6 @@ fn parse_general_message_router_decision(
     }
 
     None
-}
-
-fn plan_from_router_decision(
-    kind: GeneralMessagePlanKind,
-    conversation_act: Option<GeneralMessageConversationAct>,
-    request: &TaskRequest,
-    default_camera_hint: Option<&str>,
-    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
-) -> GeneralMessagePlan {
-    let camera_hint = pending_loop
-        .and_then(|pending| pending.camera_hint.clone())
-        .or_else(|| {
-            infer_camera_hint_from_general_message(
-                request.intent.raw_text.as_str(),
-                default_camera_hint,
-            )
-        });
-    let query = pending_loop
-        .and_then(|pending| pending.query.clone())
-        .or_else(|| infer_query_from_raw_text(request.intent.raw_text.as_str()));
-    let plan_camera_hint = match kind {
-        GeneralMessagePlanKind::CameraSnapshot
-        | GeneralMessagePlanKind::CameraRecordClip
-        | GeneralMessagePlanKind::Clarify => camera_hint,
-        _ => None,
-    };
-    let plan_query = match kind {
-        GeneralMessagePlanKind::KnowledgeSearch
-        | GeneralMessagePlanKind::RagAnswer
-        | GeneralMessagePlanKind::Clarify => query,
-        _ => None,
-    };
-    let plan_conversation_act = if kind == GeneralMessagePlanKind::ConversationAct {
-        Some(conversation_act.unwrap_or_else(|| {
-            infer_general_message_conversation_act(request.intent.raw_text.as_str(), pending_loop)
-        }))
-    } else {
-        None
-    };
-    GeneralMessagePlan {
-        kind,
-        conversation_act: plan_conversation_act,
-        reply_text: None,
-        camera_hint: plan_camera_hint,
-        query: plan_query,
-        recent_clip: None,
-        reason: Some("router_llm".to_string()),
-    }
 }
 
 fn maybe_render_general_message_reply(
@@ -10193,6 +10383,19 @@ fn attach_general_message_controller_trace(
         json!({ "payload": previous })
     };
     if let Some(map) = payload.as_object_mut() {
+        let fallback_reason = trace.fallback_reason.as_deref().map(redact_task_api_text);
+        let nsp_route = json!({
+            "stage": trace.controller_stage,
+            "schema_valid": trace.nsp_schema_valid,
+            "local_only": trace.nsp_local_only,
+            "decision": trace.nsp_decision,
+            "confidence": trace.nsp_confidence,
+            "canonical_phrase": trace
+                .nsp_canonical_phrase
+                .as_deref()
+                .map(redact_task_api_text),
+            "fallback_reason": fallback_reason.clone(),
+        });
         map.insert(
             "general_message_controller".to_string(),
             json!({
@@ -10201,10 +10404,14 @@ fn attach_general_message_controller_trace(
                 "router_latency_ms": trace.router_latency_ms,
                 "renderer_latency_ms": trace.renderer_latency_ms,
                 "candidate_count": trace.candidate_count,
-                "fallback_reason": trace.fallback_reason,
+                "fallback_reason": fallback_reason.clone(),
+                "nsp_route": nsp_route.clone(),
                 "total_turn_latency_ms": elapsed.as_millis() as u64,
             }),
         );
+        if let Some(reply_pack) = map.get_mut("reply_pack").and_then(Value::as_object_mut) {
+            reply_pack.insert("nsp_route".to_string(), nsp_route);
+        }
     }
     response.result.data = payload;
 }
@@ -10625,15 +10832,79 @@ fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePlan> {
         ),
         _ => return None,
     };
+    let confidence = normalize_general_message_nsp_confidence(payload.confidence.as_ref());
+    let home_assistant_action = if kind == GeneralMessagePlanKind::HomeAssistantServiceAction {
+        home_assistant_nsp_action_from_plan_payload(&payload)
+    } else {
+        None
+    };
     Some(GeneralMessagePlan {
         kind,
         conversation_act,
         reply_text: normalize_optional_general_message_plan_field(payload.reply_text),
+        canonical_phrase: normalize_optional_general_message_plan_field(payload.canonical_phrase),
         camera_hint: normalize_optional_general_message_plan_field(payload.camera_hint),
         query: normalize_optional_general_message_plan_field(payload.query),
+        home_assistant_action,
+        confidence,
         recent_clip: None,
         reason: normalize_optional_general_message_plan_field(payload.reason),
     })
+}
+
+fn normalize_general_message_nsp_confidence(value: Option<&Value>) -> Option<u8> {
+    let raw = match value? {
+        Value::Number(number) => number.as_f64()?,
+        Value::String(text) => text.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if !raw.is_finite() {
+        return None;
+    }
+    let percent = if raw <= 1.0 { raw * 100.0 } else { raw };
+    Some(percent.round().clamp(0.0, 100.0) as u8)
+}
+
+fn home_assistant_nsp_action_from_plan_payload(
+    payload: &GeneralMessagePlanPayload,
+) -> Option<HomeAssistantNaturalAction> {
+    let nested = payload.home_assistant.as_ref().or(payload.ha.as_ref());
+    let domain = normalize_optional_general_message_plan_field(
+        nested
+            .and_then(|value| value.domain.clone())
+            .or_else(|| payload.domain.clone()),
+    )?
+    .to_ascii_lowercase();
+    let service = normalize_optional_general_message_plan_field(
+        nested
+            .and_then(|value| value.service.clone())
+            .or_else(|| payload.service.clone()),
+    )?
+    .to_ascii_lowercase();
+    let entity_hint = normalize_optional_general_message_plan_field(
+        nested
+            .and_then(|value| value.entity_hint.clone())
+            .or_else(|| payload.entity_hint.clone()),
+    );
+    let request = HomeAssistantNaturalActionRequest {
+        domain,
+        service,
+        entity_hint,
+    };
+    if !is_low_risk_home_assistant_service_action(&request) {
+        return Some(HomeAssistantNaturalAction::Blocked {
+            message: "这类 Home Assistant 动作不在低风险 allowlist 中，本次没有执行。".to_string(),
+        });
+    }
+    Some(HomeAssistantNaturalAction::Request(request))
+}
+
+fn is_low_risk_home_assistant_service_action(action: &HomeAssistantNaturalActionRequest) -> bool {
+    match (action.domain.as_str(), action.service.as_str()) {
+        ("light" | "switch" | "input_boolean", "turn_on" | "turn_off" | "toggle") => true,
+        ("scene", "turn_on") => true,
+        _ => false,
+    }
 }
 
 fn parse_general_message_conversation_act_label(
@@ -10742,8 +11013,11 @@ fn fallback_general_message_plan(
             kind: GeneralMessagePlanKind::CapabilitySummary,
             conversation_act: None,
             reply_text: None,
+            canonical_phrase: None,
             camera_hint: None,
             query: None,
+            home_assistant_action: None,
+            confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a capability summary request".to_string()),
         });
@@ -10754,8 +11028,11 @@ fn fallback_general_message_plan(
             kind: GeneralMessagePlanKind::VisionEventNotifyLatest,
             conversation_act: None,
             reply_text: None,
+            canonical_phrase: None,
             camera_hint: None,
             query: None,
+            home_assistant_action: None,
+            confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a latest event notification request".to_string()),
         });
@@ -10765,8 +11042,11 @@ fn fallback_general_message_plan(
             kind: GeneralMessagePlanKind::VisionEventSummary,
             conversation_act: None,
             reply_text: None,
+            canonical_phrase: None,
             camera_hint: None,
             query: None,
+            home_assistant_action: None,
+            confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a recent event summary request".to_string()),
         });
@@ -10776,8 +11056,11 @@ fn fallback_general_message_plan(
             kind: GeneralMessagePlanKind::SystemReadiness,
             conversation_act: None,
             reply_text: None,
+            canonical_phrase: None,
             camera_hint: None,
             query: None,
+            home_assistant_action: None,
+            confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a system readiness request".to_string()),
         });
@@ -10787,8 +11070,11 @@ fn fallback_general_message_plan(
             kind: GeneralMessagePlanKind::HomeAssistantServiceAction,
             conversation_act: None,
             reply_text: None,
+            canonical_phrase: None,
             camera_hint: None,
             query: None,
+            home_assistant_action: None,
+            confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a Home Assistant service action".to_string()),
         });
@@ -10804,8 +11090,11 @@ fn fallback_general_message_plan(
             kind: GeneralMessagePlanKind::CameraRecordClip,
             conversation_act: None,
             reply_text: None,
+            canonical_phrase: None,
             camera_hint: default_camera_hint.map(str::to_string),
             query: None,
+            home_assistant_action: None,
+            confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a short clip request".to_string()),
         });
@@ -10815,8 +11104,11 @@ fn fallback_general_message_plan(
             kind: GeneralMessagePlanKind::CameraSnapshot,
             conversation_act: None,
             reply_text: None,
+            canonical_phrase: None,
             camera_hint: default_camera_hint.map(str::to_string),
             query: None,
+            home_assistant_action: None,
+            confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a snapshot request".to_string()),
         });
@@ -10826,8 +11118,11 @@ fn fallback_general_message_plan(
             kind: GeneralMessagePlanKind::RagAnswer,
             conversation_act: None,
             reply_text: None,
+            canonical_phrase: None,
             camera_hint: None,
             query: infer_query_from_raw_text(raw_text),
+            home_assistant_action: None,
+            confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a RAG answer request".to_string()),
         });
@@ -10853,8 +11148,11 @@ fn fallback_general_message_plan(
             kind: GeneralMessagePlanKind::KnowledgeSearch,
             conversation_act: None,
             reply_text: None,
+            canonical_phrase: None,
             camera_hint: None,
             query: infer_query_from_raw_text(raw_text),
+            home_assistant_action: None,
+            confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a knowledge search request".to_string()),
         });
@@ -16344,7 +16642,11 @@ mod tests {
         );
         assert_eq!(
             response.result.data["general_message_controller"]["router_llm"],
-            false
+            true
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["nsp_route"]["local_only"],
+            true
         );
 
         cleanup_task_api_service(admin_path, registry_path, conversation_path);
@@ -16975,6 +17277,32 @@ mod tests {
             ha_plan.kind,
             GeneralMessagePlanKind::HomeAssistantServiceAction
         );
+        assert!(ha_plan.home_assistant_action.is_none());
+        let ha_slots_plan = parse_general_message_plan(
+            r#"{
+                "decision": "ha_service_action",
+                "confidence": 0.91,
+                "canonical_phrase": "开灯",
+                "home_assistant": {
+                    "domain": "light",
+                    "service": "turn_on",
+                    "entity_hint": "厨房"
+                }
+            }"#,
+        )
+        .expect("HA slots plan");
+        assert_eq!(ha_slots_plan.confidence, Some(91));
+        assert_eq!(ha_slots_plan.canonical_phrase.as_deref(), Some("开灯"));
+        assert_eq!(
+            ha_slots_plan.home_assistant_action,
+            Some(HomeAssistantNaturalAction::Request(
+                HomeAssistantNaturalActionRequest {
+                    domain: "light".to_string(),
+                    service: "turn_on".to_string(),
+                    entity_hint: Some("厨房".to_string()),
+                }
+            ))
+        );
         let notify_plan =
             parse_general_message_plan(r#"{"decision":"vision_event_notify_latest"}"#)
                 .expect("event notify plan");
@@ -16997,6 +17325,216 @@ mod tests {
             Some(GeneralMessageConversationAct::Boundary)
         );
         assert_eq!(plan.reply_text.as_deref(), Some("这件事我现在不直接处理。"));
+    }
+
+    #[test]
+    fn parse_general_message_plan_accepts_closed_nsp_tool_decisions() {
+        let cases = [
+            ("camera_snapshot", GeneralMessagePlanKind::CameraSnapshot),
+            (
+                "camera_record_clip",
+                GeneralMessagePlanKind::CameraRecordClip,
+            ),
+            (
+                "vision_event_summary",
+                GeneralMessagePlanKind::VisionEventSummary,
+            ),
+            (
+                "vision_event_notify_latest",
+                GeneralMessagePlanKind::VisionEventNotifyLatest,
+            ),
+            ("system_readiness", GeneralMessagePlanKind::SystemReadiness),
+            ("knowledge_search", GeneralMessagePlanKind::KnowledgeSearch),
+            ("rag_answer", GeneralMessagePlanKind::RagAnswer),
+        ];
+
+        for (decision, expected_kind) in cases {
+            let plan = parse_general_message_plan(&format!(
+                r#"{{
+                    "decision": "{decision}",
+                    "confidence": 0.88,
+                    "canonical_phrase": "{decision}",
+                    "camera_hint": "门口",
+                    "query": "本地资料"
+                }}"#
+            ))
+            .expect("closed NSP decision");
+            assert_eq!(plan.kind, expected_kind);
+            assert_eq!(plan.confidence, Some(88));
+            assert_eq!(plan.canonical_phrase.as_deref(), Some(decision));
+        }
+    }
+
+    #[test]
+    fn general_message_router_system_prompt_disables_qwen3_thinking() {
+        let prompt = super::build_general_message_router_system_prompt();
+
+        assert!(prompt.starts_with("/no_think"));
+        assert!(prompt.contains("Return exactly one valid JSON object"));
+        assert!(prompt.contains("\"confidence\":0.95"));
+        assert!(prompt.contains("do not copy 0.0"));
+        assert!(prompt.contains("asking status/diagnostics/health"));
+        assert!(prompt.contains("default notification"));
+        assert!(prompt.contains("\"domain\":\"scene\",\"service\":\"turn_on\""));
+    }
+
+    #[test]
+    fn general_message_nsp_hard_guard_overrides_external_or_unsafe_continue() {
+        let weather_request =
+            general_message_test_request("nsp_boundary_weather", "深圳今天会下雨吗", Value::Null);
+        let mut weather_plan =
+            parse_general_message_plan(r#"{"decision":"conversation_continue","confidence":0.95}"#)
+                .expect("weather continue plan");
+
+        super::enforce_general_message_nsp_hard_guards(&weather_request, &mut weather_plan);
+
+        assert_eq!(weather_plan.kind, GeneralMessagePlanKind::ConversationAct);
+        assert_eq!(
+            weather_plan.conversation_act,
+            Some(GeneralMessageConversationAct::Boundary)
+        );
+        assert_eq!(
+            weather_plan.reason.as_deref(),
+            Some("nsp_boundary_hard_guard")
+        );
+
+        let lock_request = general_message_test_request(
+            "nsp_boundary_lock",
+            "我到门口了，把门锁打开",
+            Value::Null,
+        );
+        let mut lock_plan =
+            parse_general_message_plan(r#"{"decision":"conversation_continue","confidence":0.95}"#)
+                .expect("lock continue plan");
+
+        super::enforce_general_message_nsp_hard_guards(&lock_request, &mut lock_plan);
+
+        assert_eq!(
+            lock_plan.conversation_act,
+            Some(GeneralMessageConversationAct::Boundary)
+        );
+    }
+
+    #[test]
+    fn general_message_nsp_low_confidence_tool_does_not_execute() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-nsp-low-confidence");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "camera_snapshot",
+                "confidence": 0.31,
+                "canonical_phrase": "拍一张门口",
+                "camera_hint": "front-door",
+                "reason": "weak visual request"
+            }"#,
+        );
+
+        let response = service.handle_task(general_message_test_request(
+            "nsp_low_confidence",
+            "门口现在咋样",
+            Value::Null,
+        ));
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "agentic_interpreter");
+        assert_eq!(
+            response.result.data["reply_pack"]["kind"],
+            "conversation_continue"
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["fallback_reason"],
+            "nsp_low_confidence"
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["nsp_route"]["confidence"],
+            json!(31)
+        );
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_nsp_home_assistant_slots_clarify_ambiguous_entities() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-nsp-ha-clarify");
+        let (base_url, posts, server_thread) =
+            start_mock_home_assistant_server(vec![home_assistant_light_entities()], 1);
+        configure_mock_home_assistant(&service, &base_url);
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "ha_service_action",
+                "confidence": 0.94,
+                "canonical_phrase": "开灯",
+                "home_assistant": {
+                    "domain": "light",
+                    "service": "turn_on",
+                    "entity_hint": null
+                },
+                "reason": "safe low-risk light action"
+            }"#,
+        );
+
+        let response = service.handle_task(general_message_test_request(
+            "nsp_ha_clarify",
+            "屋里太暗了，帮我弄亮一点",
+            Value::Null,
+        ));
+
+        assert_eq!(response.status, TaskStatus::NeedsInput);
+        assert_eq!(response.result.data["reply_pack"]["status"], "needs_input");
+        assert_eq!(
+            response.result.data["general_message_controller"]["controller_stage"],
+            "nsp_router"
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["nsp_route"]["decision"],
+            "ha_service_action"
+        );
+        assert_eq!(posts.lock().expect("posts").len(), 0);
+
+        server_thread.join().expect("HA server");
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_nsp_unsafe_home_assistant_slots_are_blocked() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-nsp-ha-blocked");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "ha_service_action",
+                "confidence": 0.95,
+                "canonical_phrase": "解锁门锁",
+                "home_assistant": {
+                    "domain": "lock",
+                    "service": "unlock",
+                    "entity_hint": "门口"
+                },
+                "reason": "unsafe lock action"
+            }"#,
+        );
+
+        let response = service.handle_task(general_message_test_request(
+            "nsp_ha_blocked",
+            "我回来了，帮我把门打开",
+            Value::Null,
+        ));
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.data["reply_pack"]["status"], "blocked");
+        assert_eq!(response.result.data["reply_pack"]["executed"], false);
+        assert_eq!(
+            response.result.data["general_message_controller"]["controller_stage"],
+            "nsp_router"
+        );
+        let text = serde_json::to_string(&response.result.data).expect("serialize response");
+        assert!(!text.contains("ha-test-token"));
+        assert!(!text.contains("rtsp://"));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
     }
 
     #[test]
@@ -17105,7 +17643,11 @@ mod tests {
         assert!(response.result.message.contains("SiliconFlow"));
         assert_eq!(
             response.result.data["general_message_controller"]["router_llm"],
-            false
+            true
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["nsp_route"]["local_only"],
+            true
         );
 
         cleanup_task_api_service(admin_path, registry_path, conversation_path);
@@ -17159,7 +17701,11 @@ mod tests {
         );
         assert_eq!(
             response.result.data["general_message_controller"]["router_llm"],
-            false
+            true
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["nsp_route"]["local_only"],
+            true
         );
         assert!(
             response.result.data["general_message_controller"]["total_turn_latency_ms"]
@@ -17957,7 +18503,7 @@ mod tests {
         );
         assert_eq!(
             response.result.data["general_message_controller"]["fallback_reason"],
-            "router_invalid_label"
+            "nsp_invalid_json_or_decision"
         );
         assert!(!response.result.message.contains("我暂时还不能稳定理解"));
 

@@ -2753,6 +2753,29 @@ pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCe
             }
         }
     }
+    for policy in &mut route_policies {
+        if policy.route_policy_id == DEFAULT_POLICY_SEMANTIC_ROUTER {
+            policy.privacy_level = PrivacyLevel::StrictLocal;
+            policy
+                .fallback_order
+                .retain(|kind| !kind.eq_ignore_ascii_case("cloud"));
+            if policy.fallback_order.is_empty() {
+                policy.fallback_order = vec!["local".to_string(), "sidecar".to_string()];
+            }
+            if let Some(metadata) = policy.metadata.as_object_mut() {
+                metadata.remove("cloud_fallback_scope");
+                metadata.remove("redaction_required");
+                metadata.insert("local_only".to_string(), json!(true));
+                metadata.insert("cloud_fallback_allowed".to_string(), json!(false));
+            } else {
+                policy.metadata = json!({
+                    "capability": "router",
+                    "local_only": true,
+                    "cloud_fallback_allowed": false,
+                });
+            }
+        }
+    }
     route_policies.sort_by(|left, right| left.route_policy_id.cmp(&right.route_policy_id));
 
     let model_store_root =
@@ -3284,7 +3307,6 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
                 "api_key_configured": false,
                 "model": DEFAULT_SILICONFLOW_MODEL,
                 "fallback_scope": [
-                    DEFAULT_POLICY_SEMANTIC_ROUTER,
                     DEFAULT_POLICY_RETRIEVAL_ANSWER,
                 ],
                 "secret_redaction": "endpoint_metadata",
@@ -3380,19 +3402,15 @@ pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {
             workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
             domain_scope: "semantic".to_string(),
             modality: "text".to_string(),
-            privacy_level: PrivacyLevel::AllowRedactedCloud,
+            privacy_level: PrivacyLevel::StrictLocal,
             local_preferred: true,
             max_cost_per_run: None,
-            fallback_order: vec![
-                "local".to_string(),
-                "sidecar".to_string(),
-                "cloud".to_string(),
-            ],
+            fallback_order: vec!["local".to_string(), "sidecar".to_string()],
             status: "active".to_string(),
             metadata: json!({
                 "capability": "router",
-                "cloud_fallback_scope": "semantic_router_only",
-                "redaction_required": true,
+                "local_only": true,
+                "cloud_fallback_allowed": false,
             }),
         },
         ModelRoutePolicy {
@@ -5438,7 +5456,7 @@ mod tests {
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
     use crate::control_plane::media::RecordingTriggerMode;
     use crate::control_plane::models::{
-        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind,
+        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
     };
     use crate::control_plane::users::{
         Membership, MembershipStatus, RoleKind, UserAccount, UserStatus,
@@ -6392,9 +6410,9 @@ mod tests {
             .expect("semantic router policy");
         assert_eq!(
             router_policy.privacy_level,
-            crate::control_plane::models::PrivacyLevel::AllowRedactedCloud
+            crate::control_plane::models::PrivacyLevel::StrictLocal
         );
-        assert!(router_policy
+        assert!(!router_policy
             .fallback_order
             .iter()
             .any(|kind| kind == "cloud"));
@@ -6500,6 +6518,48 @@ mod tests {
             json!("http://127.0.0.1:4174/api/inference/healthz")
         );
         assert_eq!(endpoint.metadata["legacy_model_api_migrated"], json!(true));
+    }
+
+    #[test]
+    fn sanitize_model_center_keeps_semantic_router_local_only() {
+        let mut state = AdminModelCenterState {
+            endpoints: default_model_endpoints(),
+            route_policies: default_model_route_policies(),
+            model_store_root: default_model_store_root(),
+            capability_bindings: Vec::new(),
+            runtimes: Vec::new(),
+        };
+        let router = state
+            .route_policies
+            .iter_mut()
+            .find(|policy| policy.route_policy_id == "semantic.router")
+            .expect("router policy");
+        router.privacy_level = PrivacyLevel::AllowRedactedCloud;
+        router.fallback_order = vec![
+            "local".to_string(),
+            "sidecar".to_string(),
+            "cloud".to_string(),
+        ];
+        router.metadata = json!({
+            "capability": "router",
+            "cloud_fallback_scope": "semantic_router_only",
+            "redaction_required": true,
+        });
+
+        let sanitized = sanitize_model_center_state(state);
+        let router = sanitized
+            .route_policies
+            .iter()
+            .find(|policy| policy.route_policy_id == "semantic.router")
+            .expect("sanitized router policy");
+        assert_eq!(router.privacy_level, PrivacyLevel::StrictLocal);
+        assert!(!router
+            .fallback_order
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case("cloud")));
+        assert_eq!(router.metadata["local_only"], json!(true));
+        assert_eq!(router.metadata["cloud_fallback_allowed"], json!(false));
+        assert!(router.metadata.get("cloud_fallback_scope").is_none());
     }
 
     #[test]

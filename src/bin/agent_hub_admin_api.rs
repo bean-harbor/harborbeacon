@@ -44,6 +44,7 @@ use harborbeacon_local_agent::control_plane::models::{
     ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
     PrivacyLevel,
 };
+use harborbeacon_local_agent::control_plane::tasks::TaskStepRun;
 use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
 use harborbeacon_local_agent::runtime::access_control::{
     authorize_access, AccessAction, AccessIdentityHints, AccessPrincipal,
@@ -2183,6 +2184,7 @@ impl AdminApi {
             &runtime_projection,
             self.last_event_notification_attempt(),
             self.last_home_assistant_service_action(),
+            build_latest_general_message_nsp_route_workflow(&self.task_service),
             build_latest_home_assistant_task_api_workflow(&self.task_service),
             &admin_state.notification_targets,
             live_gateway_status.as_ref(),
@@ -9650,6 +9652,83 @@ fn build_latest_home_assistant_task_api_workflow(task_service: &TaskApiService) 
     })
 }
 
+fn build_latest_general_message_nsp_route_workflow(task_service: &TaskApiService) -> Value {
+    let steps = match task_service.conversation_store().recent_task_steps(200) {
+        Ok(steps) => steps,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "message": redact_admin_string(&error),
+                "redacted": true,
+            })
+        }
+    };
+    let summaries = steps
+        .iter()
+        .filter_map(redacted_general_message_nsp_route_summary)
+        .collect::<Vec<_>>();
+    let Some(latest_step) = summaries.last().cloned() else {
+        return json!({
+            "status": "not_run",
+            "message": "No general.message NSP route evidence has been recorded.",
+            "redacted": true,
+        });
+    };
+    let recent_steps = summaries
+        .iter()
+        .rev()
+        .take(6)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    json!({
+        "status": "available",
+        "redacted": true,
+        "latest_route": latest_step,
+        "recent_routes": recent_steps,
+    })
+}
+
+fn redacted_general_message_nsp_route_summary(step: &TaskStepRun) -> Option<Value> {
+    if step.domain != "general" || step.operation != "message" {
+        return None;
+    }
+    let nsp_route = step
+        .output_payload
+        .pointer("/data/reply_pack/nsp_route")
+        .or_else(|| {
+            step.output_payload
+                .pointer("/data/general_message_controller/nsp_route")
+        })?;
+    let stage = nsp_route
+        .pointer("/stage")
+        .or_else(|| {
+            step.output_payload
+                .pointer("/data/general_message_controller/controller_stage")
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
+    Some(json!({
+        "step_id": step.step_id,
+        "task_id": step.task_id,
+        "status": step.status,
+        "stage": stage,
+        "decision": nsp_route.pointer("/decision").cloned().unwrap_or(Value::Null),
+        "confidence": nsp_route.pointer("/confidence").cloned().unwrap_or(Value::Null),
+        "schema_valid": nsp_route.pointer("/schema_valid").cloned().unwrap_or(Value::Null),
+        "local_only": nsp_route.pointer("/local_only").cloned().unwrap_or(Value::Null),
+        "fallback_reason": nsp_route
+            .pointer("/fallback_reason")
+            .and_then(Value::as_str)
+            .map(redact_admin_string)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+        "redacted": true,
+    }))
+}
+
 fn redacted_home_assistant_task_api_event_summary(event: &EventRecord) -> Option<Value> {
     if !event
         .event_type
@@ -9702,6 +9781,7 @@ fn build_redacted_diagnostics_bundle(
     runtime: &LocalModelRuntimeProjection,
     last_event_notification_attempt: Option<Value>,
     last_home_assistant_service_action: Option<Value>,
+    last_general_message_nsp_route: Value,
     last_home_assistant_task_api_workflow: Value,
     notification_targets: &[NotificationTargetRecord],
     gateway_status: Option<&Value>,
@@ -9773,6 +9853,7 @@ fn build_redacted_diagnostics_bundle(
                 "status": "not_run",
                 "message": "No Home Assistant service action has been attempted in this API process.",
             })),
+            "general_message_nsp_route": last_general_message_nsp_route,
             "home_assistant_task_api_workflow": last_home_assistant_task_api_workflow,
             "default_notification_target": build_default_notification_target_readiness(
                 notification_targets,
@@ -14823,7 +14904,76 @@ fn redact_stream_url_credentials(value: &str) -> String {
 }
 
 fn redact_admin_string(value: &str) -> String {
-    redact_url_query_secrets(&redact_stream_url_credentials(value))
+    redact_local_path_occurrences(&redact_url_query_secrets(&redact_stream_url_credentials(
+        value,
+    )))
+}
+
+fn redact_local_path_occurrences(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let remaining = &value[index..];
+        if remaining.starts_with('/') && is_local_path_boundary(value, index) {
+            let end = consume_local_path(value, index);
+            if end > index + 1 {
+                output.push_str("[redacted local path]");
+                index = end;
+                continue;
+            }
+        }
+        if looks_like_windows_absolute_path(value, index) && is_local_path_boundary(value, index) {
+            let end = consume_local_path(value, index);
+            if end > index + 2 {
+                output.push_str("[redacted local path]");
+                index = end;
+                continue;
+            }
+        }
+        let ch = remaining.chars().next().unwrap_or_default();
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+    output
+}
+
+fn is_local_path_boundary(value: &str, index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    value[..index]
+        .chars()
+        .last()
+        .map(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '(' | '[' | '{'))
+        .unwrap_or(true)
+}
+
+fn looks_like_windows_absolute_path(value: &str, index: usize) -> bool {
+    let bytes = value.as_bytes();
+    bytes
+        .get(index)
+        .copied()
+        .map(|byte| byte.is_ascii_alphabetic())
+        .unwrap_or(false)
+        && bytes.get(index + 1) == Some(&b':')
+        && matches!(bytes.get(index + 2), Some(b'\\' | b'/'))
+}
+
+fn consume_local_path(value: &str, start: usize) -> usize {
+    let mut saw_separator = false;
+    for (offset, ch) in value[start..].char_indices() {
+        if matches!(ch, '/' | '\\') {
+            saw_separator = true;
+        }
+        if ch.is_whitespace() || matches!(ch, '"' | '\'' | ')' | ']' | '}' | ',' | ';') {
+            return if saw_separator { start + offset } else { start };
+        }
+    }
+    if saw_separator {
+        value.len()
+    } else {
+        start
+    }
 }
 
 fn redact_url_query_secrets(value: &str) -> String {
@@ -15666,16 +15816,16 @@ mod tests {
         parse_optional_unix_seconds, parse_share_link_revoke_path,
         parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
         percent_decode_path_segment, probe_local_model_runtime, redact_account_management_snapshot,
-        redact_bridge_provider_config, redact_camera_device_projection,
+        redact_admin_string, redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
-        redact_value_stream_credentials, redacted_home_assistant_task_api_event_summary,
-        release_item, request_identity_hints, resolve_harbor_assistant_asset_path,
-        resolve_knowledge_preview_path, run_knowledge_index_jobs, run_model_download_job,
-        run_model_download_transfer, scan_request_task_args, url_encode_path_segment,
-        validate_home_assistant_service_fields, validate_home_assistant_service_smoke, AdminApi,
-        HomeAssistantServiceSmokeRequest, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
-        ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
-        DEFAULT_HF_ENDPOINT,
+        redact_value_stream_credentials, redacted_general_message_nsp_route_summary,
+        redacted_home_assistant_task_api_event_summary, release_item, request_identity_hints,
+        resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
+        run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
+        scan_request_task_args, url_encode_path_segment, validate_home_assistant_service_fields,
+        validate_home_assistant_service_smoke, AdminApi, HomeAssistantServiceSmokeRequest,
+        KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
+        ModelRuntimeActivationRequest, ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
     };
     use harborbeacon_local_agent::control_plane::events::EventRecord;
     use harborbeacon_local_agent::control_plane::media::{
@@ -15945,18 +16095,68 @@ mod tests {
                 "status": "not_run",
                 "redacted": true,
             }),
+            json!({
+                "status": "not_run",
+                "redacted": true,
+            }),
             &[],
             None,
         );
         let text = serde_json::to_string(&bundle).expect("serialize bundle");
 
         assert_eq!(bundle.security["secret_scan"], json!("clean"));
+        assert_eq!(
+            bundle.workflow["general_message_nsp_route"]["status"],
+            json!("not_run")
+        );
         assert!(!text.contains("token=secret"));
         assert!(!text.contains("rtsp://"));
         assert!(!text.contains("api_key=abc"));
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn nsp_route_diagnostics_redacts_local_paths() {
+        let step = harborbeacon_local_agent::control_plane::tasks::TaskStepRun {
+            step_id: "step-1".to_string(),
+            task_id: "turn-1".to_string(),
+            domain: "general".to_string(),
+            operation: "message".to_string(),
+            status: harborbeacon_local_agent::control_plane::tasks::TaskStepRunStatus::Success,
+            output_payload: json!({
+                "data": {
+                    "general_message_controller": {
+                        "controller_stage": "nsp_router",
+                        "nsp_route": {
+                            "decision": null,
+                            "confidence": null,
+                            "schema_valid": false,
+                            "local_only": true,
+                            "fallback_reason": "missing /mnt/software/harborbeacon-agent-ci/model-store/runtimes/harbor-candle/bootstrap-llm/tokenizer.json and C:\\\\models\\\\secret\\\\tokenizer.json token=secret"
+                        }
+                    }
+                }
+            }),
+            ..Default::default()
+        };
+
+        let summary = redacted_general_message_nsp_route_summary(&step).expect("summary");
+        let text = serde_json::to_string(&summary).expect("serialize");
+
+        assert_eq!(summary["stage"], json!("nsp_router"));
+        assert!(text.contains("[redacted local path]"));
+        assert!(!text.contains("/mnt/software"));
+        assert!(!text.contains("C:\\\\models"));
+        assert!(!text.contains("token=secret"));
+    }
+
+    #[test]
+    fn admin_string_redaction_preserves_plain_http_origin() {
+        let redacted = redact_admin_string("probe http://homeassistant.local:8123 ok");
+
+        assert!(redacted.contains("http://homeassistant.local:8123"));
     }
 
     #[test]
