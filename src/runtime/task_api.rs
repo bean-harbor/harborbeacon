@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -57,6 +58,11 @@ use crate::runtime::admin_console::{
 };
 #[cfg(test)]
 use crate::runtime::admin_console::{resolved_identity_binding_records, IdentityBindingRecord};
+use crate::runtime::evt_readiness::{
+    build_evt_evidence_bundle, build_evt_readiness_report, evt_evidence_reply_summary,
+    evt_long_run_request_boundary, evt_preflight_reply_summary, evt_preflight_workflow_summary,
+    evt_status_reply_summary, run_evt_preflight_report,
+};
 use crate::runtime::hub::{
     looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanRequest,
     HubScanResultItem,
@@ -474,6 +480,9 @@ enum GeneralMessagePlanKind {
     VisionEventSummary,
     VisionEventNotifyLatest,
     SystemReadiness,
+    EvtReadiness,
+    EvtPreflight,
+    EvtEvidenceBundle,
     #[allow(dead_code)]
     Unsupported,
 }
@@ -629,6 +638,7 @@ struct GeneralMessageControllerTrace {
 pub struct TaskApiService {
     admin_store: AdminConsoleStore,
     conversation_store: TaskConversationStore,
+    last_evt_preflight: Arc<Mutex<Option<Value>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -650,11 +660,26 @@ impl TaskApiService {
         Self {
             admin_store,
             conversation_store,
+            last_evt_preflight: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn conversation_store(&self) -> &TaskConversationStore {
         &self.conversation_store
+    }
+
+    fn record_last_evt_preflight(&self, preflight: &Value) {
+        let Ok(mut guard) = self.last_evt_preflight.lock() else {
+            return;
+        };
+        *guard = Some(preflight.clone());
+    }
+
+    fn last_evt_preflight(&self) -> Option<Value> {
+        self.last_evt_preflight
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     pub fn accept_or_replay_task(
@@ -2244,6 +2269,30 @@ impl TaskApiService {
                 }
                 self.handle_general_message_system_readiness(request)
             }
+            GeneralMessagePlanKind::EvtReadiness => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_evt_readiness(request)
+            }
+            GeneralMessagePlanKind::EvtPreflight => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_evt_preflight(request)
+            }
+            GeneralMessagePlanKind::EvtEvidenceBundle => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_evt_evidence_bundle(request)
+            }
             GeneralMessagePlanKind::Unsupported => {
                 if let Err(response) =
                     self.clear_general_message_loop_if_matches(request, prior_pending)
@@ -2959,6 +3008,168 @@ impl TaskApiService {
         )
     }
 
+    fn handle_general_message_evt_readiness(&self, request: &TaskRequest) -> TaskResponse {
+        let gateway_status = fetch_task_gateway_status().ok();
+        let readiness = match build_evt_readiness_report(&self.admin_store, gateway_status.as_ref())
+        {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                return self.failed(
+                    request,
+                    "agentic_interpreter",
+                    RiskLevel::Low,
+                    format!("读取 EVT 就绪状态失败：{}", redact_task_api_text(&error)),
+                );
+            }
+        };
+        let latest_preflight = self.last_evt_preflight();
+        let message = evt_status_reply_summary(&readiness, latest_preflight.as_ref());
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "evt.readiness_read",
+            EventSeverity::Info,
+            json!({
+                "status": readiness.get("status").and_then(Value::as_str).unwrap_or("degraded"),
+                "blocker_count": readiness
+                    .get("blockers")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0),
+                "warning_count": readiness
+                    .get("warnings")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0),
+                "metadata_only": true,
+                "redacted": true,
+            }),
+        ));
+        self.completed_with_context(
+            request,
+            "agentic_interpreter",
+            RiskLevel::Low,
+            message.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "evt_readiness",
+                    "summary": message,
+                    "readiness": readiness,
+                    "latest_preflight": evt_preflight_workflow_summary(latest_preflight),
+                    "redacted": true,
+                }
+            }),
+            Vec::new(),
+            vec![event],
+            vec!["帮我做一下EVT预检".to_string(), "生成压测证据".to_string()],
+        )
+    }
+
+    fn handle_general_message_evt_preflight(&self, request: &TaskRequest) -> TaskResponse {
+        let gateway_status = fetch_task_gateway_status().ok();
+        let preflight = match run_evt_preflight_report(&self.admin_store, gateway_status.as_ref()) {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                return self.failed(
+                    request,
+                    "agentic_interpreter",
+                    RiskLevel::Low,
+                    format!("运行 EVT 预检失败：{}", redact_task_api_text(&error)),
+                );
+            }
+        };
+        self.record_last_evt_preflight(&preflight);
+        let message = evt_preflight_reply_summary(&preflight);
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "evt.preflight_run",
+            EventSeverity::Info,
+            json!({
+                "status": preflight.get("status").and_then(Value::as_str).unwrap_or("degraded"),
+                "duration_ms": preflight.get("duration_ms").and_then(Value::as_u64),
+                "long_run_started": false,
+                "short_run_started": false,
+                "metadata_only": true,
+                "redacted": true,
+            }),
+        ));
+        self.completed_with_context(
+            request,
+            "agentic_interpreter",
+            RiskLevel::Low,
+            message.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "evt_preflight",
+                    "summary": message,
+                    "preflight": preflight,
+                    "redacted": true,
+                }
+            }),
+            Vec::new(),
+            vec![event],
+            vec!["压测前状态怎么样".to_string(), "生成压测证据".to_string()],
+        )
+    }
+
+    fn handle_general_message_evt_evidence_bundle(&self, request: &TaskRequest) -> TaskResponse {
+        let gateway_status = fetch_task_gateway_status().ok();
+        let readiness = match build_evt_readiness_report(&self.admin_store, gateway_status.as_ref())
+        {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                return self.failed(
+                    request,
+                    "agentic_interpreter",
+                    RiskLevel::Low,
+                    format!("生成 EVT 证据包失败：{}", redact_task_api_text(&error)),
+                );
+            }
+        };
+        let bundle = build_evt_evidence_bundle(
+            readiness,
+            self.last_evt_preflight(),
+            json!({
+                "source": "task_api.general_message",
+                "metadata_only": true,
+                "redacted": true,
+            }),
+        );
+        let message = evt_evidence_reply_summary(&bundle);
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "evt.evidence_bundle_generated",
+            EventSeverity::Info,
+            json!({
+                "status": bundle.get("status").and_then(Value::as_str).unwrap_or("degraded"),
+                "metadata_only": true,
+                "redacted": true,
+            }),
+        ));
+        self.completed_with_context(
+            request,
+            "agentic_interpreter",
+            RiskLevel::Low,
+            message.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "evt_evidence_bundle",
+                    "summary": message,
+                    "evidence_bundle": bundle,
+                    "redacted": true,
+                }
+            }),
+            Vec::new(),
+            vec![event],
+            vec![
+                "压测前状态怎么样".to_string(),
+                "帮我做一下EVT预检".to_string(),
+            ],
+        )
+    }
+
     fn general_message_capability_summary_response(
         &self,
         request: &TaskRequest,
@@ -2988,6 +3199,9 @@ impl TaskApiService {
                         "vision_event_notify_latest",
                         "ha_service_action",
                         "system_readiness",
+                        "evt_readiness",
+                        "evt_preflight",
+                        "evt_evidence_bundle",
                         "knowledge_search",
                         "rag_answer",
                     ],
@@ -3001,6 +3215,7 @@ impl TaskApiService {
                 "通知最新事件".to_string(),
                 "开灯".to_string(),
                 "状态".to_string(),
+                "压测前状态怎么样".to_string(),
             ],
         )
     }
@@ -3032,6 +3247,9 @@ impl TaskApiService {
                         "vision_event_notify_latest",
                         "ha_service_action",
                         "system_readiness",
+                        "evt_readiness",
+                        "evt_preflight",
+                        "evt_evidence_bundle",
                         "knowledge_search",
                         "rag_answer",
                     ],
@@ -6103,7 +6321,10 @@ fn clip_confirmation_active_frame_decision(plan: &GeneralMessagePlan) -> ActiveF
         | GeneralMessagePlanKind::HomeAssistantServiceAction
         | GeneralMessagePlanKind::VisionEventSummary
         | GeneralMessagePlanKind::VisionEventNotifyLatest
-        | GeneralMessagePlanKind::SystemReadiness => ActiveFrameDecision::Supersede,
+        | GeneralMessagePlanKind::SystemReadiness
+        | GeneralMessagePlanKind::EvtReadiness
+        | GeneralMessagePlanKind::EvtPreflight
+        | GeneralMessagePlanKind::EvtEvidenceBundle => ActiveFrameDecision::Supersede,
         GeneralMessagePlanKind::ConversationAct
             if plan.conversation_act == Some(GeneralMessageConversationAct::Cancel) =>
         {
@@ -9960,7 +10181,10 @@ fn general_message_nsp_validation_failure(
 }
 
 fn enforce_general_message_nsp_hard_guards(request: &TaskRequest, plan: &mut GeneralMessagePlan) {
-    if !general_message_external_boundary_hard_guard(request.intent.raw_text.as_str()) {
+    let long_run_requested = evt_long_run_request_boundary(request.intent.raw_text.as_str());
+    if !long_run_requested
+        && !general_message_external_boundary_hard_guard(request.intent.raw_text.as_str())
+    {
         return;
     }
     if matches!(
@@ -9970,17 +10194,30 @@ fn enforce_general_message_nsp_hard_guards(request: &TaskRequest, plan: &mut Gen
             Some(GeneralMessageConversationAct::Boundary)
         )
     ) {
-        return;
+        if !long_run_requested {
+            return;
+        }
     }
     plan.kind = GeneralMessagePlanKind::ConversationAct;
     plan.conversation_act = Some(GeneralMessageConversationAct::Boundary);
     plan.home_assistant_action = None;
     plan.camera_hint = None;
     plan.query = None;
-    plan.reply_text = None;
-    plan.canonical_phrase = Some("边界拒绝".to_string());
+    plan.reply_text = long_run_requested.then(|| {
+        "4h/72h 长压测必须走 operator supervisor，我不能从微信或 WebUI 启动；我可以帮你查看 EVT 就绪状态或生成脱敏证据包。"
+            .to_string()
+    });
+    plan.canonical_phrase = Some(if long_run_requested {
+        "长压测启动拒绝".to_string()
+    } else {
+        "边界拒绝".to_string()
+    });
     plan.confidence = plan.confidence.or(Some(100));
-    plan.reason = Some("nsp_boundary_hard_guard".to_string());
+    plan.reason = Some(if long_run_requested {
+        "evt_long_run_requires_operator_supervisor".to_string()
+    } else {
+        "nsp_boundary_hard_guard".to_string()
+    });
 }
 
 fn general_message_nsp_schema_valid(plan: &GeneralMessagePlan) -> bool {
@@ -10007,10 +10244,16 @@ fn general_message_plan_is_actionable_tool(kind: GeneralMessagePlanKind) -> bool
             | GeneralMessagePlanKind::VisionEventSummary
             | GeneralMessagePlanKind::VisionEventNotifyLatest
             | GeneralMessagePlanKind::SystemReadiness
+            | GeneralMessagePlanKind::EvtReadiness
+            | GeneralMessagePlanKind::EvtPreflight
+            | GeneralMessagePlanKind::EvtEvidenceBundle
     )
 }
 
 fn general_message_external_boundary_hard_guard(raw_text: &str) -> bool {
+    if evt_long_run_request_boundary(raw_text) {
+        return true;
+    }
     let normalized = normalize_command_text(raw_text).to_ascii_lowercase();
     if [
         "天气",
@@ -10062,6 +10305,9 @@ fn general_message_plan_decision_label(plan: &GeneralMessagePlan) -> &'static st
         GeneralMessagePlanKind::VisionEventSummary => "vision_event_summary",
         GeneralMessagePlanKind::VisionEventNotifyLatest => "vision_event_notify_latest",
         GeneralMessagePlanKind::SystemReadiness => "system_readiness",
+        GeneralMessagePlanKind::EvtReadiness => "evt_readiness",
+        GeneralMessagePlanKind::EvtPreflight => "evt_preflight",
+        GeneralMessagePlanKind::EvtEvidenceBundle => "evt_evidence_bundle",
         GeneralMessagePlanKind::ConversationAct => plan
             .conversation_act
             .map(GeneralMessageConversationAct::reply_pack_kind)
@@ -10088,14 +10334,19 @@ fn build_general_message_router_system_prompt() -> String {
         "\"conversation_act\":null,\"reply_text\":null,\"reason\":\"...\"}. ",
         "Closed decisions: capability_summary, camera_snapshot, camera_record_clip, ",
         "vision_event_summary, vision_event_notify_latest, ha_service_action, system_readiness, ",
-        "knowledge_search, rag_answer, clarify, conversation_continue, conversation_boundary, ",
+        "evt_readiness, evt_preflight, evt_evidence_bundle, knowledge_search, rag_answer, ",
+        "clarify, conversation_continue, conversation_boundary, ",
         "conversation_repair, conversation_cancel, conversation_clarify_continue. ",
         "For ha_service_action, fill only domain/service/entity_hint. Allowed HA outputs are ",
         "light/switch/input_boolean turn_on/turn_off/toggle and scene turn_on. ",
         "Never extract arbitrary service fields. Use confidence 0.75-0.99 for clear decisions; ",
         "do not copy 0.0 unless the request is genuinely unclear. Chinese semantic rules: ",
         "asking what Harbor/K3 can do means capability_summary; asking status/diagnostics/health ",
-        "of the home, WeChat entry, K3, HA, camera, or gateway means system_readiness; asking to ",
+        "of the home, WeChat entry, K3, HA, camera, or gateway means system_readiness; asking if ",
+        "K3 is ready for EVT/stress-test entry means evt_readiness; asking to run an EVT/pre-stress ",
+        "environment preflight means evt_preflight; asking to generate EVT/stress-test evidence ",
+        "means evt_evidence_bundle; asking to start/run a 4h or 72h stress test must be ",
+        "conversation_boundary because long runs require the operator supervisor; asking to ",
         "look/check/see the door/front/current camera means camera_snapshot; asking for a short ",
         "recording/video/clip means camera_record_clip; asking what the camera recently saw means ",
         "vision_event_summary; asking to send/share/notify the latest camera situation means ",
@@ -10197,6 +10448,15 @@ fn parse_general_message_router_decision(
             }
             "system_readiness" | "status" | "diagnostics" => {
                 return Some((GeneralMessagePlanKind::SystemReadiness, None))
+            }
+            "evt_readiness" | "evt_status" | "stress_readiness" => {
+                return Some((GeneralMessagePlanKind::EvtReadiness, None))
+            }
+            "evt_preflight" | "stress_preflight" => {
+                return Some((GeneralMessagePlanKind::EvtPreflight, None))
+            }
+            "evt_evidence_bundle" | "evt_evidence" | "stress_evidence" => {
+                return Some((GeneralMessagePlanKind::EvtEvidenceBundle, None))
             }
             "conversation" | "conversation_continue" | "continue" => {
                 return Some((
@@ -10355,6 +10615,9 @@ fn build_general_message_renderer_prompt(
             GeneralMessagePlanKind::VisionEventSummary => "vision_event_summary",
             GeneralMessagePlanKind::VisionEventNotifyLatest => "vision_event_notify_latest",
             GeneralMessagePlanKind::SystemReadiness => "system_readiness",
+            GeneralMessagePlanKind::EvtReadiness => "evt_readiness",
+            GeneralMessagePlanKind::EvtPreflight => "evt_preflight",
+            GeneralMessagePlanKind::EvtEvidenceBundle => "evt_evidence_bundle",
         },
         message = request.intent.raw_text,
         pending_loop = serde_json::to_string(&pending_loop.map(|pending| {
@@ -10519,6 +10782,9 @@ fn general_message_supported_examples() -> Vec<String> {
         "切换开关".to_string(),
         "执行测试场景".to_string(),
         "状态".to_string(),
+        "压测前状态怎么样".to_string(),
+        "帮我做一下EVT预检".to_string(),
+        "生成压测证据".to_string(),
         "帮我找到和樱花有关的文件".to_string(),
         "根据资料回答樱花计划是什么".to_string(),
     ]
@@ -10533,7 +10799,7 @@ fn general_message_support_summary_for_request(raw_text: &str) -> String {
 }
 
 fn general_message_support_summary() -> String {
-    "我可以作为 K3 家庭入口：摄像头抓拍/短视频、最近事件、通知最新事件、低风险家居动作、状态诊断，也能搜索/问答已有知识库；遇到多个家居实体时我会先让你选择，不会猜着执行。".to_string()
+    "我可以作为 K3 家庭入口：摄像头抓拍/短视频、最近事件、通知最新事件、低风险家居动作、状态诊断、EVT 就绪/预检/脱敏证据包，也能搜索/问答已有知识库；遇到多个家居实体时我会先让你选择，不会猜着执行，4h/72h 长压测必须走 operator supervisor。".to_string()
 }
 
 fn general_message_unsupported_summary() -> String {
@@ -10808,6 +11074,13 @@ fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePlan> {
         "system_readiness" | "status" | "diagnostics" => {
             (GeneralMessagePlanKind::SystemReadiness, None)
         }
+        "evt_readiness" | "evt_status" | "stress_readiness" => {
+            (GeneralMessagePlanKind::EvtReadiness, None)
+        }
+        "evt_preflight" | "stress_preflight" => (GeneralMessagePlanKind::EvtPreflight, None),
+        "evt_evidence_bundle" | "evt_evidence" | "stress_evidence" => {
+            (GeneralMessagePlanKind::EvtEvidenceBundle, None)
+        }
         "conversation" | "conversation_continue" | "continue" => (
             GeneralMessagePlanKind::ConversationAct,
             Some(payload_conversation_act.unwrap_or(GeneralMessageConversationAct::Continue)),
@@ -11006,6 +11279,24 @@ fn fallback_general_message_plan(
     let normalized = normalize_command_text(raw_text);
     if normalized.is_empty() {
         return None;
+    }
+
+    if evt_long_run_request_boundary(raw_text) {
+        return Some(GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::ConversationAct,
+            conversation_act: Some(GeneralMessageConversationAct::Boundary),
+            reply_text: Some(
+                "4h/72h 长压测必须走 operator supervisor，我不能从微信或 WebUI 启动；我可以帮你查看 EVT 就绪状态或生成脱敏证据包。"
+                    .to_string(),
+            ),
+            canonical_phrase: Some("长压测启动拒绝".to_string()),
+            camera_hint: None,
+            query: None,
+            home_assistant_action: None,
+            confidence: Some(100),
+            recent_clip: None,
+            reason: Some("evt_long_run_requires_operator_supervisor".to_string()),
+        });
     }
 
     if general_message_requests_capability_summary(raw_text) {
@@ -17344,6 +17635,12 @@ mod tests {
                 GeneralMessagePlanKind::VisionEventNotifyLatest,
             ),
             ("system_readiness", GeneralMessagePlanKind::SystemReadiness),
+            ("evt_readiness", GeneralMessagePlanKind::EvtReadiness),
+            ("evt_preflight", GeneralMessagePlanKind::EvtPreflight),
+            (
+                "evt_evidence_bundle",
+                GeneralMessagePlanKind::EvtEvidenceBundle,
+            ),
             ("knowledge_search", GeneralMessagePlanKind::KnowledgeSearch),
             ("rag_answer", GeneralMessagePlanKind::RagAnswer),
         ];
@@ -17374,6 +17671,8 @@ mod tests {
         assert!(prompt.contains("\"confidence\":0.95"));
         assert!(prompt.contains("do not copy 0.0"));
         assert!(prompt.contains("asking status/diagnostics/health"));
+        assert!(prompt.contains("evt_readiness, evt_preflight, evt_evidence_bundle"));
+        assert!(prompt.contains("4h or 72h stress test"));
         assert!(prompt.contains("default notification"));
         assert!(prompt.contains("\"domain\":\"scene\",\"service\":\"turn_on\""));
     }
@@ -17413,6 +17712,70 @@ mod tests {
             lock_plan.conversation_act,
             Some(GeneralMessageConversationAct::Boundary)
         );
+
+        let long_run_request = general_message_test_request(
+            "nsp_boundary_evt_long_run",
+            "开始72小时压测",
+            Value::Null,
+        );
+        let mut long_run_plan =
+            parse_general_message_plan(r#"{"decision":"evt_preflight","confidence":0.95}"#)
+                .expect("long run plan");
+
+        super::enforce_general_message_nsp_hard_guards(&long_run_request, &mut long_run_plan);
+
+        assert_eq!(long_run_plan.kind, GeneralMessagePlanKind::ConversationAct);
+        assert_eq!(
+            long_run_plan.conversation_act,
+            Some(GeneralMessageConversationAct::Boundary)
+        );
+        assert_eq!(
+            long_run_plan.reason.as_deref(),
+            Some("evt_long_run_requires_operator_supervisor")
+        );
+        assert!(long_run_plan
+            .reply_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("operator supervisor"));
+    }
+
+    #[test]
+    fn general_message_evt_preflight_runs_short_guard_only() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-evt-preflight");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "evt_preflight",
+                "confidence": 0.94,
+                "canonical_phrase": "EVT预检",
+                "reason": "user asks for pre-stress environment preflight"
+            }"#,
+        );
+
+        let response = service.handle_task(general_message_test_request(
+            "evt_preflight",
+            "帮我做一下EVT预检",
+            Value::Null,
+        ));
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.data["reply_pack"]["kind"], "evt_preflight");
+        assert_eq!(
+            response.result.data["reply_pack"]["preflight"]["long_run_started"],
+            json!(false)
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["preflight"]["short_run_started"],
+            json!(false)
+        );
+        let text = serde_json::to_string(&response.result.data).expect("serialize reply");
+        assert!(!text.contains("rtsp://"));
+        assert!(!text.contains("Bearer "));
+        assert!(!text.contains("data:image"));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
     }
 
     #[test]
@@ -17593,7 +17956,7 @@ mod tests {
             response.result.data["reply_pack"]["examples"]
                 .as_array()
                 .map(Vec::len),
-            Some(11)
+            Some(14)
         );
         assert!(response.result.data["reply_pack"]["capabilities"]
             .as_array()
@@ -17605,6 +17968,11 @@ mod tests {
             .expect("capabilities")
             .iter()
             .any(|capability| capability.as_str() == Some("vision_event_notify_latest")));
+        assert!(response.result.data["reply_pack"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .any(|capability| capability.as_str() == Some("evt_preflight")));
         assert!(response.result.data["reply_pack"]["examples"]
             .as_array()
             .expect("examples")

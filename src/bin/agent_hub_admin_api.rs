@@ -66,6 +66,10 @@ use harborbeacon_local_agent::runtime::dvr::{
     apply_retention_policy, build_status_response, dvr_media_preview_path, media_library_root_path,
     scan_timeline, store_snapshot_bytes, DvrRecordingSettings, DvrRuntime, DvrTimelineSegment,
 };
+use harborbeacon_local_agent::runtime::evt_readiness::{
+    build_evt_evidence_bundle, build_evt_readiness_report, evt_preflight_workflow_summary,
+    evt_readiness_workflow_summary, run_evt_preflight_report,
+};
 use harborbeacon_local_agent::runtime::hub::{
     CameraConnectRequest, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
     HubStateSnapshot,
@@ -221,6 +225,7 @@ pub struct AdminApi {
     model_runtime_activation: Option<ModelRuntimeActivationHandler>,
     last_event_notification_attempt: Arc<Mutex<Option<Value>>>,
     last_home_assistant_service_action: Arc<Mutex<Option<Value>>>,
+    last_evt_preflight: Arc<Mutex<Option<Value>>>,
 }
 
 pub(crate) type ModelRuntimeActivationHandler = Arc<
@@ -1353,6 +1358,7 @@ impl AdminApi {
             model_runtime_activation: None,
             last_event_notification_attempt: Arc::new(Mutex::new(None)),
             last_home_assistant_service_action: Arc::new(Mutex::new(None)),
+            last_evt_preflight: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1397,6 +1403,20 @@ impl AdminApi {
 
     fn last_home_assistant_service_action(&self) -> Option<Value> {
         self.last_home_assistant_service_action
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn record_last_evt_preflight(&self, preflight: &Value) {
+        let Ok(mut guard) = self.last_evt_preflight.lock() else {
+            return;
+        };
+        *guard = Some(preflight.clone());
+    }
+
+    fn last_evt_preflight(&self) -> Option<Value> {
+        self.last_evt_preflight
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
@@ -1506,6 +1526,18 @@ impl AdminApi {
             }
             Method::Get if path == "/api/rag/readiness" => {
                 self.handle_rag_readiness(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/evt/readiness" => {
+                self.handle_evt_readiness(&identity_hints).boxed()
+            }
+            Method::Post if path == "/api/evt/preflight" => {
+                self.handle_run_evt_preflight(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/evt/preflight/latest" => {
+                self.handle_latest_evt_preflight(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/evt/evidence-bundle" => {
+                self.handle_evt_evidence_bundle(&identity_hints).boxed()
             }
             Method::Get if path == "/api/diagnostics/redacted-bundle" => self
                 .handle_redacted_diagnostics_bundle(&identity_hints)
@@ -2157,6 +2189,73 @@ impl AdminApi {
         }
     }
 
+    fn handle_evt_readiness(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let live_gateway_status = fetch_remote_gateway_status().ok();
+        match build_evt_readiness_report(&self.admin_store, live_gateway_status.as_ref()) {
+            Ok(readiness) => ok_json(&readiness),
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+    }
+
+    fn handle_run_evt_preflight(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let live_gateway_status = fetch_remote_gateway_status().ok();
+        match run_evt_preflight_report(&self.admin_store, live_gateway_status.as_ref()) {
+            Ok(preflight) => {
+                self.record_last_evt_preflight(&preflight);
+                ok_json(&preflight)
+            }
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+    }
+
+    fn handle_latest_evt_preflight(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        ok_json(&evt_preflight_workflow_summary(self.last_evt_preflight()))
+    }
+
+    fn handle_evt_evidence_bundle(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let live_gateway_status = fetch_remote_gateway_status().ok();
+        let readiness =
+            match build_evt_readiness_report(&self.admin_store, live_gateway_status.as_ref()) {
+                Ok(readiness) => readiness,
+                Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+            };
+        let diagnostics_workflow = build_evt_diagnostics_workflow(
+            &readiness,
+            self.last_evt_preflight(),
+            self.last_event_notification_attempt(),
+            self.last_home_assistant_service_action(),
+            build_latest_general_message_nsp_route_workflow(&self.task_service),
+            build_latest_home_assistant_task_api_workflow(&self.task_service),
+        );
+        let bundle =
+            build_evt_evidence_bundle(readiness, self.last_evt_preflight(), diagnostics_workflow);
+        ok_json(&bundle)
+    }
+
     fn handle_redacted_diagnostics_bundle(
         &self,
         hints: &AccessIdentityHints,
@@ -2178,6 +2277,16 @@ impl AdminApi {
                 admin_state.home_assistant,
             );
         let live_gateway_status = fetch_remote_gateway_status().ok();
+        let evt_readiness =
+            build_evt_readiness_report(&self.admin_store, live_gateway_status.as_ref())
+                .unwrap_or_else(|error| {
+                    json!({
+                        "kind": "evt_readiness_v1",
+                        "status": "blocked",
+                        "error": redact_admin_string(&error),
+                        "redacted": true,
+                    })
+                });
         let bundle = build_redacted_diagnostics_bundle(
             &redacted_state,
             &build_home_assistant_status_response(&home_assistant),
@@ -2186,6 +2295,8 @@ impl AdminApi {
             self.last_home_assistant_service_action(),
             build_latest_general_message_nsp_route_workflow(&self.task_service),
             build_latest_home_assistant_task_api_workflow(&self.task_service),
+            evt_readiness,
+            self.last_evt_preflight(),
             &admin_state.notification_targets,
             live_gateway_status.as_ref(),
         );
@@ -7162,6 +7273,10 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/release/readiness/run"
         || path == "/api/hardware/readiness"
         || path == "/api/rag/readiness"
+        || path == "/api/evt/readiness"
+        || path == "/api/evt/preflight"
+        || path == "/api/evt/preflight/latest"
+        || path == "/api/evt/evidence-bundle"
         || path == "/api/diagnostics/redacted-bundle"
         || path == "/api/knowledge/settings"
         || path == "/api/knowledge/search"
@@ -9783,6 +9898,8 @@ fn build_redacted_diagnostics_bundle(
     last_home_assistant_service_action: Option<Value>,
     last_general_message_nsp_route: Value,
     last_home_assistant_task_api_workflow: Value,
+    evt_readiness: Value,
+    last_evt_preflight: Option<Value>,
     notification_targets: &[NotificationTargetRecord],
     gateway_status: Option<&Value>,
 ) -> RedactedDiagnosticsBundleResponse {
@@ -9855,6 +9972,8 @@ fn build_redacted_diagnostics_bundle(
             })),
             "general_message_nsp_route": last_general_message_nsp_route,
             "home_assistant_task_api_workflow": last_home_assistant_task_api_workflow,
+            "evt_readiness": evt_readiness_workflow_summary(&evt_readiness),
+            "evt_preflight": evt_preflight_workflow_summary(last_evt_preflight),
             "default_notification_target": build_default_notification_target_readiness(
                 notification_targets,
                 gateway_status,
@@ -9907,6 +10026,31 @@ fn build_redacted_diagnostics_bundle(
             "created_at": now_unix_string(),
         }),
     }
+}
+
+fn build_evt_diagnostics_workflow(
+    evt_readiness: &Value,
+    last_evt_preflight: Option<Value>,
+    last_event_notification_attempt: Option<Value>,
+    last_home_assistant_service_action: Option<Value>,
+    last_general_message_nsp_route: Value,
+    last_home_assistant_task_api_workflow: Value,
+) -> Value {
+    json!({
+        "event_notification": last_event_notification_attempt.unwrap_or_else(|| json!({
+            "status": "not_run",
+            "message": "No event notification has been attempted in this API process.",
+        })),
+        "home_assistant_service_action": last_home_assistant_service_action.unwrap_or_else(|| json!({
+            "status": "not_run",
+            "message": "No Home Assistant service action has been attempted in this API process.",
+        })),
+        "general_message_nsp_route": last_general_message_nsp_route,
+        "home_assistant_task_api_workflow": last_home_assistant_task_api_workflow,
+        "evt_readiness": evt_readiness_workflow_summary(evt_readiness),
+        "evt_preflight": evt_preflight_workflow_summary(last_evt_preflight),
+        "redacted": true,
+    })
 }
 
 fn systemd_service_summary(service: &str) -> Value {
@@ -16099,6 +16243,22 @@ mod tests {
                 "status": "not_run",
                 "redacted": true,
             }),
+            json!({
+                "kind": "evt_readiness_v1",
+                "profile": "k3-direct-72h-readiness",
+                "status": "degraded",
+                "blockers": [],
+                "warnings": ["test"],
+                "redacted": true,
+            }),
+            Some(json!({
+                "kind": "evt_preflight_v1",
+                "profile": "k3-direct-72h-readiness",
+                "status": "degraded",
+                "long_run_started": false,
+                "short_run_started": false,
+                "redacted": true,
+            })),
             &[],
             None,
         );
@@ -16108,6 +16268,14 @@ mod tests {
         assert_eq!(
             bundle.workflow["general_message_nsp_route"]["status"],
             json!("not_run")
+        );
+        assert_eq!(
+            bundle.workflow["evt_readiness"]["status"],
+            json!("degraded")
+        );
+        assert_eq!(
+            bundle.workflow["evt_preflight"]["long_run_started"],
+            json!(false)
         );
         assert!(!text.contains("token=secret"));
         assert!(!text.contains("rtsp://"));

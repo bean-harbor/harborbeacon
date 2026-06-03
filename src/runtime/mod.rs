@@ -6,6 +6,7 @@ pub mod automation;
 pub mod discovery;
 pub mod dvr;
 pub mod events;
+pub mod evt_readiness;
 pub mod hub;
 pub mod knowledge;
 pub mod knowledge_index;
