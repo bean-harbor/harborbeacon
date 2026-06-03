@@ -105,6 +105,36 @@ pub struct PendingTaskGeneralMessageLoop {
     pub camera_hint: Option<String>,
     #[serde(default)]
     pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_assistant: Option<PendingTaskHomeAssistantClarification>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PendingTaskHomeAssistantClarification {
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub service: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_hint: Option<String>,
+    #[serde(default)]
+    pub candidates: Vec<PendingTaskHomeAssistantCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PendingTaskHomeAssistantCandidate {
+    #[serde(default)]
+    pub entity_id: String,
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_class: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -873,6 +903,23 @@ impl TaskConversationStore {
         Ok(events)
     }
 
+    pub fn recent_events(&self, limit: usize) -> Result<Vec<EventRecord>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let file = self.load_file()?;
+        let mut events = file.events.values().cloned().collect::<Vec<_>>();
+        events.sort_by(|left, right| {
+            left.occurred_at
+                .cmp(&right.occurred_at)
+                .then(left.event_id.cmp(&right.event_id))
+        });
+        if events.len() > limit {
+            events = events.split_off(events.len() - limit);
+        }
+        Ok(events)
+    }
+
     pub fn replace_events_for_step(
         &self,
         task_id: &str,
@@ -1535,6 +1582,7 @@ mod tests {
             selected_candidate_action: None,
             camera_hint: Some("front-door".to_string()),
             query: None,
+            home_assistant: None,
         };
         let mut state = TaskConversationState {
             key: "chat-general".to_string(),

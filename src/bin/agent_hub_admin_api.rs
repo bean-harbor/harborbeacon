@@ -36,6 +36,7 @@ use harborbeacon_local_agent::connectors::notifications::{
     NotificationDeliveryError, NotificationDeliveryRecord, NotificationDeliveryService,
 };
 use harborbeacon_local_agent::connectors::storage::StorageTarget;
+use harborbeacon_local_agent::control_plane::events::EventRecord;
 use harborbeacon_local_agent::control_plane::media::{
     MediaAsset, MediaAssetKind, MediaSession, MediaSessionStatus, ShareLink,
 };
@@ -2182,6 +2183,7 @@ impl AdminApi {
             &runtime_projection,
             self.last_event_notification_attempt(),
             self.last_home_assistant_service_action(),
+            build_latest_home_assistant_task_api_workflow(&self.task_service),
             &admin_state.notification_targets,
             live_gateway_status.as_ref(),
         );
@@ -9609,12 +9611,98 @@ fn build_inference_health_alias_response(
     }
 }
 
+fn build_latest_home_assistant_task_api_workflow(task_service: &TaskApiService) -> Value {
+    let events = match task_service.conversation_store().recent_events(200) {
+        Ok(events) => events,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "message": redact_admin_string(&error),
+                "redacted": true,
+            })
+        }
+    };
+    let summaries = events
+        .iter()
+        .filter_map(redacted_home_assistant_task_api_event_summary)
+        .collect::<Vec<_>>();
+    let Some(latest_event) = summaries.last().cloned() else {
+        return json!({
+            "status": "not_run",
+            "message": "No Home Assistant Task API workflow evidence has been recorded.",
+            "redacted": true,
+        });
+    };
+    let recent_events = summaries
+        .iter()
+        .rev()
+        .take(6)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    json!({
+        "status": "available",
+        "redacted": true,
+        "latest_event": latest_event,
+        "recent_events": recent_events,
+    })
+}
+
+fn redacted_home_assistant_task_api_event_summary(event: &EventRecord) -> Option<Value> {
+    if !event
+        .event_type
+        .starts_with("home_assistant.service_action")
+    {
+        return None;
+    }
+    let payload = &event.payload;
+    Some(json!({
+        "event_type": event.event_type,
+        "status": json_string_at_paths(payload, &["/status", "/outcome"]),
+        "domain": json_string_at_paths(payload, &["/domain", "/entity/domain", "/request/domain"]),
+        "service": json_string_at_paths(payload, &["/service", "/entity/service", "/request/service"]),
+        "entity_id": json_string_at_paths(payload, &["/entity_id", "/entity/entity_id", "/request/entity_id"]),
+        "candidate_count": json_usize_at_paths(payload, &["/candidate_count"]),
+        "reason": json_string_at_paths(payload, &["/reason"]),
+        "occurred_at": event.occurred_at,
+        "redacted": true,
+    }))
+}
+
+fn json_string_at_paths(value: &Value, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        value
+            .pointer(path)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn json_usize_at_paths(value: &Value, paths: &[&str]) -> Option<usize> {
+    paths.iter().find_map(|path| {
+        let value = value.pointer(path)?;
+        value
+            .as_u64()
+            .and_then(|number| usize::try_from(number).ok())
+            .or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|text| text.trim().parse::<usize>().ok())
+            })
+    })
+}
+
 fn build_redacted_diagnostics_bundle(
     state: &StateResponse,
     home_assistant: &HomeAssistantStatusResponse,
     runtime: &LocalModelRuntimeProjection,
     last_event_notification_attempt: Option<Value>,
     last_home_assistant_service_action: Option<Value>,
+    last_home_assistant_task_api_workflow: Value,
     notification_targets: &[NotificationTargetRecord],
     gateway_status: Option<&Value>,
 ) -> RedactedDiagnosticsBundleResponse {
@@ -9685,6 +9773,7 @@ fn build_redacted_diagnostics_bundle(
                 "status": "not_run",
                 "message": "No Home Assistant service action has been attempted in this API process.",
             })),
+            "home_assistant_task_api_workflow": last_home_assistant_task_api_workflow,
             "default_notification_target": build_default_notification_target_readiness(
                 notification_targets,
                 gateway_status,
@@ -15579,14 +15668,16 @@ mod tests {
         percent_decode_path_segment, probe_local_model_runtime, redact_account_management_snapshot,
         redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
-        redact_value_stream_credentials, release_item, request_identity_hints,
-        resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
-        run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
-        scan_request_task_args, url_encode_path_segment, validate_home_assistant_service_fields,
-        validate_home_assistant_service_smoke, AdminApi, HomeAssistantServiceSmokeRequest,
-        KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
-        ModelRuntimeActivationRequest, ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
+        redact_value_stream_credentials, redacted_home_assistant_task_api_event_summary,
+        release_item, request_identity_hints, resolve_harbor_assistant_asset_path,
+        resolve_knowledge_preview_path, run_knowledge_index_jobs, run_model_download_job,
+        run_model_download_transfer, scan_request_task_args, url_encode_path_segment,
+        validate_home_assistant_service_fields, validate_home_assistant_service_smoke, AdminApi,
+        HomeAssistantServiceSmokeRequest, KnowledgeSearchApiRequest, LocalModelRuntimeProjection,
+        ManualAddRequest, ModelRuntimeActivationRequest, ModelRuntimeActivationResult,
+        DEFAULT_HF_ENDPOINT,
     };
+    use harborbeacon_local_agent::control_plane::events::EventRecord;
     use harborbeacon_local_agent::control_plane::media::{
         MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
         ShareLink,
@@ -15850,6 +15941,10 @@ mod tests {
             &LocalModelRuntimeProjection::default(),
             None,
             None,
+            json!({
+                "status": "not_run",
+                "redacted": true,
+            }),
             &[],
             None,
         );
@@ -15862,6 +15957,39 @@ mod tests {
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn home_assistant_task_api_workflow_summary_is_metadata_only() {
+        let event = EventRecord {
+            event_id: "event-1".to_string(),
+            workspace_id: "home-1".to_string(),
+            source_id: "task-1".to_string(),
+            event_type: "home_assistant.service_action_clarification_required".to_string(),
+            payload: json!({
+                "status": "needs_input",
+                "domain": "scene",
+                "service": "turn_on",
+                "candidate_count": 2,
+                "reason": "ambiguous_entity",
+                "message": "token=secret Bearer abc rtsp://camera.local/stream",
+            }),
+            occurred_at: Some("1710000000".to_string()),
+            ..Default::default()
+        };
+
+        let summary =
+            redacted_home_assistant_task_api_event_summary(&event).expect("summary event");
+        let text = serde_json::to_string(&summary).expect("serialize summary");
+
+        assert_eq!(summary["status"], json!("needs_input"));
+        assert_eq!(summary["domain"], json!("scene"));
+        assert_eq!(summary["service"], json!("turn_on"));
+        assert_eq!(summary["candidate_count"], json!(2));
+        assert_eq!(summary["redacted"], json!(true));
+        assert!(!text.contains("token=secret"));
+        assert!(!text.contains("Bearer abc"));
+        assert!(!text.contains("rtsp://"));
     }
 
     #[test]
