@@ -283,11 +283,13 @@ fn runtime_model_id_for_activation(config: &ModelApiConfig, kind: ModelKind) -> 
         ModelKind::Llm => Some(match config.backend {
             BackendKind::Candle => config.candle.chat_model_id.clone(),
             BackendKind::OpenAIProxy => config.chat_model.clone(),
+            BackendKind::SemanticRouter => config.chat_model.clone(),
         }),
-        ModelKind::Embedder => Some(match config.backend {
-            BackendKind::Candle => config.candle.embedding_model_id.clone(),
-            BackendKind::OpenAIProxy => config.embedding_model.clone(),
-        }),
+        ModelKind::Embedder => match config.backend {
+            BackendKind::Candle => Some(config.candle.embedding_model_id.clone()),
+            BackendKind::OpenAIProxy => Some(config.embedding_model.clone()),
+            BackendKind::SemanticRouter => None,
+        },
         _ => None,
     }
 }

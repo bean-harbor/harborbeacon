@@ -2,6 +2,7 @@
 //! VLM summary execution.
 
 use base64::Engine as _;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,6 +35,12 @@ const SEMANTIC_ROUTER_POLICY_ID: &str = "semantic.router";
 const VLM_POLICY_ID: &str = "retrieval.vision_summary";
 const DEFAULT_ADMIN_STATE_PATH: &str = ".harborbeacon/admin-console.json";
 const DEFAULT_TESSERACT_LANGS: &str = "chi_sim+eng";
+const SEMANTIC_ROUTER_BASE_URL_ENV: &str = "HARBOR_SEMANTIC_ROUTER_BASE_URL";
+const SEMANTIC_ROUTER_HEALTHZ_URL_ENV: &str = "HARBOR_SEMANTIC_ROUTER_HEALTHZ_URL";
+const SEMANTIC_ROUTER_TOKEN_ENV: &str = "HARBOR_SEMANTIC_ROUTER_TOKEN";
+const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
+const DEFAULT_SEMANTIC_ROUTER_BASE_URL: &str = "http://127.0.0.1:4176/v1";
+const DEFAULT_SEMANTIC_ROUTER_MODEL: &str = "Qwen/Qwen2.5-0.5B-Instruct";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelEndpointTestResult {
@@ -617,6 +624,7 @@ fn semantic_router_local_only_model_state(state: &AdminModelCenterState) -> Admi
     local_state
         .endpoints
         .retain(|endpoint| endpoint.endpoint_kind != ModelEndpointKind::Cloud);
+    wire_semantic_router_resident_endpoint(&mut local_state);
     for policy in &mut local_state.route_policies {
         if policy.route_policy_id == SEMANTIC_ROUTER_POLICY_ID {
             policy.privacy_level = PrivacyLevel::StrictLocal;
@@ -633,6 +641,111 @@ fn semantic_router_local_only_model_state(state: &AdminModelCenterState) -> Admi
         }
     }
     local_state
+}
+
+pub(crate) fn wire_semantic_router_resident_endpoint(state: &mut AdminModelCenterState) {
+    let base_url = env_trimmed(SEMANTIC_ROUTER_BASE_URL_ENV)
+        .map(|value| value.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| DEFAULT_SEMANTIC_ROUTER_BASE_URL.to_string());
+    let healthz_url = env_trimmed(SEMANTIC_ROUTER_HEALTHZ_URL_ENV)
+        .unwrap_or_else(|| infer_healthz_url(&base_url));
+    let api_key = env_trimmed(SEMANTIC_ROUTER_TOKEN_ENV)
+        .or_else(|| env_trimmed(MODEL_API_TOKEN_ENV))
+        .unwrap_or_default();
+
+    let has_explicit_router = state.endpoints.iter().any(|endpoint| {
+        endpoint.model_kind == ModelKind::Llm
+            && endpoint.endpoint_kind == ModelEndpointKind::Local
+            && endpoint.status != ModelEndpointStatus::Disabled
+            && (endpoint
+                .capability_tags
+                .iter()
+                .any(|tag| matches_semantic_router_tag(tag))
+                || metadata_bool(&endpoint.metadata, "semantic_router"))
+    });
+
+    let mut wired_any = false;
+    for endpoint in state.endpoints.iter_mut() {
+        if endpoint.model_kind != ModelKind::Llm
+            || endpoint.endpoint_kind != ModelEndpointKind::Local
+            || endpoint.status == ModelEndpointStatus::Disabled
+            || !endpoint
+                .provider_key
+                .eq_ignore_ascii_case("openai_compatible")
+        {
+            continue;
+        }
+        let is_explicit_router = endpoint
+            .capability_tags
+            .iter()
+            .any(|tag| matches_semantic_router_tag(tag))
+            || metadata_bool(&endpoint.metadata, "semantic_router");
+        let is_builtin_default = endpoint.model_endpoint_id == "llm-local-openai-compatible";
+        if !is_explicit_router && !(is_builtin_default && !has_explicit_router) {
+            continue;
+        }
+        mark_semantic_router_resident_endpoint(endpoint, &base_url, &healthz_url, &api_key);
+        wired_any = true;
+    }
+
+    if wired_any {
+        return;
+    }
+
+    let mut endpoint = ModelEndpoint {
+        model_endpoint_id: "llm-local-semantic-router".to_string(),
+        workspace_id: Some("home-1".to_string()),
+        provider_account_id: None,
+        model_kind: ModelKind::Llm,
+        endpoint_kind: ModelEndpointKind::Local,
+        provider_key: "openai_compatible".to_string(),
+        model_name: DEFAULT_SEMANTIC_ROUTER_MODEL.to_string(),
+        capability_tags: Vec::new(),
+        cost_policy: json!({"cost_hint": "local_candle"}),
+        status: ModelEndpointStatus::Degraded,
+        metadata: json!({"builtin": true}),
+    };
+    mark_semantic_router_resident_endpoint(&mut endpoint, &base_url, &healthz_url, &api_key);
+    state.endpoints.push(endpoint);
+}
+
+fn mark_semantic_router_resident_endpoint(
+    endpoint: &mut ModelEndpoint,
+    base_url: &str,
+    healthz_url: &str,
+    api_key: &str,
+) {
+    for tag in [
+        "chat",
+        "local_first",
+        "semantic_router",
+        "assistant_input_parser",
+        "k3_nsp",
+    ] {
+        if !endpoint.capability_tags.iter().any(|value| value == tag) {
+            endpoint.capability_tags.push(tag.to_string());
+        }
+    }
+    endpoint.capability_tags.sort();
+    endpoint.capability_tags.dedup();
+    set_metadata_string(&mut endpoint.metadata, "base_url", base_url.to_string());
+    set_metadata_string(
+        &mut endpoint.metadata,
+        "healthz_url",
+        healthz_url.to_string(),
+    );
+    set_metadata_bool(&mut endpoint.metadata, "semantic_router", true);
+    set_metadata_bool(&mut endpoint.metadata, "local_only", true);
+    set_metadata_bool(&mut endpoint.metadata, "cloud_fallback_allowed", false);
+    set_metadata_bool(
+        &mut endpoint.metadata,
+        "semantic_router_resident_endpoint",
+        true,
+    );
+    if !api_key.trim().is_empty() {
+        set_metadata_string(&mut endpoint.metadata, "api_key", api_key.to_string());
+        set_metadata_bool(&mut endpoint.metadata, "api_key_configured", true);
+    }
 }
 
 fn run_llm_text_on_endpoint(
@@ -1216,8 +1329,12 @@ fn overlay_endpoints_with_runtime_truth(
             let mut overlayed = endpoint.clone();
             if let Some(default_endpoint) = builtin_defaults.get(&overlayed.model_endpoint_id) {
                 if is_builtin_local_openai_endpoint(default_endpoint) {
+                    let resident_router_endpoint =
+                        metadata_bool(&overlayed.metadata, "semantic_router_resident_endpoint");
                     let legacy_base_url = metadata_string(&overlayed.metadata, "base_url")
-                        .is_some_and(|value| is_legacy_model_api_url(&value));
+                        .is_some_and(|value| {
+                            is_legacy_model_api_url(&value) && !resident_router_endpoint
+                        });
                     if metadata_missing_or_empty(&overlayed.metadata, "base_url") || legacy_base_url
                     {
                         set_metadata_string(
@@ -1236,7 +1353,9 @@ fn overlay_endpoints_with_runtime_truth(
                         }
                     }
                     let legacy_healthz_url = metadata_string(&overlayed.metadata, "healthz_url")
-                        .is_some_and(|value| is_legacy_model_api_url(&value));
+                        .is_some_and(|value| {
+                            is_legacy_model_api_url(&value) && !resident_router_endpoint
+                        });
                     if metadata_missing_or_empty(&overlayed.metadata, "healthz_url")
                         || legacy_healthz_url
                     {
@@ -1526,6 +1645,13 @@ fn metadata_missing_or_empty(metadata: &Value, key: &str) -> bool {
     metadata_string(metadata, key).is_none()
 }
 
+fn env_trimmed(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn is_legacy_model_api_url(value: &str) -> bool {
     let normalized = value.trim().to_ascii_lowercase();
     normalized.contains("127.0.0.1:4176") || normalized.contains("localhost:4176")
@@ -1706,7 +1832,7 @@ mod tests {
         clear_local_runtime_projection_cache, connectivity_url,
         openai_compatible_config_from_endpoint, redact_model_endpoint, run_embedding_with_state,
         run_llm_text_with_state, run_llm_text_with_state_and_options, run_vlm_summary_with_state,
-        test_model_endpoint, LlmTextOptions,
+        semantic_router_local_only_model_state, test_model_endpoint, LlmTextOptions,
     };
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
@@ -1715,6 +1841,29 @@ mod tests {
     use crate::runtime::admin_console::AdminModelCenterState;
 
     static MODEL_RUNTIME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.as_ref() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn redact_model_endpoint_masks_api_keys() {
@@ -2279,6 +2428,110 @@ mod tests {
             result.details["attempted_endpoints"],
             json!(["llm-local-openai-compatible"])
         );
+    }
+
+    #[test]
+    fn semantic_router_local_only_state_wires_resident_endpoint() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        let _base_url = EnvVarGuard::set(
+            "HARBOR_SEMANTIC_ROUTER_BASE_URL",
+            "http://127.0.0.1:4176/v1",
+        );
+        let _healthz = EnvVarGuard::set(
+            "HARBOR_SEMANTIC_ROUTER_HEALTHZ_URL",
+            "http://127.0.0.1:4176/healthz",
+        );
+        let state = AdminModelCenterState {
+            endpoints: vec![
+                ModelEndpoint {
+                    model_endpoint_id: "llm-local-openai-compatible".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Local,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "harbor-local-chat".to_string(),
+                    capability_tags: vec!["chat".to_string(), "local_first".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Degraded,
+                    metadata: json!({
+                        "builtin": true,
+                        "base_url": "http://127.0.0.1:4174/api/inference/v1",
+                        "healthz_url": "http://127.0.0.1:4174/api/inference/healthz",
+                    }),
+                },
+                ModelEndpoint {
+                    model_endpoint_id: "llm-cloud-siliconflow".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Cloud,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
+                    capability_tags: vec!["cloud_fallback".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "base_url": "https://api.siliconflow.cn/v1",
+                        "api_key": "configured",
+                    }),
+                },
+            ],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "semantic.router".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "semantic".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({"capability": "router"}),
+            }],
+            ..AdminModelCenterState::default()
+        };
+
+        let local_state = semantic_router_local_only_model_state(&state);
+        let endpoint = local_state
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible")
+            .expect("resident semantic router endpoint");
+        assert_eq!(
+            endpoint.metadata["base_url"],
+            json!("http://127.0.0.1:4176/v1")
+        );
+        assert_eq!(
+            endpoint.metadata["healthz_url"],
+            json!("http://127.0.0.1:4176/healthz")
+        );
+        assert_eq!(endpoint.metadata["semantic_router"], json!(true));
+        assert_eq!(endpoint.metadata["local_only"], json!(true));
+        assert_eq!(
+            endpoint.metadata["semantic_router_resident_endpoint"],
+            json!(true)
+        );
+        assert!(endpoint
+            .capability_tags
+            .iter()
+            .any(|tag| tag == "semantic_router"));
+        assert!(!local_state
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.endpoint_kind == ModelEndpointKind::Cloud));
+        let router_policy = local_state
+            .route_policies
+            .iter()
+            .find(|policy| policy.route_policy_id == "semantic.router")
+            .expect("router policy");
+        assert_eq!(router_policy.privacy_level, PrivacyLevel::StrictLocal);
+        assert!(!router_policy
+            .fallback_order
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case("cloud")));
     }
 
     #[test]
