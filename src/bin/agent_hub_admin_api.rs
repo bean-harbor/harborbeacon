@@ -44,6 +44,9 @@ use harborbeacon_local_agent::control_plane::models::{
     ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
     PrivacyLevel,
 };
+use harborbeacon_local_agent::control_plane::routing::{
+    build_routing_status, RoutingRuntimeProjection,
+};
 use harborbeacon_local_agent::control_plane::tasks::TaskStepRun;
 use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
 use harborbeacon_local_agent::runtime::access_control::{
@@ -1618,6 +1621,9 @@ impl AdminApi {
             Method::Get if path == "/api/diagnostics/redacted-bundle" => self
                 .handle_redacted_diagnostics_bundle(&identity_hints)
                 .boxed(),
+            Method::Get if path == "/api/routing/status" => {
+                self.handle_routing_status(&identity_hints).boxed()
+            }
             Method::Get if path == "/api/knowledge/settings" => {
                 self.handle_knowledge_settings(&identity_hints).boxed()
             }
@@ -2399,6 +2405,37 @@ impl AdminApi {
             live_gateway_status.as_ref(),
         );
         ok_json(&bundle)
+    }
+
+    fn handle_routing_status(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.load_or_create_state() {
+            Ok(state) => {
+                let runtimes = state
+                    .models
+                    .runtimes
+                    .iter()
+                    .map(|runtime| RoutingRuntimeProjection {
+                        runtime_id: runtime.runtime_id.clone(),
+                        status: runtime.status.clone(),
+                        enabled: runtime.enabled,
+                        capabilities: runtime.capabilities.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                ok_json(&build_routing_status(
+                    &state.models.endpoints,
+                    &state.models.route_policies,
+                    &runtimes,
+                    now_unix_string(),
+                ))
+            }
+            Err(error) => error_json(StatusCode(500), &error),
+        }
     }
 
     fn handle_knowledge_settings(
@@ -7907,6 +7944,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/evt/preflight/latest"
         || path == "/api/evt/evidence-bundle"
         || path == "/api/diagnostics/redacted-bundle"
+        || path == "/api/routing/status"
         || path == "/api/family/timeline"
         || path == "/api/family/timeline/digest"
         || path == "/api/home-guardian/activity"
@@ -17088,6 +17126,39 @@ mod tests {
         assert!(!text.contains("gw_route_secret"));
         assert!(!text.contains("token=secret"));
         assert!(!text.contains("/tmp/admin-family-shape.jpg"));
+    }
+
+    #[test]
+    fn routing_status_admin_handler_keeps_routing_and_gate_boundary_separate() {
+        let (api, paths) = build_test_admin_api("harborbeacon-routing-status-shape");
+        let hints = AccessIdentityHints::default();
+
+        let (status, body) = response_json(api.handle_routing_status(&hints));
+        assert_eq!(status, StatusCode(200));
+        assert_eq!(body["kind"], json!("harborbeacon.routing_status.v1"));
+        assert_eq!(body["metadata_only"], json!(true));
+        assert_eq!(body["scope"], json!("beacon_internal_orchestration"));
+        assert!(body["execution_routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|route| route["domain_id"] == json!("harboros_system")));
+        assert!(body["boundaries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|boundary| boundary["boundary_id"] == json!("im_gateway_route_registry")));
+        assert_eq!(
+            normalize_unified_admin_path("/api/beacon/routing/status"),
+            "/api/routing/status"
+        );
+        assert!(is_admin_surface_path("/api/routing/status"));
+
+        let text = serde_json::to_string(&body).expect("serialize routing status");
+        assert!(!text.contains("gw_route_"));
+        assert!(!text.contains("args.resume_token"));
+
+        cleanup_test_paths(&paths);
     }
 
     #[test]
