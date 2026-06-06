@@ -648,6 +648,7 @@ fn semantic_router_decision(request: &SemanticRouterRequest) -> Value {
     let mut home_assistant = json!({"domain": null, "service": null, "entity_hint": null});
     let mut camera_hint = Value::Null;
     let mut query = Value::Null;
+    let mut guardian_rule = Value::Null;
 
     let stress = contains_any(text, &lower, &["evt", "stress", "压测", "压力测试"]);
     if stress
@@ -699,6 +700,95 @@ fn semantic_router_decision(request: &SemanticRouterRequest) -> Value {
     } else if contains_any(text, &lower, &["你能干什么", "帮助", "help", "能力"]) {
         decision = "capability_summary";
         confidence = 0.95;
+    } else if contains_any(
+        text,
+        &lower,
+        &[
+            "家庭守护状态",
+            "守护状态",
+            "guardian status",
+            "home guardian",
+        ],
+    ) {
+        decision = "guardian_status";
+        confidence = 0.94;
+    } else if contains_any(
+        text,
+        &lower,
+        &[
+            "启用这个规则",
+            "启用规则",
+            "启用",
+            "武装",
+            "armed",
+            "enable rule",
+        ],
+    ) {
+        decision = "guardian_rule_enable";
+        confidence = 0.94;
+    } else if contains_any(
+        text,
+        &lower,
+        &[
+            "暂停这个规则",
+            "暂停规则",
+            "取消这个规则",
+            "取消规则",
+            "取消",
+            "pause rule",
+        ],
+    ) {
+        decision = "guardian_rule_pause";
+        confidence = 0.94;
+    } else if semantic_router_looks_like_guardian_rule(text, &lower) {
+        decision = "guardian_rule_proposal";
+        confidence = 0.94;
+        camera_hint = infer_camera_hint(text);
+        if let Some(ha) = infer_semantic_router_home_assistant(text, &lower) {
+            home_assistant = ha.clone();
+            guardian_rule = json!({
+                "trigger": semantic_router_guardian_trigger(text),
+                "action_plan": {
+                    "actions": [{
+                        "kind": "ha_service_action",
+                        "domain": ha.get("domain").cloned().unwrap_or(Value::Null),
+                        "service": ha.get("service").cloned().unwrap_or(Value::Null),
+                        "entity_hint": ha.get("entity_hint").cloned().unwrap_or(Value::Null),
+                        "fields": {},
+                    }]
+                }
+            });
+        } else {
+            guardian_rule = json!({
+                "trigger": semantic_router_guardian_trigger(text),
+                "action_plan": {
+                    "actions": [{
+                        "kind": "notify_default_target"
+                    }]
+                }
+            });
+        }
+    } else if contains_any(
+        text,
+        &lower,
+        &[
+            "今天家里发生了什么",
+            "家里发生了什么",
+            "家庭时间线",
+            "family timeline",
+        ],
+    ) {
+        decision = "family_timeline_summary";
+        confidence = 0.94;
+    } else if contains_any(
+        text,
+        &lower,
+        &["今天有人", "有人来过", "门口今天", "今天门口", "家里今天"],
+    ) {
+        decision = "family_timeline_query";
+        confidence = 0.93;
+        camera_hint = infer_camera_hint(text);
+        query = json!(text);
     } else if contains_any(
         text,
         &lower,
@@ -757,6 +847,7 @@ fn semantic_router_decision(request: &SemanticRouterRequest) -> Value {
         "camera_hint": camera_hint,
         "query": query,
         "home_assistant": home_assistant,
+        "guardian_rule": guardian_rule,
         "conversation_act": Value::Null,
         "reply_text": Value::Null,
         "reason": "local_only_semantic_router_backend",
@@ -773,6 +864,54 @@ fn contains_any(text: &str, lower_ascii: &str, needles: &[&str]) -> bool {
     })
 }
 
+fn semantic_router_looks_like_guardian_rule(text: &str, lower: &str) -> bool {
+    let has_guardian_trigger = contains_any(
+        text,
+        lower,
+        &[
+            "以后",
+            "将来",
+            "下次",
+            "如果",
+            "有人",
+            "检测到",
+            "when",
+            "whenever",
+        ],
+    );
+    let has_notify_action = contains_any(text, lower, &["通知", "提醒", "发给我"]);
+    let has_safe_ha_action = infer_semantic_router_home_assistant(text, lower).is_some();
+    has_guardian_trigger && (has_notify_action || has_safe_ha_action)
+}
+
+fn semantic_router_guardian_trigger(text: &str) -> Value {
+    let camera_hint = infer_camera_hint(text);
+    let mut labels = Vec::new();
+    let event_type = if text.contains("人") || text.to_ascii_lowercase().contains("person") {
+        labels.push("person");
+        "person_detected"
+    } else if text.contains("车") || text.to_ascii_lowercase().contains("vehicle") {
+        labels.push("vehicle");
+        "vehicle_detected"
+    } else if text.contains("宠物") || text.contains("猫") || text.contains("狗") {
+        labels.push("pet");
+        "pet_detected"
+    } else {
+        "motion_like_scene"
+    };
+    json!({
+        "camera_id": camera_hint,
+        "event_type": event_type,
+        "labels": labels,
+        "min_confidence": 0.6,
+        "local_time_window": {
+            "start": "00:00",
+            "end": "23:59",
+        },
+        "metadata_only": true,
+    })
+}
+
 fn infer_camera_hint(text: &str) -> Value {
     for hint in ["门口", "前门", "客厅", "车库", "院子"] {
         if text.contains(hint) {
@@ -783,9 +922,14 @@ fn infer_camera_hint(text: &str) -> Value {
 }
 
 fn infer_semantic_router_home_assistant(text: &str, lower: &str) -> Option<Value> {
-    let service = if contains_any(text, lower, &["打开", "开灯", "开启", "turn on"]) {
+    let mentions_light = contains_any(text, lower, &["灯", "light"]);
+    let service = if contains_any(text, lower, &["打开", "开灯", "开启", "turn on"])
+        || (mentions_light && text.contains('开'))
+    {
         "turn_on"
-    } else if contains_any(text, lower, &["关闭", "关灯", "turn off"]) {
+    } else if contains_any(text, lower, &["关闭", "关灯", "turn off"])
+        || (mentions_light && text.contains('关'))
+    {
         "turn_off"
     } else if contains_any(text, lower, &["切换", "toggle"]) {
         "toggle"
@@ -797,7 +941,7 @@ fn infer_semantic_router_home_assistant(text: &str, lower: &str) -> Option<Value
 
     let (domain, hint) = if contains_any(text, lower, &["场景", "scene"]) {
         ("scene", "测试")
-    } else if contains_any(text, lower, &["灯", "light"]) {
+    } else if mentions_light {
         ("light", "灯")
     } else if contains_any(text, lower, &["input_boolean"]) {
         ("input_boolean", "input_boolean")
@@ -2550,6 +2694,71 @@ mod tests {
         assert_eq!(decision["decision"], json!("ha_service_action"));
         assert_eq!(decision["home_assistant"]["domain"], json!("scene"));
         assert_eq!(decision["home_assistant"]["service"], json!("turn_on"));
+    }
+
+    #[test]
+    fn semantic_router_backend_routes_family_guardian_decisions() {
+        for (message, expected) in [
+            (
+                "User message: 今天家里发生了什么",
+                "family_timeline_summary",
+            ),
+            ("User message: 门口今天有人来过吗", "family_timeline_query"),
+            ("User message: 家庭守护状态", "guardian_status"),
+            ("User message: 启用这个规则", "guardian_rule_enable"),
+        ] {
+            let body = json!({
+                "messages": [
+                    {"role": "user", "content": message}
+                ]
+            });
+            let request =
+                parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+                    .expect("semantic router request");
+            let decision = semantic_router_decision(&request);
+            assert_eq!(decision["decision"], json!(expected));
+            assert!(decision["confidence"].as_f64().unwrap_or_default() >= 0.9);
+        }
+
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "User message: 以后门口有人就通知我"}
+            ]
+        });
+        let request = parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+            .expect("semantic router request");
+        let decision = semantic_router_decision(&request);
+        assert_eq!(decision["decision"], json!("guardian_rule_proposal"));
+        assert_eq!(
+            decision["guardian_rule"]["action_plan"]["actions"][0]["kind"],
+            json!("notify_default_target")
+        );
+        assert_eq!(
+            decision["guardian_rule"]["trigger"]["event_type"],
+            json!("person_detected")
+        );
+
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "User message: 有人到门口就开门口灯"}
+            ]
+        });
+        let request = parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+            .expect("semantic router request");
+        let decision = semantic_router_decision(&request);
+        assert_eq!(decision["decision"], json!("guardian_rule_proposal"));
+        assert_eq!(
+            decision["guardian_rule"]["action_plan"]["actions"][0]["kind"],
+            json!("ha_service_action")
+        );
+        assert_eq!(
+            decision["guardian_rule"]["action_plan"]["actions"][0]["domain"],
+            json!("light")
+        );
+        assert_eq!(
+            decision["guardian_rule"]["action_plan"]["actions"][0]["service"],
+            json!("turn_on")
+        );
     }
 
     #[test]

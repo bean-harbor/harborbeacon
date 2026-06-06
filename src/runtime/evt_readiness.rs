@@ -15,7 +15,9 @@ use crate::runtime::admin_console::{
     AdminConsoleState, AdminConsoleStore, AdminModelCenterState, NotificationTargetRecord,
 };
 use crate::runtime::model_center::wire_semantic_router_resident_endpoint;
-use crate::runtime::vision_event::list_recent_local_vision_events_default;
+use crate::runtime::vision_event::{
+    list_recent_local_vision_events_default, local_vision_event_store_stats_default,
+};
 
 pub const EVT_READINESS_PROFILE: &str = "k3-direct-72h-readiness";
 pub const EVT_READINESS_EVIDENCE_KIND: &str = "evt_readiness_v1";
@@ -359,6 +361,15 @@ fn build_evt_readiness_from_state(
         .map(|service| systemd_service_summary(service))
         .collect::<Vec<_>>();
     let latest_events = list_recent_local_vision_events_default(3).unwrap_or_default();
+    let event_store_stats = local_vision_event_store_stats_default()
+        .map(|stats| serde_json::to_value(stats).unwrap_or_else(|_| json!({})))
+        .unwrap_or_else(|error| {
+            json!({
+                "status": "unavailable",
+                "error": redact_evt_text(&error),
+                "metadata_only": true,
+            })
+        });
     let latest_event = latest_events.first();
     let package = package_summary("harboros-beacon");
     let gateway = evt_gateway_readiness(&state.notification_targets, gateway_status);
@@ -368,6 +379,7 @@ fn build_evt_readiness_from_state(
         "configured_count": camera_count,
         "latest_event_available": latest_event.is_some(),
         "latest_event_id": latest_event.map(|event| event.event.event_id.clone()),
+        "event_store": event_store_stats,
         "metadata_only": true,
         "rtsp_urls_redacted": true,
         "local_paths_redacted": true,

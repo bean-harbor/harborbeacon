@@ -1,5 +1,6 @@
 //! Local vision event records for HarborNavi K3 viability testing.
 
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,14 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const VISION_EVENT_STORE_PATH_ENV: &str = "HARBOR_VISION_EVENT_STORE_PATH";
+pub const MAX_LOCAL_VISION_EVENT_JSON_BYTES: usize = 256 * 1024;
+const MAX_STORED_VISION_EVENT_LINE_BYTES: usize = 512 * 1024;
+const MAX_LOCAL_VISION_TEXT_CHARS: usize = 2_000;
+const MAX_LOCAL_VISION_MODEL_TEXT_CHARS: usize = 4_000;
+const MAX_LOCAL_VISION_LABELS: usize = 32;
+const MAX_LOCAL_VISION_ARTIFACTS: usize = 8;
+const MAX_LOCAL_VISION_METRICS_BYTES: usize = 64 * 1024;
+const MAX_LOCAL_VISION_RECENT_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SnapshotArtifact {
@@ -131,6 +140,18 @@ pub struct StoredLocalVisionEvent {
     pub event: LocalVisionEvent,
     pub audit_record: Value,
     pub ha_mqtt_payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct LocalVisionEventStoreStats {
+    pub exists: bool,
+    pub file_bytes: u64,
+    pub line_count: usize,
+    pub largest_line_bytes: usize,
+    pub skipped_malformed_count: usize,
+    pub skipped_oversized_count: usize,
+    pub max_line_bytes: usize,
+    pub metadata_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -342,6 +363,62 @@ pub fn list_recent_local_vision_events_default(
     list_recent_local_vision_events(&default_vision_event_store_path(), limit)
 }
 
+pub fn local_vision_event_store_stats_default() -> Result<LocalVisionEventStoreStats, String> {
+    local_vision_event_store_stats(&default_vision_event_store_path())
+}
+
+pub fn local_vision_event_store_stats(
+    store_path: &Path,
+) -> Result<LocalVisionEventStoreStats, String> {
+    if !store_path.exists() {
+        return Ok(LocalVisionEventStoreStats {
+            exists: false,
+            max_line_bytes: MAX_STORED_VISION_EVENT_LINE_BYTES,
+            metadata_only: true,
+            ..LocalVisionEventStoreStats::default()
+        });
+    }
+    let file_bytes = fs::metadata(store_path)
+        .map_err(|error| {
+            format!(
+                "failed to stat vision event store {}: {error}",
+                store_path.display()
+            )
+        })?
+        .len();
+    let file = fs::File::open(store_path).map_err(|error| {
+        format!(
+            "failed to open vision event store {}: {error}",
+            store_path.display()
+        )
+    })?;
+    let mut stats = LocalVisionEventStoreStats {
+        exists: true,
+        file_bytes,
+        max_line_bytes: MAX_STORED_VISION_EVENT_LINE_BYTES,
+        metadata_only: true,
+        ..LocalVisionEventStoreStats::default()
+    };
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| format!("failed to read vision event store: {error}"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        stats.line_count = stats.line_count.saturating_add(1);
+        let line_bytes = trimmed.as_bytes().len();
+        stats.largest_line_bytes = stats.largest_line_bytes.max(line_bytes);
+        if line_bytes > MAX_STORED_VISION_EVENT_LINE_BYTES {
+            stats.skipped_oversized_count = stats.skipped_oversized_count.saturating_add(1);
+            continue;
+        }
+        if serde_json::from_str::<Value>(trimmed).is_err() {
+            stats.skipped_malformed_count = stats.skipped_malformed_count.saturating_add(1);
+        }
+    }
+    Ok(stats)
+}
+
 pub fn list_recent_local_vision_events(
     store_path: &Path,
     limit: usize,
@@ -355,20 +432,26 @@ pub fn list_recent_local_vision_events(
             store_path.display()
         )
     })?;
-    let mut events = Vec::new();
+    let target_limit = limit.max(1).min(MAX_LOCAL_VISION_RECENT_LIMIT);
+    let mut events = VecDeque::with_capacity(target_limit);
     for line in BufReader::new(file).lines() {
         let line = line.map_err(|error| format!("failed to read vision event store: {error}"))?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let event = serde_json::from_str::<StoredLocalVisionEvent>(trimmed)
-            .map_err(|error| format!("failed to parse stored local vision event: {error}"))?;
-        events.push(event);
+        if trimmed.as_bytes().len() > MAX_STORED_VISION_EVENT_LINE_BYTES {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<StoredLocalVisionEvent>(trimmed) else {
+            continue;
+        };
+        if events.len() == target_limit {
+            events.pop_front();
+        }
+        events.push_back(event);
     }
-    events.reverse();
-    events.truncate(limit.max(1));
-    Ok(events)
+    Ok(events.into_iter().rev().collect())
 }
 
 pub fn build_ha_mqtt_payload(event: &LocalVisionEvent) -> Value {
@@ -580,9 +663,106 @@ pub fn validate_local_vision_event(event: &LocalVisionEvent) -> Result<(), Strin
     if !(0.0..=1.0).contains(&event.confidence) {
         return Err("local vision event confidence must be between 0 and 1".to_string());
     }
+    validate_local_vision_event_size(event)?;
     let payload = serde_json::to_value(event)
         .map_err(|error| format!("failed to inspect local vision event: {error}"))?;
-    reject_sensitive_value(&payload)
+    reject_sensitive_value(&payload)?;
+    reject_local_path_value(&payload)?;
+    Ok(())
+}
+
+fn validate_local_vision_event_size(event: &LocalVisionEvent) -> Result<(), String> {
+    let json_bytes = serde_json::to_vec(event)
+        .map_err(|error| format!("failed to measure local vision event: {error}"))?;
+    if json_bytes.len() > MAX_LOCAL_VISION_EVENT_JSON_BYTES {
+        return Err(format!(
+            "local vision event JSON exceeds {} bytes",
+            MAX_LOCAL_VISION_EVENT_JSON_BYTES
+        ));
+    }
+    validate_text_len("summary", &event.summary, MAX_LOCAL_VISION_TEXT_CHARS)?;
+    validate_text_len("event_type", &event.event_type, 128)?;
+    validate_text_len("camera_id", &event.camera_id, 128)?;
+    validate_text_len("analyzer", &event.analyzer, 256)?;
+    validate_string_vec_len("labels", &event.labels, MAX_LOCAL_VISION_LABELS, 128)?;
+    let metrics_bytes = serde_json::to_vec(&event.metrics)
+        .map_err(|error| format!("failed to measure local vision event metrics: {error}"))?
+        .len();
+    if metrics_bytes > MAX_LOCAL_VISION_METRICS_BYTES {
+        return Err(format!(
+            "local vision event metrics exceed {} bytes",
+            MAX_LOCAL_VISION_METRICS_BYTES
+        ));
+    }
+    if let Some(vlm) = event.vlm.as_ref() {
+        validate_text_len("vlm.status", &vlm.status, 128)?;
+        validate_text_len(
+            "vlm.summary",
+            &vlm.summary,
+            MAX_LOCAL_VISION_MODEL_TEXT_CHARS,
+        )?;
+        validate_text_len(
+            "vlm.derived_text",
+            &vlm.derived_text,
+            MAX_LOCAL_VISION_MODEL_TEXT_CHARS,
+        )?;
+        if let Some(error) = vlm.error.as_deref() {
+            validate_text_len("vlm.error", error, MAX_LOCAL_VISION_TEXT_CHARS)?;
+        }
+        validate_string_vec_len("vlm.tags", &vlm.tags, MAX_LOCAL_VISION_LABELS, 128)?;
+        validate_string_vec_len("vlm.labels", &vlm.labels, MAX_LOCAL_VISION_LABELS, 128)?;
+        if vlm.artifacts.len() > MAX_LOCAL_VISION_ARTIFACTS {
+            return Err(format!(
+                "local vision event VLM artifacts exceed {} entries",
+                MAX_LOCAL_VISION_ARTIFACTS
+            ));
+        }
+        let ingest_metadata_bytes = serde_json::to_vec(&vlm.ingest_metadata)
+            .map_err(|error| format!("failed to measure VLM ingest metadata: {error}"))?
+            .len();
+        if ingest_metadata_bytes > MAX_LOCAL_VISION_METRICS_BYTES {
+            return Err(format!(
+                "local vision event VLM ingest metadata exceeds {} bytes",
+                MAX_LOCAL_VISION_METRICS_BYTES
+            ));
+        }
+        let vlm_metrics_bytes = serde_json::to_vec(&vlm.vlm_metrics)
+            .map_err(|error| format!("failed to measure VLM metrics: {error}"))?
+            .len();
+        if vlm_metrics_bytes > MAX_LOCAL_VISION_METRICS_BYTES {
+            return Err(format!(
+                "local vision event VLM metrics exceed {} bytes",
+                MAX_LOCAL_VISION_METRICS_BYTES
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_text_len(name: &str, value: &str, max_chars: usize) -> Result<(), String> {
+    if value.chars().count() > max_chars {
+        return Err(format!(
+            "local vision event {name} exceeds {max_chars} chars"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_string_vec_len(
+    name: &str,
+    values: &[String],
+    max_items: usize,
+    max_chars: usize,
+) -> Result<(), String> {
+    if values.len() > max_items {
+        return Err(format!(
+            "local vision event {name} exceeds {max_items} entries"
+        ));
+    }
+    for value in values {
+        validate_text_len(name, value, max_chars)?;
+    }
+    Ok(())
 }
 
 fn build_local_vision_notification_audit(
@@ -667,7 +847,7 @@ fn local_vision_notification_summary(event: &LocalVisionEvent) -> String {
     local_vision_automation_summary(event)
 }
 
-fn local_vision_automation_summary(event: &LocalVisionEvent) -> String {
+pub(crate) fn local_vision_automation_summary(event: &LocalVisionEvent) -> String {
     if let Some(vlm) = event.vlm.as_ref() {
         if vlm.status == "active" && !vlm.summary.trim().is_empty() {
             return sanitize_model_text(vlm.summary.trim());
@@ -707,7 +887,7 @@ fn local_vision_family_title(event_type: &str) -> String {
     }
 }
 
-fn local_vision_vlm_status(event: &LocalVisionEvent) -> String {
+pub(crate) fn local_vision_vlm_status(event: &LocalVisionEvent) -> String {
     event
         .vlm
         .as_ref()
@@ -961,7 +1141,7 @@ fn push_unique_label(labels: &mut Vec<String>, label: &str) {
     }
 }
 
-fn reject_sensitive_value(value: &Value) -> Result<(), String> {
+pub(crate) fn reject_sensitive_value(value: &Value) -> Result<(), String> {
     match value {
         Value::String(text) => reject_sensitive_text(text),
         Value::Array(items) => {
@@ -998,6 +1178,8 @@ fn reject_sensitive_text(text: &str) -> Result<(), String> {
         ("private_key", "private key"),
         ("upload_url", "x-amz-signature="),
         ("upload_url", "presigned"),
+        ("raw_image", "data:image"),
+        ("raw_image", ";base64,"),
     ];
     for (code, needle) in blocked {
         if lower.contains(needle) {
@@ -1012,7 +1194,7 @@ fn reject_sensitive_text(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn reject_local_path_value(value: &Value) -> Result<(), String> {
+pub(crate) fn reject_local_path_value(value: &Value) -> Result<(), String> {
     match value {
         Value::String(text) => reject_local_path_text(text),
         Value::Array(items) => {
@@ -1087,12 +1269,29 @@ fn hex_sha256(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn now_epoch_ms_string() -> String {
-    let millis = SystemTime::now()
+pub(crate) fn now_epoch_ms() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default();
-    format!("epoch_ms:{millis}")
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+pub(crate) fn now_epoch_ms_string() -> String {
+    format!("epoch_ms:{}", now_epoch_ms())
+}
+
+pub(crate) fn parse_epoch_ms(value: &str) -> Option<u64> {
+    let digits = value
+        .trim()
+        .strip_prefix("epoch_ms:")
+        .unwrap_or_else(|| value.trim())
+        .trim();
+    let parsed = digits.parse::<u64>().ok()?;
+    if parsed > 9_999_999_999 {
+        Some(parsed)
+    } else {
+        Some(parsed.saturating_mul(1000))
+    }
 }
 
 fn looks_like_url_with_credentials(text: &str) -> bool {
@@ -1166,6 +1365,84 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event.event_id, "event-2");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_recent_events_keeps_only_requested_tail_for_large_store() {
+        let dir = std::env::temp_dir().join(format!("vision-event-tail-{}", Uuid::new_v4()));
+        let store = dir.join("events.jsonl");
+
+        for index in 0..1_000 {
+            let mut event = sample_event();
+            event.event_id = format!("event-{index:04}");
+            ingest_local_vision_event(&store, event).expect("ingest event");
+        }
+
+        let events = list_recent_local_vision_events(&store, 3).expect("list recent");
+        let stats = local_vision_event_store_stats(&store).expect("store stats");
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event.event_id, "event-0999");
+        assert_eq!(events[1].event.event_id, "event-0998");
+        assert_eq!(events[2].event.event_id, "event-0997");
+        assert_eq!(stats.line_count, 1_000);
+        assert_eq!(stats.skipped_malformed_count, 0);
+        assert_eq!(stats.skipped_oversized_count, 0);
+        assert!(stats.largest_line_bytes > 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_recent_events_skips_malformed_and_oversized_lines() {
+        let dir = std::env::temp_dir().join(format!("vision-event-skip-{}", Uuid::new_v4()));
+        let store = dir.join("events.jsonl");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&store)
+            .expect("open store");
+        writeln!(file, "not-json").expect("write malformed");
+        writeln!(
+            file,
+            "{}",
+            "x".repeat(MAX_STORED_VISION_EVENT_LINE_BYTES + 1)
+        )
+        .expect("write oversized");
+        let valid = sample_stored_event(sample_event());
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&valid).expect("serialize event")
+        )
+        .expect("write valid");
+
+        let events = list_recent_local_vision_events(&store, 5).expect("list recent");
+        let stats = local_vision_event_store_stats(&store).expect("store stats");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.event_id, "event-1");
+        assert_eq!(stats.line_count, 3);
+        assert_eq!(stats.skipped_malformed_count, 1);
+        assert_eq!(stats.skipped_oversized_count, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_vision_event_rejects_oversized_payloads_and_raw_images() {
+        let mut event = sample_event();
+        event.summary = "x".repeat(MAX_LOCAL_VISION_TEXT_CHARS + 1);
+
+        let error = validate_local_vision_event(&event).expect_err("oversized summary");
+
+        assert!(error.contains("summary"));
+
+        let mut event = sample_event();
+        event.metrics = json!({"inline_image": "data:image/jpeg;base64,abc"});
+
+        let error = validate_local_vision_event(&event).expect_err("raw image data URL");
+
+        assert!(error.contains("raw_image") || error.contains("sensitive"));
     }
 
     #[test]
@@ -1624,7 +1901,7 @@ mod tests {
             summary: "本地视觉事件".to_string(),
             snapshot_artifact: SnapshotArtifact {
                 artifact_id: Some("artifact-1".to_string()),
-                path: Some("/tmp/source.jpg".to_string()),
+                path: None,
                 mime_type: Some("image/jpeg".to_string()),
                 byte_size: Some(5),
                 sha256: Some("abc123".to_string()),

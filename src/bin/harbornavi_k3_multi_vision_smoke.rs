@@ -288,9 +288,19 @@ struct SingleSmokeSummary {
     passed: usize,
     failed: usize,
     average_total_ms: u64,
+    #[serde(default)]
+    p95_total_ms: u64,
     max_total_ms: u64,
     average_detector_ms: u64,
+    #[serde(default)]
+    p95_detector_ms: u64,
     average_event_ingest_ms: u64,
+    #[serde(default)]
+    p95_event_ingest_ms: u64,
+    #[serde(default)]
+    p95_capture_read_ms: u64,
+    #[serde(default)]
+    p95_frame_age_ms: u64,
     detection_runs: usize,
     detection_count: usize,
     #[serde(default)]
@@ -664,21 +674,24 @@ fn summarize_camera_report(
         failed,
         success_rate: rate(passed, total),
         average_total_ms: report.summary.average_total_ms,
-        p95_total_ms: p95(&total_values),
+        p95_total_ms: report.summary.p95_total_ms.max(p95(&total_values)),
         max_total_ms: report.summary.max_total_ms,
         average_capture_ms: average_u64(&capture_values),
         p95_capture_ms: p95(&capture_values),
         average_capture_read_ms: average_u64(&capture_read_values),
-        p95_capture_read_ms: p95(&capture_read_values),
+        p95_capture_read_ms: report
+            .summary
+            .p95_capture_read_ms
+            .max(p95(&capture_read_values)),
         average_frame_age_ms: average_u64(&frame_age_values),
-        p95_frame_age_ms: p95(&frame_age_values),
+        p95_frame_age_ms: report.summary.p95_frame_age_ms.max(p95(&frame_age_values)),
         max_stream_uptime_ms,
         reconnect_count,
         decode_backend,
         average_detector_ms: report.summary.average_detector_ms,
-        p95_detector_ms: p95(&detector_values),
+        p95_detector_ms: report.summary.p95_detector_ms.max(p95(&detector_values)),
         average_event_ingest_ms: report.summary.average_event_ingest_ms,
-        p95_event_ingest_ms: p95(&ingest_values),
+        p95_event_ingest_ms: report.summary.p95_event_ingest_ms.max(p95(&ingest_values)),
         detection_runs: report.summary.detection_runs,
         detection_count: report.summary.detection_count,
         vlm_total,
