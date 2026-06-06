@@ -36,6 +36,10 @@ use harborbeacon_local_agent::connectors::notifications::{
     NotificationDeliveryError, NotificationDeliveryRecord, NotificationDeliveryService,
 };
 use harborbeacon_local_agent::connectors::storage::StorageTarget;
+use harborbeacon_local_agent::control_plane::audit::{
+    build_audit_summary, build_metadata_audit_record, query_audit_records, AuditActorKind,
+    AuditRecordQuery,
+};
 use harborbeacon_local_agent::control_plane::events::EventRecord;
 use harborbeacon_local_agent::control_plane::media::{
     MediaAsset, MediaAssetKind, MediaSession, MediaSessionStatus, ShareLink,
@@ -1501,6 +1505,53 @@ impl AdminApi {
             .and_then(|guard| guard.clone())
     }
 
+    fn record_admin_audit(
+        &self,
+        principal: &AccessPrincipal,
+        entity_kind: &str,
+        entity_id: &str,
+        action: &str,
+        request_snapshot: Value,
+        result_snapshot: Value,
+    ) {
+        let actor_kind = if principal.user_id == "system" {
+            AuditActorKind::System
+        } else {
+            AuditActorKind::User
+        };
+        let record = build_metadata_audit_record(
+            principal.workspace_id.clone(),
+            entity_kind,
+            entity_id,
+            action,
+            actor_kind,
+            principal.user_id.clone(),
+            request_snapshot,
+            result_snapshot,
+        );
+        let _ = self.admin_store.append_audit_record(record);
+    }
+
+    fn record_local_vision_notify_audit(
+        &self,
+        principal: &AccessPrincipal,
+        response: &LocalVisionEventNotificationResponse,
+    ) {
+        self.record_admin_audit(
+            principal,
+            "vision_event",
+            &response.event_id,
+            "vision_event.notify",
+            json!({"event_id": response.event_id}),
+            json!({
+                "status": response.status,
+                "notification_id": response.notification_id,
+                "delivery_id": response.delivery_id,
+                "target_bound": response.target_label.is_some(),
+            }),
+        );
+    }
+
     fn authorize_admin_action(
         &self,
         hints: &AccessIdentityHints,
@@ -1624,6 +1675,12 @@ impl AdminApi {
             Method::Get if path == "/api/routing/status" => {
                 self.handle_routing_status(&identity_hints).boxed()
             }
+            Method::Get if path == "/api/audit/records" => self
+                .handle_audit_records(&raw_url, &identity_hints)
+                .boxed(),
+            Method::Get if path == "/api/audit/summary" => self
+                .handle_audit_summary(&raw_url, &identity_hints)
+                .boxed(),
             Method::Get if path == "/api/knowledge/settings" => {
                 self.handle_knowledge_settings(&identity_hints).boxed()
             }
@@ -2404,6 +2461,19 @@ impl AdminApi {
             &admin_state.notification_targets,
             live_gateway_status.as_ref(),
         );
+        self.record_admin_audit(
+            &AccessPrincipal {
+                workspace_id: "home-1".to_string(),
+                user_id: "system".to_string(),
+                display_name: "system".to_string(),
+                role_kind: RoleKind::Owner,
+            },
+            "diagnostics",
+            "redacted-bundle",
+            "diagnostics.redacted_bundle.generate",
+            json!({"surface": "admin_api"}),
+            json!({"status": "generated", "metadata_only": true}),
+        );
         ok_json(&bundle)
     }
 
@@ -2434,6 +2504,49 @@ impl AdminApi {
                     now_unix_string(),
                 ))
             }
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_audit_records(
+        &self,
+        raw_url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.audit_records() {
+            Ok(records) => ok_json(&query_audit_records(
+                &records,
+                AuditRecordQuery {
+                    limit: parse_query_param(raw_url, "limit")
+                        .and_then(|value| value.parse::<usize>().ok()),
+                    cursor: parse_query_param(raw_url, "cursor")
+                        .and_then(|value| value.parse::<usize>().ok()),
+                    entity_kind: parse_query_param(raw_url, "entity_kind")
+                        .and_then(|value| non_empty_string(&value)),
+                    entity_id: parse_query_param(raw_url, "entity_id")
+                        .and_then(|value| non_empty_string(&value)),
+                    action: parse_query_param(raw_url, "action")
+                        .and_then(|value| non_empty_string(&value)),
+                },
+            )),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_audit_summary(
+        &self,
+        raw_url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let window = parse_query_param(raw_url, "window").unwrap_or_else(|| "24h".to_string());
+        match self.admin_store.audit_records() {
+            Ok(records) => ok_json(&build_audit_summary(&records, window)),
             Err(error) => error_json(StatusCode(500), &error),
         }
     }
@@ -3594,9 +3707,10 @@ impl AdminApi {
         path: &str,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
-            return error_json(StatusCode(403), &error);
-        }
+        let principal = match self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let review_id = match parse_automation_review_evaluate_latest_path(path) {
             Some(review_id) => review_id,
             None => return error_json(StatusCode(400), "invalid automation evaluate path"),
@@ -3612,6 +3726,18 @@ impl AdminApi {
             Ok(evaluation) => {
                 let value = serde_json::to_value(&evaluation).unwrap_or_else(|_| json!({}));
                 self.record_last_guardian_rule_evaluation(&value);
+                self.record_admin_audit(
+                    &principal,
+                    "automation_review",
+                    &review_id,
+                    "home_guardian.evaluate_latest",
+                    json!({"review_id": review_id, "latest_event_id": event.event.event_id}),
+                    json!({
+                        "status": evaluation.status,
+                        "result_count": evaluation.results.len(),
+                        "metadata_only": true,
+                    }),
+                );
                 ok_json(&evaluation)
             }
             Err(error) => error_json(StatusCode(422), &error),
@@ -3978,9 +4104,10 @@ impl AdminApi {
         path: &str,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
-            return error_json(StatusCode(403), &error);
-        }
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let event_id = match parse_local_vision_event_notify_path(path) {
             Some(event_id) => event_id,
             None => return error_json(StatusCode(400), "invalid local vision event notify path"),
@@ -4004,6 +4131,7 @@ impl AdminApi {
                     "No default notification target is configured.",
                 );
                 self.record_last_event_notification_attempt(&response);
+                self.record_local_vision_notify_audit(&principal, &response);
                 return ok_json(&response);
             }
         };
@@ -4018,6 +4146,7 @@ impl AdminApi {
                     &error,
                 );
                 self.record_last_event_notification_attempt(&response);
+                self.record_local_vision_notify_audit(&principal, &response);
                 return ok_json(&response);
             }
         };
@@ -4030,6 +4159,7 @@ impl AdminApi {
                     &redact_admin_string(&error),
                 );
                 self.record_last_event_notification_attempt(&response);
+                self.record_local_vision_notify_audit(&principal, &response);
                 return ok_json(&response);
             }
         };
@@ -4042,6 +4172,7 @@ impl AdminApi {
                     intent.audit_record,
                 );
                 self.record_last_event_notification_attempt(&response);
+                self.record_local_vision_notify_audit(&principal, &response);
                 ok_json(&response)
             }
             Ok(record) => {
@@ -4053,6 +4184,7 @@ impl AdminApi {
                     "HarborGate returned a failed delivery record.",
                 );
                 self.record_last_event_notification_attempt(&response);
+                self.record_local_vision_notify_audit(&principal, &response);
                 ok_json(&response)
             }
             Err(error) => {
@@ -4060,6 +4192,7 @@ impl AdminApi {
                     &event, &target, error,
                 );
                 self.record_last_event_notification_attempt(&response);
+                self.record_local_vision_notify_audit(&principal, &response);
                 ok_json(&response)
             }
         }
@@ -4146,9 +4279,10 @@ impl AdminApi {
         path: &str,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
-            return error_json(StatusCode(403), &error);
-        }
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let endpoint_id = match parse_model_endpoint_test_path(path) {
             Some(endpoint_id) => endpoint_id,
             None => return error_json(StatusCode(400), "invalid model endpoint test path"),
@@ -4175,6 +4309,19 @@ impl AdminApi {
         ) {
             return error_json(StatusCode(500), &error);
         }
+        self.record_admin_audit(
+            &principal,
+            "model_endpoint",
+            &endpoint_id,
+            "model.endpoint.test",
+            json!({"endpoint_id": endpoint_id}),
+            json!({
+                "ok": result.ok,
+                "status": result.status,
+                "summary": result.summary,
+                "endpoint_kind": result.endpoint.endpoint_kind.as_str(),
+            }),
+        );
         ok_json(&result)
     }
 
@@ -4337,9 +4484,10 @@ impl AdminApi {
         request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
-            return error_json(StatusCode(403), &error);
-        }
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let capability_id = match parse_model_capability_selection_path(path) {
             Some(capability_id) => capability_id,
             None => return error_json(StatusCode(400), "invalid model capability selection path"),
@@ -4358,6 +4506,14 @@ impl AdminApi {
         {
             return error_json(StatusCode(422), &error);
         }
+        self.record_admin_audit(
+            &principal,
+            "model_capability",
+            &capability_id,
+            "model.capability.select",
+            json!({"capability_id": capability_id}),
+            json!({"status": "selected", "model_id": body.model_id}),
+        );
         self.handle_model_capabilities(hints)
     }
 
@@ -4494,20 +4650,35 @@ impl AdminApi {
         request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
-            return error_json(StatusCode(403), &error);
-        }
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let payload: ModelPoliciesRequest = match read_json_body(request) {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
+        let requested_count = payload.route_policies.len();
         match self
             .admin_store
             .save_model_route_policies(payload.route_policies)
         {
-            Ok(state) => ok_json(&ModelPoliciesResponse {
-                route_policies: state.models.route_policies,
-            }),
+            Ok(state) => {
+                self.record_admin_audit(
+                    &principal,
+                    "model_route_policy",
+                    "bulk",
+                    "model.route_policy.save",
+                    json!({"requested_policy_count": requested_count}),
+                    json!({
+                        "status": "saved",
+                        "route_policy_count": state.models.route_policies.len(),
+                    }),
+                );
+                ok_json(&ModelPoliciesResponse {
+                    route_policies: state.models.route_policies,
+                })
+            }
             Err(error) => error_json(StatusCode(422), &error),
         }
     }
@@ -4714,9 +4885,10 @@ impl AdminApi {
         status: &str,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
-            return error_json(StatusCode(403), &error);
-        }
+        let principal = match self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let review_id = match parse_automation_review_action_path(path) {
             Some(review_id) => review_id,
             None => return error_json(StatusCode(400), "invalid automation review path"),
@@ -4726,7 +4898,17 @@ impl AdminApi {
             .set_automation_review_status(&review_id, status)
             .map(|state| build_automation_reviews_response(state.automation_reviews))
         {
-            Ok(payload) => ok_json(&payload),
+            Ok(payload) => {
+                self.record_admin_audit(
+                    &principal,
+                    "automation_review",
+                    &review_id,
+                    "home_guardian.status.update",
+                    json!({"review_id": review_id}),
+                    json!({"status": status, "metadata_only": true}),
+                );
+                ok_json(&payload)
+            }
             Err(error) => error_json(StatusCode(422), &error),
         }
     }
@@ -7945,6 +8127,8 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/evt/evidence-bundle"
         || path == "/api/diagnostics/redacted-bundle"
         || path == "/api/routing/status"
+        || path == "/api/audit/records"
+        || path == "/api/audit/summary"
         || path == "/api/family/timeline"
         || path == "/api/family/timeline/digest"
         || path == "/api/home-guardian/activity"
@@ -16695,6 +16879,9 @@ mod tests {
         ModelRuntimeActivationRequest, ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
     };
     use harborbeacon_local_agent::control_plane::events::EventRecord;
+    use harborbeacon_local_agent::control_plane::audit::{
+        build_metadata_audit_record, AuditActorKind,
+    };
     use harborbeacon_local_agent::control_plane::media::{
         MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
         ShareLink,
@@ -17157,6 +17344,137 @@ mod tests {
         let text = serde_json::to_string(&body).expect("serialize routing status");
         assert!(!text.contains("gw_route_"));
         assert!(!text.contains("args.resume_token"));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn audit_records_admin_handler_filters_paginates_and_redacts() {
+        let (api, paths) = build_test_admin_api("harborbeacon-audit-records-shape");
+        api.admin_store
+            .append_audit_record(build_metadata_audit_record(
+                "home-1",
+                "model_route_policy",
+                "bulk",
+                "model.route_policy.save",
+                AuditActorKind::User,
+                "local-owner",
+                json!({
+                    "route_key": "gw_route_secret",
+                    "model_path": "C:\\models\\secret\\tokenizer.json",
+                    "token": "secret",
+                }),
+                json!({"status": "saved"}),
+            ))
+            .expect("append audit");
+        api.admin_store
+            .append_audit_record(build_metadata_audit_record(
+                "home-1",
+                "vision_event",
+                "event-audit-1",
+                "vision_event.notify",
+                AuditActorKind::User,
+                "local-owner",
+                json!({"event_id": "event-audit-1"}),
+                json!({"status": "blocked"}),
+            ))
+            .expect("append audit");
+
+        let hints = AccessIdentityHints::default();
+        let (status, body) = response_json(api.handle_audit_records(
+            "/api/audit/records?limit=1&action=model.route_policy.save",
+            &hints,
+        ));
+        assert_eq!(status, StatusCode(200));
+        assert_eq!(body["metadata_only"], json!(true));
+        assert_eq!(body["secret_scan"], json!("clean"));
+        assert_eq!(body["total"], json!(1));
+        assert_eq!(body["records"][0]["action"], json!("model.route_policy.save"));
+        assert!(is_admin_surface_path("/api/audit/records"));
+        assert_eq!(
+            normalize_unified_admin_path("/api/beacon/audit/records"),
+            "/api/audit/records"
+        );
+
+        let text = serde_json::to_string(&body).expect("serialize audit page");
+        assert!(!text.contains("gw_route_secret"));
+        assert!(!text.contains("C:\\models"));
+        assert!(!text.contains("tokenizer"));
+        assert!(text.contains("metadata_only"));
+
+        let (status, summary) = response_json(api.handle_audit_summary(
+            "/api/audit/summary?window=24h",
+            &hints,
+        ));
+        assert_eq!(status, StatusCode(200));
+        assert_eq!(summary["total"], json!(2));
+        assert_eq!(summary["by_action"]["vision_event.notify"], json!(1));
+        assert!(is_admin_surface_path("/api/audit/summary"));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn audit_records_admin_handler_clamps_and_filters_entity_id_with_safe_parse_fallbacks() {
+        let (api, paths) = build_test_admin_api("harborbeacon-audit-records-filter-console");
+        for index in 0..3 {
+            api.admin_store
+                .append_audit_record(build_metadata_audit_record(
+                    "home-1",
+                    if index == 1 {
+                        "home_guardian"
+                    } else {
+                        "vision_event"
+                    },
+                    if index == 1 { "rule-front" } else { "event-front" },
+                    if index == 1 {
+                        "home_guardian.evaluate_latest"
+                    } else {
+                        "vision_event.notify"
+                    },
+                    AuditActorKind::User,
+                    "local-owner",
+                    json!({
+                        "entity_id": if index == 1 { "rule-front" } else { "event-front" },
+                        "raw_path": "/mnt/pool/private/frame.jpg",
+                        "route_key": "gw_route_should_not_escape",
+                    }),
+                    json!({"status": "recorded"}),
+                ))
+                .expect("append audit");
+        }
+
+        let hints = AccessIdentityHints::default();
+        let (status, body) = response_json(api.handle_audit_records(
+            "/api/audit/records?limit=999&cursor=bogus&entity_kind=home_guardian&entity_id=rule-front&action=home_guardian.evaluate_latest",
+            &hints,
+        ));
+        assert_eq!(status, StatusCode(200));
+        assert_eq!(body["limit"], json!(200));
+        assert_eq!(body["cursor"], Value::Null);
+        assert_eq!(body["total"], json!(1));
+        assert_eq!(body["records"][0]["entity_id"], json!("rule-front"));
+        assert_eq!(
+            body["records"][0]["action"],
+            json!("home_guardian.evaluate_latest")
+        );
+
+        let text = serde_json::to_string(&body).expect("serialize audit page");
+        assert!(!text.contains("/mnt/pool/private"));
+        assert!(!text.contains("gw_route_should_not_escape"));
+        assert!(!text.contains("route_key"));
+        assert!(text.contains("opaque_delivery_route_present"));
+
+        let (status, body) = response_json(api.handle_audit_records(
+            "/api/audit/records?limit=1&cursor=1&action=vision_event.notify",
+            &hints,
+        ));
+        assert_eq!(status, StatusCode(200));
+        assert_eq!(body["limit"], json!(1));
+        assert_eq!(body["cursor"], json!("1"));
+        assert_eq!(body["total"], json!(2));
+        assert_eq!(body["records"].as_array().unwrap().len(), 1);
+        assert_eq!(body["next_cursor"], Value::Null);
 
         cleanup_test_paths(&paths);
     }

@@ -16,6 +16,9 @@ use crate::connectors::home_assistant::{
     redact_home_assistant_token, token_is_redacted, HOME_ASSISTANT_TOKEN_REDACTION,
 };
 use crate::control_plane::access::{PermissionBinding, PermissionEffect, ScopeKind};
+use crate::control_plane::audit::{
+    append_bounded_audit_record, sanitize_audit_stream, AuditRecord,
+};
 use crate::control_plane::auth::{AuthSource, IdentityBinding};
 use crate::control_plane::credentials::{
     CredentialKind, CredentialRecord, CredentialRotationState, ProviderAccount,
@@ -539,6 +542,8 @@ pub struct AdminConsoleState {
     pub knowledge_index_jobs: Vec<KnowledgeIndexJobRecord>,
     #[serde(default)]
     pub home_assistant: HomeAssistantAdminState,
+    #[serde(default)]
+    pub audit_records: Vec<AuditRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1985,6 +1990,22 @@ impl AdminConsoleStore {
         };
         state.models.route_policies = sanitized;
         self.save_projected_state(state)
+    }
+
+    pub fn append_audit_record(&self, record: AuditRecord) -> Result<AuditRecord, String> {
+        let mut state = self.load_or_create_state()?;
+        append_bounded_audit_record(&mut state.audit_records, record);
+        let record = state
+            .audit_records
+            .last()
+            .cloned()
+            .ok_or_else(|| "audit record stream append failed".to_string())?;
+        self.save_projected_state(state)?;
+        Ok(record)
+    }
+
+    pub fn audit_records(&self) -> Result<Vec<AuditRecord>, String> {
+        Ok(self.load_or_create_state()?.audit_records)
     }
 
     pub fn registry_store(&self) -> &DeviceRegistryStore {
@@ -3589,6 +3610,7 @@ fn sanitize_legacy_admin_fields(state: &mut AdminConsoleState) {
     state.knowledge = sanitize_knowledge_settings(state.knowledge.clone());
     state.knowledge_index_jobs = sanitize_knowledge_index_jobs(state.knowledge_index_jobs.clone());
     state.home_assistant = sanitize_home_assistant_state(state.home_assistant.clone());
+    state.audit_records = sanitize_audit_stream(state.audit_records.clone());
 }
 
 pub fn default_home_assistant_exposed_domains() -> Vec<String> {
