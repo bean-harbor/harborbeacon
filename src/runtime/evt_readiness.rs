@@ -36,17 +36,20 @@ pub fn build_evt_readiness_report(
     store: &AdminConsoleStore,
     gateway_status: Option<&Value>,
 ) -> Result<Value, String> {
-    let state = store.load_or_create_state()?;
+    let state = store.load_state()?;
     let camera_count = store
         .registry_store()
         .load_devices()
         .map(|devices| devices.len())
         .unwrap_or(0);
-    Ok(build_evt_readiness_from_state(
-        &state,
-        camera_count,
-        gateway_status,
-    ))
+    let mut readiness = build_evt_readiness_from_state(&state, camera_count, gateway_status);
+    if let Some(object) = readiness.as_object_mut() {
+        object.insert(
+            "admin_state".to_string(),
+            serde_json::to_value(store.state_stats(Some(&state))).unwrap_or_else(|_| json!({})),
+        );
+    }
+    Ok(readiness)
 }
 
 pub fn run_evt_preflight_report(

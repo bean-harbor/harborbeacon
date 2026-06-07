@@ -6,6 +6,8 @@ use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -83,13 +85,13 @@ use harborbeacon_local_agent::runtime::family_timeline::{
 };
 use harborbeacon_local_agent::runtime::home_guardian::{
     append_home_guardian_run_summary, automation_review_is_home_guardian,
-    build_home_guardian_activity_response, build_home_guardian_evaluation_response,
+    build_home_guardian_activity_response_with_activity, build_home_guardian_evaluation_response,
     build_home_guardian_rule_evaluation_plan, compact_home_guardian_evaluation_evidence,
     compact_home_guardian_proposal_evidence, complete_home_guardian_rule_execution,
     home_guardian_ha_service_request, home_guardian_idempotent_action_result,
-    home_guardian_redacted_action_plan, home_guardian_run_already_recorded,
-    home_guardian_unsupported_action_result, select_home_guardian_reviews,
-    HomeGuardianActionExecutionKind, HomeGuardianEvaluationResponse,
+    home_guardian_redacted_action_plan, home_guardian_rule_run_summary,
+    home_guardian_run_already_recorded, home_guardian_unsupported_action_result,
+    select_home_guardian_reviews, HomeGuardianActionExecutionKind, HomeGuardianEvaluationResponse,
     HomeGuardianRuleEvaluationPlan,
 };
 use harborbeacon_local_agent::runtime::hub::{
@@ -124,6 +126,14 @@ use harborbeacon_local_agent::runtime::vision_event::{
 };
 
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
+const HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY: usize = 128;
+const HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS: u64 = 60;
+const HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS: u64 = 300;
+const HOME_GUARDIAN_IDEMPOTENCY_MEMORY_SECONDS: u64 = 7 * 24 * 60 * 60;
+const ADMIN_HTTP_WORKER_COUNT: usize = 32;
+const ADMIN_HTTP_REQUEST_QUEUE_CAPACITY: usize = 256;
+const MAX_VISION_EVENT_INGEST_INFLIGHT: usize = 8;
+const HOME_GUARDIAN_ACTIVITY_LIMIT: usize = 500;
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -252,6 +262,218 @@ pub struct AdminApi {
     last_family_timeline_digest: Arc<Mutex<Option<Value>>>,
     last_guardian_rule_proposal: Arc<Mutex<Option<Value>>>,
     last_guardian_rule_evaluation: Arc<Mutex<Option<Value>>>,
+    guardian_queue: HomeGuardianEvaluationQueue,
+    guardian_auto_eval_cooldowns: Arc<Mutex<HashMap<String, u64>>>,
+    guardian_cooldowns: Arc<Mutex<HashMap<String, u64>>>,
+    guardian_action_runs: Arc<Mutex<HashMap<String, u64>>>,
+    guardian_rule_cache: Arc<Mutex<HomeGuardianRuleCache>>,
+    guardian_activity_log_lock: Arc<Mutex<()>>,
+    http_runtime: HttpRuntimeCounters,
+    vision_ingest_limiter: VisionIngestLimiter,
+}
+
+#[derive(Clone, Default)]
+struct HomeGuardianRuleCache {
+    active_reviews: Vec<AutomationRuleReview>,
+    loaded_at_epoch: u64,
+    file_bytes: u64,
+    modified_epoch_ms: Option<u128>,
+    refresh_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct HttpRuntimeCounters {
+    active: Arc<AtomicUsize>,
+    accepted_total: Arc<AtomicU64>,
+    rejected_total: Arc<AtomicU64>,
+    completed_total: Arc<AtomicU64>,
+}
+
+impl HttpRuntimeCounters {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            accepted_total: Arc::new(AtomicU64::new(0)),
+            rejected_total: Arc::new(AtomicU64::new(0)),
+            completed_total: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn record_accepted(&self) {
+        self.accepted_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rejected(&self) {
+        self.rejected_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn begin_request(&self) -> HttpRequestGuard {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        HttpRequestGuard {
+            counters: self.clone(),
+        }
+    }
+
+    fn snapshot(&self) -> Value {
+        let active = self.active.load(Ordering::Relaxed);
+        let accepted_total = self.accepted_total.load(Ordering::Relaxed);
+        let completed_total = self.completed_total.load(Ordering::Relaxed);
+        let queued_pending = accepted_total
+            .saturating_sub(completed_total)
+            .saturating_sub(active as u64);
+        json!({
+            "worker_count": ADMIN_HTTP_WORKER_COUNT,
+            "queue_capacity": ADMIN_HTTP_REQUEST_QUEUE_CAPACITY,
+            "active_requests": active,
+            "queued_pending": queued_pending,
+            "accepted_total": accepted_total,
+            "rejected_total": self.rejected_total.load(Ordering::Relaxed),
+            "completed_total": completed_total,
+            "process_thread_count": current_process_thread_count(),
+            "bounded": true,
+            "metadata_only": true,
+        })
+    }
+}
+
+struct HttpRequestGuard {
+    counters: HttpRuntimeCounters,
+}
+
+impl Drop for HttpRequestGuard {
+    fn drop(&mut self) {
+        self.counters.active.fetch_sub(1, Ordering::Relaxed);
+        self.counters
+            .completed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct VisionIngestLimiter {
+    active: Arc<AtomicUsize>,
+    accepted_total: Arc<AtomicU64>,
+    rejected_total: Arc<AtomicU64>,
+}
+
+impl VisionIngestLimiter {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            accepted_total: Arc::new(AtomicU64::new(0)),
+            rejected_total: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<VisionIngestGuard> {
+        loop {
+            let active = self.active.load(Ordering::Relaxed);
+            if active >= MAX_VISION_EVENT_INGEST_INFLIGHT {
+                self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            if self
+                .active
+                .compare_exchange_weak(active, active + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.accepted_total.fetch_add(1, Ordering::Relaxed);
+                return Some(VisionIngestGuard {
+                    limiter: self.clone(),
+                });
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Value {
+        json!({
+            "max_inflight": MAX_VISION_EVENT_INGEST_INFLIGHT,
+            "active_inflight": self.active.load(Ordering::Relaxed),
+            "accepted_total": self.accepted_total.load(Ordering::Relaxed),
+            "rejected_total": self.rejected_total.load(Ordering::Relaxed),
+            "bounded": true,
+            "metadata_only": true,
+        })
+    }
+}
+
+struct VisionIngestGuard {
+    limiter: VisionIngestLimiter,
+}
+
+impl Drop for VisionIngestGuard {
+    fn drop(&mut self) {
+        self.limiter.active.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+struct HomeGuardianEvaluationQueue {
+    sender: SyncSender<StoredLocalVisionEvent>,
+    queued: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
+    processed: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
+    coalesced: Arc<AtomicU64>,
+    disconnected: Arc<AtomicU64>,
+}
+
+impl HomeGuardianEvaluationQueue {
+    fn new(sender: SyncSender<StoredLocalVisionEvent>) -> Self {
+        Self {
+            sender,
+            queued: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            processed: Arc::new(AtomicU64::new(0)),
+            failed: Arc::new(AtomicU64::new(0)),
+            coalesced: Arc::new(AtomicU64::new(0)),
+            disconnected: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn enqueue(&self, event: StoredLocalVisionEvent) -> &'static str {
+        match self.sender.try_send(event) {
+            Ok(()) => {
+                self.queued.fetch_add(1, Ordering::Relaxed);
+                "queued"
+            }
+            Err(TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                "dropped"
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.disconnected.fetch_add(1, Ordering::Relaxed);
+                "disconnected"
+            }
+        }
+    }
+
+    fn record_processed(&self) {
+        self.processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failed(&self) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_coalesced(&self) {
+        self.coalesced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Value {
+        json!({
+            "capacity": HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY,
+            "auto_evaluation_min_interval_seconds": HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
+            "queued_total": self.queued.load(Ordering::Relaxed),
+            "dropped_total": self.dropped.load(Ordering::Relaxed),
+            "processed_total": self.processed.load(Ordering::Relaxed),
+            "failed_total": self.failed.load(Ordering::Relaxed),
+            "coalesced_total": self.coalesced.load(Ordering::Relaxed),
+            "disconnected_total": self.disconnected.load(Ordering::Relaxed),
+            "bounded": true,
+            "metadata_only": true,
+        })
+    }
 }
 
 pub(crate) type ModelRuntimeActivationHandler = Arc<
@@ -1386,7 +1608,9 @@ impl AdminApi {
         harbor_assistant_dist: PathBuf,
         public_origin: String,
     ) -> Self {
-        Self {
+        let (guardian_sender, guardian_receiver) =
+            sync_channel(HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY);
+        let api = Self {
             admin_store,
             task_service,
             dvr_runtime: DvrRuntime::default(),
@@ -1400,7 +1624,18 @@ impl AdminApi {
             last_family_timeline_digest: Arc::new(Mutex::new(None)),
             last_guardian_rule_proposal: Arc::new(Mutex::new(None)),
             last_guardian_rule_evaluation: Arc::new(Mutex::new(None)),
-        }
+            guardian_queue: HomeGuardianEvaluationQueue::new(guardian_sender),
+            guardian_auto_eval_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            guardian_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            guardian_action_runs: Arc::new(Mutex::new(HashMap::new())),
+            guardian_rule_cache: Arc::new(Mutex::new(HomeGuardianRuleCache::default())),
+            guardian_activity_log_lock: Arc::new(Mutex::new(())),
+            http_runtime: HttpRuntimeCounters::new(),
+            vision_ingest_limiter: VisionIngestLimiter::new(),
+        };
+        api.refresh_home_guardian_rule_cache_best_effort();
+        api.start_home_guardian_worker(guardian_receiver);
+        api
     }
 
     pub(crate) fn with_model_runtime_activation_handler(
@@ -1413,6 +1648,253 @@ impl AdminApi {
 
     fn hub(&self) -> CameraHubService {
         CameraHubService::new(self.admin_store.clone())
+    }
+
+    fn start_home_guardian_worker(&self, receiver: Receiver<StoredLocalVisionEvent>) {
+        let worker = self.clone();
+        let _ = thread::Builder::new()
+            .name("home-guardian-eval".to_string())
+            .spawn(move || worker.run_home_guardian_worker(receiver));
+    }
+
+    fn run_home_guardian_worker(self, receiver: Receiver<StoredLocalVisionEvent>) {
+        for stored in receiver {
+            match self.evaluate_home_guardian_rules_for_event(&stored, None, true) {
+                Ok(evaluation) => {
+                    self.guardian_queue.record_processed();
+                    self.record_last_guardian_rule_evaluation(
+                        &serde_json::to_value(&evaluation).unwrap_or_else(|_| json!({})),
+                    );
+                }
+                Err(error) => {
+                    self.guardian_queue.record_failed();
+                    self.record_last_guardian_rule_evaluation(&json!({
+                        "status": "failed",
+                        "event_id": stored.event.event_id,
+                        "reason": redact_admin_string(&error),
+                        "metadata_only": true,
+                        "secret_scan": "clean",
+                    }));
+                }
+            }
+        }
+    }
+
+    fn enqueue_home_guardian_evaluation(&self, stored: &StoredLocalVisionEvent) -> &'static str {
+        let now_epoch = current_epoch_secs();
+        if !self.guardian_auto_evaluation_due(stored, now_epoch) {
+            self.guardian_queue.record_coalesced();
+            return "coalesced";
+        }
+        self.guardian_queue.enqueue(stored.clone())
+    }
+
+    fn home_guardian_queue_snapshot(&self) -> Value {
+        self.guardian_queue.snapshot()
+    }
+
+    fn refresh_home_guardian_rule_cache_best_effort(&self) {
+        if let Err(error) = self.refresh_home_guardian_rule_cache() {
+            if let Ok(mut guard) = self.guardian_rule_cache.lock() {
+                guard.refresh_error = Some(redact_admin_string(&error));
+            }
+        }
+    }
+
+    fn refresh_home_guardian_rule_cache(&self) -> Result<(), String> {
+        let state = self.admin_store.load_state()?;
+        let active_reviews = state
+            .automation_reviews
+            .into_iter()
+            .filter(|review| {
+                automation_review_is_home_guardian(review) && review.status.as_str() == "active"
+            })
+            .collect::<Vec<_>>();
+        let (file_bytes, modified_epoch_ms) = admin_state_file_fingerprint(self.admin_store.path());
+        let mut guard = self
+            .guardian_rule_cache
+            .lock()
+            .map_err(|_| "home guardian rule cache lock poisoned".to_string())?;
+        *guard = HomeGuardianRuleCache {
+            active_reviews,
+            loaded_at_epoch: current_epoch_secs(),
+            file_bytes,
+            modified_epoch_ms,
+            refresh_error: None,
+        };
+        Ok(())
+    }
+
+    fn cached_home_guardian_reviews_for_auto(&self) -> Result<Vec<AutomationRuleReview>, String> {
+        let (file_bytes, modified_epoch_ms) = admin_state_file_fingerprint(self.admin_store.path());
+        let needs_refresh = self
+            .guardian_rule_cache
+            .lock()
+            .map(|guard| {
+                guard.loaded_at_epoch == 0
+                    || guard.file_bytes != file_bytes
+                    || guard.modified_epoch_ms != modified_epoch_ms
+            })
+            .unwrap_or(true);
+        if needs_refresh {
+            self.refresh_home_guardian_rule_cache()?;
+        }
+        let guard = self
+            .guardian_rule_cache
+            .lock()
+            .map_err(|_| "home guardian rule cache lock poisoned".to_string())?;
+        if let Some(error) = guard.refresh_error.as_ref() {
+            return Err(error.clone());
+        }
+        Ok(guard.active_reviews.clone())
+    }
+
+    fn guardian_rule_cache_snapshot(&self) -> Value {
+        match self.guardian_rule_cache.lock() {
+            Ok(guard) => json!({
+                "active_rule_count": guard.active_reviews.len(),
+                "loaded_at_epoch": guard.loaded_at_epoch,
+                "file_bytes": guard.file_bytes,
+                "modified_epoch_ms": guard.modified_epoch_ms.map(|value| value.to_string()),
+                "refresh_error": guard.refresh_error.as_deref().map(redact_admin_string),
+                "metadata_only": true,
+            }),
+            Err(_) => json!({
+                "status": "unavailable",
+                "reason": "home guardian rule cache lock poisoned",
+                "metadata_only": true,
+            }),
+        }
+    }
+
+    fn guardian_action_run_seen(&self, idempotency_key: &str, now_epoch: u64) -> bool {
+        let Ok(mut guard) = self.guardian_action_runs.lock() else {
+            return false;
+        };
+        guard.retain(|_, last_epoch| {
+            now_epoch.saturating_sub(*last_epoch) <= HOME_GUARDIAN_IDEMPOTENCY_MEMORY_SECONDS
+        });
+        guard.contains_key(idempotency_key)
+    }
+
+    fn mark_guardian_action_run_seen(&self, idempotency_key: &str, now_epoch: u64) {
+        if let Ok(mut guard) = self.guardian_action_runs.lock() {
+            guard.insert(idempotency_key.to_string(), now_epoch);
+        }
+    }
+
+    fn record_http_request_accepted(&self) {
+        self.http_runtime.record_accepted();
+    }
+
+    fn record_http_request_rejected(&self) {
+        self.http_runtime.record_rejected();
+    }
+
+    fn begin_http_request(&self) -> HttpRequestGuard {
+        self.http_runtime.begin_request()
+    }
+
+    fn runtime_backpressure_snapshot(&self) -> Value {
+        json!({
+            "http": self.http_runtime.snapshot(),
+            "vision_ingest": self.vision_ingest_limiter.snapshot(),
+            "home_guardian": self.home_guardian_queue_snapshot(),
+            "home_guardian_rule_cache": self.guardian_rule_cache_snapshot(),
+            "metadata_only": true,
+        })
+    }
+
+    fn home_guardian_activity_log_path(&self) -> PathBuf {
+        self.admin_store
+            .path()
+            .with_file_name("home_guardian_activity.jsonl")
+    }
+
+    fn load_home_guardian_activity_summaries(&self) -> Vec<Value> {
+        let path = self.home_guardian_activity_log_path();
+        let Ok(text) = fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let summaries = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+            .collect::<Vec<_>>();
+        latest_home_guardian_activity_summaries(summaries)
+    }
+
+    fn append_home_guardian_activity_summary(&self, summary: &Value) {
+        let Ok(_guard) = self.guardian_activity_log_lock.lock() else {
+            return;
+        };
+        let path = self.home_guardian_activity_log_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut summaries = self.load_home_guardian_activity_summaries();
+        summaries.push(summary.clone());
+        summaries = latest_home_guardian_activity_summaries(summaries);
+        let payload = summaries
+            .into_iter()
+            .filter_map(|summary| serde_json::to_string(&summary).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = fs::write(path, format!("{payload}\n"));
+    }
+
+    fn guardian_action_in_cooldown(
+        &self,
+        review: &AutomationRuleReview,
+        stored: &StoredLocalVisionEvent,
+        action_key: &str,
+        now_epoch: u64,
+    ) -> bool {
+        let key = home_guardian_action_cooldown_key(review, stored, action_key);
+        let Ok(mut guard) = self.guardian_cooldowns.lock() else {
+            return false;
+        };
+        guard.retain(|_, last_epoch| {
+            now_epoch.saturating_sub(*last_epoch) <= HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS * 2
+        });
+        guard.get(&key).is_some_and(|last_epoch| {
+            now_epoch.saturating_sub(*last_epoch) < HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS
+        })
+    }
+
+    fn mark_guardian_action_cooldown(
+        &self,
+        review: &AutomationRuleReview,
+        stored: &StoredLocalVisionEvent,
+        action_key: &str,
+        now_epoch: u64,
+    ) {
+        let key = home_guardian_action_cooldown_key(review, stored, action_key);
+        if let Ok(mut guard) = self.guardian_cooldowns.lock() {
+            guard.insert(key, now_epoch);
+        }
+    }
+
+    fn guardian_auto_evaluation_due(
+        &self,
+        stored: &StoredLocalVisionEvent,
+        now_epoch: u64,
+    ) -> bool {
+        let key = home_guardian_auto_evaluation_cooldown_key(stored);
+        let Ok(mut guard) = self.guardian_auto_eval_cooldowns.lock() else {
+            return true;
+        };
+        guard.retain(|_, last_epoch| {
+            now_epoch.saturating_sub(*last_epoch)
+                <= HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS * 2
+        });
+        if guard.get(&key).is_some_and(|last_epoch| {
+            now_epoch.saturating_sub(*last_epoch)
+                < HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS
+        }) {
+            return false;
+        }
+        guard.insert(key, now_epoch);
+        true
     }
 
     fn record_last_event_notification_attempt(
@@ -1557,7 +2039,7 @@ impl AdminApi {
         hints: &AccessIdentityHints,
         action: AccessAction,
     ) -> Result<AccessPrincipal, String> {
-        let state = self.admin_store.load_or_create_state()?;
+        let state = self.admin_store.load_state()?;
         let workspace_id = state
             .platform
             .workspaces
@@ -1586,7 +2068,7 @@ impl AdminApi {
         device_id: &str,
         action: AccessAction,
     ) -> Result<AccessPrincipal, String> {
-        let state = self.admin_store.load_or_create_state()?;
+        let state = self.admin_store.load_state()?;
         authorize_access(&state, hints, action, &format!("camera:{device_id}"), true)
     }
 
@@ -1675,12 +2157,12 @@ impl AdminApi {
             Method::Get if path == "/api/routing/status" => {
                 self.handle_routing_status(&identity_hints).boxed()
             }
-            Method::Get if path == "/api/audit/records" => self
-                .handle_audit_records(&raw_url, &identity_hints)
-                .boxed(),
-            Method::Get if path == "/api/audit/summary" => self
-                .handle_audit_summary(&raw_url, &identity_hints)
-                .boxed(),
+            Method::Get if path == "/api/audit/records" => {
+                self.handle_audit_records(&raw_url, &identity_hints).boxed()
+            }
+            Method::Get if path == "/api/audit/summary" => {
+                self.handle_audit_summary(&raw_url, &identity_hints).boxed()
+            }
             Method::Get if path == "/api/knowledge/settings" => {
                 self.handle_knowledge_settings(&identity_hints).boxed()
             }
@@ -2103,7 +2585,7 @@ impl AdminApi {
         let live_bridge_provider = fetch_remote_gateway_status()
             .ok()
             .and_then(|payload| live_bridge_provider_from_setup_status(&payload));
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => match self.current_state() {
                 Ok(mut payload) => {
                     let mut account_management =
@@ -2141,7 +2623,7 @@ impl AdminApi {
         let live_bridge_provider = fetch_remote_gateway_status()
             .ok()
             .and_then(|payload| live_bridge_provider_from_setup_status(&payload));
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 let mut snapshot = account_management_snapshot(&state, Some(&self.public_origin));
                 if let Some(provider) = live_bridge_provider.as_ref() {
@@ -2165,7 +2647,7 @@ impl AdminApi {
         }
 
         self.refresh_gateway_projection_best_effort();
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 if let Ok(payload) = fetch_remote_gateway_status() {
                     ok_json(&payload)
@@ -2193,7 +2675,7 @@ impl AdminApi {
             .as_ref()
             .and_then(live_bridge_provider_from_setup_status);
 
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 let state_snapshot = self.current_state().ok().map(redact_state_snapshot);
                 let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
@@ -2262,7 +2744,7 @@ impl AdminApi {
             .as_ref()
             .and_then(live_bridge_provider_from_setup_status);
 
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 let state_snapshot = self.current_state().ok().map(redact_state_snapshot);
                 let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
@@ -2330,7 +2812,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
                 ok_json(&build_rag_readiness_response(
@@ -2344,6 +2826,20 @@ impl AdminApi {
         }
     }
 
+    fn evt_readiness_report_with_runtime(
+        &self,
+        gateway_status: Option<&Value>,
+    ) -> Result<Value, String> {
+        let mut readiness = build_evt_readiness_report(&self.admin_store, gateway_status)?;
+        if let Some(object) = readiness.as_object_mut() {
+            object.insert(
+                "runtime_backpressure".to_string(),
+                self.runtime_backpressure_snapshot(),
+            );
+        }
+        Ok(readiness)
+    }
+
     fn handle_evt_readiness(
         &self,
         hints: &AccessIdentityHints,
@@ -2352,7 +2848,7 @@ impl AdminApi {
             return error_json(StatusCode(403), &error);
         }
         let live_gateway_status = fetch_remote_gateway_status().ok();
-        match build_evt_readiness_report(&self.admin_store, live_gateway_status.as_ref()) {
+        match self.evt_readiness_report_with_runtime(live_gateway_status.as_ref()) {
             Ok(readiness) => ok_json(&readiness),
             Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
         }
@@ -2393,11 +2889,19 @@ impl AdminApi {
             return error_json(StatusCode(403), &error);
         }
         let live_gateway_status = fetch_remote_gateway_status().ok();
-        let readiness =
-            match build_evt_readiness_report(&self.admin_store, live_gateway_status.as_ref()) {
-                Ok(readiness) => readiness,
-                Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
-            };
+        let readiness = match self.evt_readiness_report_with_runtime(live_gateway_status.as_ref()) {
+            Ok(readiness) => readiness,
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let admin_state_stats = self
+            .admin_store
+            .load_state()
+            .ok()
+            .map(|state| {
+                serde_json::to_value(self.admin_store.state_stats(Some(&state)))
+                    .unwrap_or_else(|_| json!({}))
+            })
+            .unwrap_or_else(|| json!({"status": "unavailable", "metadata_only": true}));
         let diagnostics_workflow = build_evt_diagnostics_workflow(
             &readiness,
             self.last_evt_preflight(),
@@ -2406,6 +2910,9 @@ impl AdminApi {
             self.last_family_timeline_digest(),
             self.last_guardian_rule_proposal(),
             self.last_guardian_rule_evaluation(),
+            self.home_guardian_queue_snapshot(),
+            self.runtime_backpressure_snapshot(),
+            admin_state_stats,
             build_latest_general_message_nsp_route_workflow(&self.task_service),
             build_latest_home_assistant_task_api_workflow(&self.task_service),
         );
@@ -2421,7 +2928,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let admin_state = match self.admin_store.load_or_create_state() {
+        let admin_state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -2432,19 +2939,19 @@ impl AdminApi {
         let runtime_projection = probe_local_model_runtime(&admin_state.models.endpoints);
         let home_assistant =
             harborbeacon_local_agent::runtime::admin_console::redact_home_assistant_state(
-                admin_state.home_assistant,
+                admin_state.home_assistant.clone(),
             );
         let live_gateway_status = fetch_remote_gateway_status().ok();
-        let evt_readiness =
-            build_evt_readiness_report(&self.admin_store, live_gateway_status.as_ref())
-                .unwrap_or_else(|error| {
-                    json!({
-                        "kind": "evt_readiness_v1",
-                        "status": "blocked",
-                        "error": redact_admin_string(&error),
-                        "redacted": true,
-                    })
-                });
+        let evt_readiness = self
+            .evt_readiness_report_with_runtime(live_gateway_status.as_ref())
+            .unwrap_or_else(|error| {
+                json!({
+                    "kind": "evt_readiness_v1",
+                    "status": "blocked",
+                    "error": redact_admin_string(&error),
+                    "redacted": true,
+                })
+            });
         let bundle = build_redacted_diagnostics_bundle(
             &redacted_state,
             &build_home_assistant_status_response(&home_assistant),
@@ -2454,6 +2961,10 @@ impl AdminApi {
             self.last_family_timeline_digest(),
             self.last_guardian_rule_proposal(),
             self.last_guardian_rule_evaluation(),
+            self.home_guardian_queue_snapshot(),
+            self.runtime_backpressure_snapshot(),
+            serde_json::to_value(self.admin_store.state_stats(Some(&admin_state)))
+                .unwrap_or_else(|_| json!({})),
             build_latest_general_message_nsp_route_workflow(&self.task_service),
             build_latest_home_assistant_task_api_workflow(&self.task_service),
             evt_readiness,
@@ -2484,7 +2995,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 let runtimes = state
                     .models
@@ -3430,7 +3941,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -3448,7 +3959,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -3546,7 +4057,7 @@ impl AdminApi {
             .as_ref()
             .and_then(live_bridge_provider_from_setup_status);
 
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => {
                 let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
                 let endpoints = overlay_model_endpoints_with_runtime_truth(
@@ -3579,6 +4090,19 @@ impl AdminApi {
         request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let Some(_ingest_guard) = self.vision_ingest_limiter.try_acquire() else {
+            return json_response(
+                StatusCode(429),
+                &json!({
+                    "error": "vision ingest busy",
+                    "status": "blocked",
+                    "reason": "Too many local vision event ingests are in progress; retry after the current batch drains.",
+                    "metadata_only": true,
+                    "secret_scan": "clean",
+                    "limits": self.vision_ingest_limiter.snapshot(),
+                }),
+            );
+        };
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
@@ -3592,12 +4116,16 @@ impl AdminApi {
         };
         match ingest_local_vision_event_default(event) {
             Ok(stored) => {
-                if let Ok(evaluation) =
-                    self.evaluate_home_guardian_rules_for_event(&stored, None, true)
-                {
-                    self.record_last_guardian_rule_evaluation(
-                        &serde_json::to_value(&evaluation).unwrap_or_else(|_| json!({})),
-                    );
+                let queue_status = self.enqueue_home_guardian_evaluation(&stored);
+                if queue_status != "queued" {
+                    self.record_last_guardian_rule_evaluation(&json!({
+                        "status": queue_status,
+                        "event_id": stored.event.event_id,
+                        "reason": "Home Guardian evaluation queue did not accept the event.",
+                        "queue": self.home_guardian_queue_snapshot(),
+                        "metadata_only": true,
+                        "secret_scan": "clean",
+                    }));
                 }
                 ok_json(&stored)
             }
@@ -3694,9 +4222,10 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.load_or_create_state() {
-            Ok(state) => ok_json(&build_home_guardian_activity_response(
+        match self.admin_store.load_state() {
+            Ok(state) => ok_json(&build_home_guardian_activity_response_with_activity(
                 state.automation_reviews,
+                self.load_home_guardian_activity_summaries(),
             )),
             Err(error) => error_json(StatusCode(500), &error),
         }
@@ -3750,8 +4279,13 @@ impl AdminApi {
         only_review_id: Option<&str>,
         execute_active: bool,
     ) -> Result<HomeGuardianEvaluationResponse, String> {
-        let state = self.admin_store.load_or_create_state()?;
-        let reviews = select_home_guardian_reviews(state.automation_reviews, only_review_id)?;
+        let automatic_evaluation = only_review_id.is_none();
+        let reviews = if automatic_evaluation {
+            self.cached_home_guardian_reviews_for_auto()?
+        } else {
+            let state = self.admin_store.load_state()?;
+            select_home_guardian_reviews(state.automation_reviews, only_review_id)?
+        };
         let mut results = Vec::new();
         for review in reviews {
             let Some(plan) = build_home_guardian_rule_evaluation_plan(
@@ -3768,16 +4302,36 @@ impl AdminApi {
                     summary,
                     persist_summary,
                 } => {
-                    if persist_summary {
+                    if persist_summary && !automatic_evaluation {
                         let review = append_home_guardian_run_summary(review, summary.clone());
                         self.admin_store.upsert_automation_review(review)?;
+                        self.append_home_guardian_activity_summary(&summary);
+                    } else if persist_summary {
+                        self.append_home_guardian_activity_summary(&summary);
                     }
                     results.push(summary);
                 }
                 HomeGuardianRuleEvaluationPlan::Execute { review, actions } => {
                     let mut action_results = Vec::new();
+                    let mut cooldown_skipped = 0usize;
+                    let now_epoch = current_epoch_secs();
                     for action_plan in actions {
-                        if home_guardian_run_already_recorded(&review, &action_plan.idempotency_key)
+                        if only_review_id.is_none()
+                            && self.guardian_action_in_cooldown(
+                                &review,
+                                stored,
+                                &action_plan.action_key,
+                                now_epoch,
+                            )
+                        {
+                            cooldown_skipped = cooldown_skipped.saturating_add(1);
+                            continue;
+                        }
+                        if self.guardian_action_run_seen(&action_plan.idempotency_key, now_epoch)
+                            || home_guardian_run_already_recorded(
+                                &review,
+                                &action_plan.idempotency_key,
+                            )
                         {
                             action_results.push(home_guardian_idempotent_action_result(
                                 &action_plan.action_key,
@@ -3803,13 +4357,46 @@ impl AdminApi {
                                 )
                             }
                         };
+                        let should_cooldown = !matches!(
+                            result.get("status").and_then(Value::as_str),
+                            Some("skipped")
+                        );
+                        if should_cooldown {
+                            self.mark_guardian_action_cooldown(
+                                &review,
+                                stored,
+                                &action_plan.action_key,
+                                now_epoch,
+                            );
+                            self.mark_guardian_action_run_seen(
+                                &action_plan.idempotency_key,
+                                now_epoch,
+                            );
+                        }
                         action_results.push(result);
+                    }
+
+                    if action_results.is_empty() && cooldown_skipped > 0 {
+                        let summary = home_guardian_rule_run_summary(
+                            &review,
+                            stored,
+                            "skipped",
+                            true,
+                            false,
+                            "Home Guardian action cooldown is active; automatic evaluation was not persisted.",
+                            Vec::new(),
+                        );
+                        results.push(summary);
+                        continue;
                     }
 
                     let summary =
                         complete_home_guardian_rule_execution(&review, stored, action_results);
-                    let review = append_home_guardian_run_summary(review, summary.clone());
-                    self.admin_store.upsert_automation_review(review)?;
+                    if !automatic_evaluation {
+                        let review = append_home_guardian_run_summary(review, summary.clone());
+                        self.admin_store.upsert_automation_review(review)?;
+                    }
+                    self.append_home_guardian_activity_summary(&summary);
                     results.push(summary);
                 }
             }
@@ -3823,7 +4410,7 @@ impl AdminApi {
         stored: &StoredLocalVisionEvent,
         idempotency_key: &str,
     ) -> Value {
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => {
                 return json!({
@@ -4117,7 +4704,7 @@ impl AdminApi {
             Ok(None) => return error_json(StatusCode(404), "local vision event not found"),
             Err(error) => return error_json(StatusCode(500), &error),
         };
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4205,7 +4792,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => ok_json(&ModelPoliciesResponse {
                 route_policies: state.models.route_policies,
             }),
@@ -4287,7 +4874,7 @@ impl AdminApi {
             Some(endpoint_id) => endpoint_id,
             None => return error_json(StatusCode(400), "invalid model endpoint test path"),
         };
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4337,7 +4924,7 @@ impl AdminApi {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4691,7 +5278,7 @@ impl AdminApi {
             return error_json(StatusCode(403), &error);
         }
 
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -4808,7 +5395,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => ok_json(&build_automation_reviews_response(state.automation_reviews)),
             Err(error) => error_json(StatusCode(500), &error),
         }
@@ -4849,7 +5436,8 @@ impl AdminApi {
             run_summaries: body.run_summaries,
             metadata: body.metadata,
         };
-        let proposal_evidence = if automation_review_is_home_guardian(&review) {
+        let is_home_guardian_review = automation_review_is_home_guardian(&review);
+        let proposal_evidence = if is_home_guardian_review {
             Some(json!({
                 "status": "proposed",
                 "review_id": review.review_id,
@@ -4872,6 +5460,9 @@ impl AdminApi {
             Ok(payload) => {
                 if let Some(proposal_evidence) = proposal_evidence.as_ref() {
                     self.record_last_guardian_rule_proposal(proposal_evidence);
+                }
+                if is_home_guardian_review {
+                    self.refresh_home_guardian_rule_cache_best_effort();
                 }
                 ok_json(&payload)
             }
@@ -4899,6 +5490,7 @@ impl AdminApi {
             .map(|state| build_automation_reviews_response(state.automation_reviews))
         {
             Ok(payload) => {
+                self.refresh_home_guardian_rule_cache_best_effort();
                 self.record_admin_audit(
                     &principal,
                     "automation_review",
@@ -4991,7 +5583,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => ok_json(&NotificationTargetsResponse {
                 targets: state.notification_targets,
             }),
@@ -5369,7 +5961,7 @@ impl AdminApi {
             }
             Err(error) => return error_json(StatusCode(422), &error),
         };
-        match self.admin_store.load_or_create_state() {
+        match self.admin_store.load_state() {
             Ok(state) => ok_json(&build_device_credential_status(&state, &device)),
             Err(error) => error_json(StatusCode(500), &error),
         }
@@ -5427,7 +6019,7 @@ impl AdminApi {
             Err(error) => return error_json(StatusCode(400), &error),
         };
 
-        let state = match self.admin_store.load_or_create_state() {
+        let state = match self.admin_store.load_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
         };
@@ -6092,7 +6684,7 @@ impl AdminApi {
 
     fn current_gateway_manage_url(&self) -> String {
         self.admin_store
-            .load_or_create_state()
+            .load_state()
             .map(|state| {
                 harborbeacon_local_agent::runtime::admin_console::gateway_manage_url(
                     &state.bridge_provider.gateway_base_url,
@@ -6361,7 +6953,7 @@ impl AdminApi {
     }
 
     fn camera_device_with_runtime_credentials(&self, device: &CameraDevice) -> CameraDevice {
-        let Ok(state) = self.admin_store.load_or_create_state() else {
+        let Ok(state) = self.admin_store.load_state() else {
             return device.clone();
         };
         let Some(stream_url) = camera_stream_url_with_credentials(device, &state) else {
@@ -6396,7 +6988,7 @@ impl AdminApi {
         device: &CameraDevice,
         request: RtspCheckRequest,
     ) -> Result<RtspCheckResponse, String> {
-        let state = self.admin_store.load_or_create_state()?;
+        let state = self.admin_store.load_state()?;
         let credential = state
             .device_credentials
             .iter()
@@ -6523,7 +7115,7 @@ impl AdminApi {
         &self,
         device: &CameraDevice,
     ) -> Result<DeviceEvidenceResponse, String> {
-        let state = self.admin_store.load_or_create_state()?;
+        let state = self.admin_store.load_state()?;
         let credential_status = build_device_credential_status(&state, device);
         let share_links = self.list_share_links(Some(&device.device_id))?;
         let mut evidence = self.admin_store.list_device_evidence(&device.device_id)?;
@@ -6818,12 +7410,69 @@ fn main() {
     });
 
     println!("HarborBeacon admin API listening on http://{}", cli.bind);
-    for request in server.incoming_requests() {
-        let api = api.clone();
-        thread::spawn(move || {
-            api.handle(request);
-        });
+    let (request_sender, request_receiver) =
+        sync_channel::<Request>(ADMIN_HTTP_REQUEST_QUEUE_CAPACITY);
+    let request_receiver = Arc::new(Mutex::new(request_receiver));
+    for worker_index in 0..ADMIN_HTTP_WORKER_COUNT {
+        let worker_api = api.clone();
+        let worker_receiver = request_receiver.clone();
+        let _ = thread::Builder::new()
+            .name(format!("admin-api-worker-{worker_index}"))
+            .spawn(move || loop {
+                let request = {
+                    let Ok(receiver) = worker_receiver.lock() else {
+                        return;
+                    };
+                    receiver.recv()
+                };
+                match request {
+                    Ok(request) => {
+                        let _guard = worker_api.begin_http_request();
+                        worker_api.handle(request);
+                    }
+                    Err(_) => return,
+                }
+            });
     }
+
+    for request in server.incoming_requests() {
+        if is_healthz_request(&request) {
+            let _ = request.respond(ok_json(&json!({"status":"ok"})).boxed());
+            continue;
+        }
+        match request_sender.try_send(request) {
+            Ok(()) => api.record_http_request_accepted(),
+            Err(TrySendError::Full(request)) => {
+                api.record_http_request_rejected();
+                let _ = request.respond(service_overloaded_response().boxed());
+            }
+            Err(TrySendError::Disconnected(request)) => {
+                api.record_http_request_rejected();
+                let _ = request.respond(service_overloaded_response().boxed());
+            }
+        }
+    }
+}
+
+fn is_healthz_request(request: &Request) -> bool {
+    request.method() == &Method::Get
+        && normalize_unified_admin_url(request.url())
+            .split('?')
+            .next()
+            .is_some_and(|path| path == "/healthz")
+}
+
+fn service_overloaded_response() -> Response<std::io::Cursor<Vec<u8>>> {
+    json_response(
+        StatusCode(503),
+        &json!({
+            "error": "service overloaded",
+            "status": "blocked",
+            "reason": "HarborBeacon request queue is full; retry after the current load drops.",
+            "metadata_only": true,
+            "secret_scan": "clean",
+        }),
+    )
 }
 
 fn resolve_state_path(preferred: &Path) -> PathBuf {
@@ -10744,6 +11393,61 @@ fn json_usize_at_paths(value: &Value, paths: &[&str]) -> Option<usize> {
     })
 }
 
+fn latest_home_guardian_activity_summaries(mut summaries: Vec<Value>) -> Vec<Value> {
+    summaries.sort_by(|left, right| {
+        json_string_at_paths(right, &["/created_at", "/evaluated_at"]).cmp(&json_string_at_paths(
+            left,
+            &["/created_at", "/evaluated_at"],
+        ))
+    });
+    summaries.truncate(HOME_GUARDIAN_ACTIVITY_LIMIT);
+    summaries.reverse();
+    summaries
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn current_process_thread_count() -> Option<u64> {
+    let text = fs::read_to_string("/proc/self/status").ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn admin_state_file_fingerprint(path: &Path) -> (u64, Option<u128>) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return (0, None);
+    };
+    let modified_epoch_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis());
+    (metadata.len(), modified_epoch_ms)
+}
+
+fn home_guardian_action_cooldown_key(
+    review: &AutomationRuleReview,
+    stored: &StoredLocalVisionEvent,
+    action_key: &str,
+) -> String {
+    let rule_key = review
+        .rule_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&review.review_id);
+    format!("{}:{}:{}", rule_key, stored.event.camera_id, action_key)
+}
+
+fn home_guardian_auto_evaluation_cooldown_key(stored: &StoredLocalVisionEvent) -> String {
+    format!("{}:{}", stored.event.camera_id, stored.event.event_type)
+}
+
 fn build_redacted_diagnostics_bundle(
     state: &StateResponse,
     home_assistant: &HomeAssistantStatusResponse,
@@ -10753,6 +11457,9 @@ fn build_redacted_diagnostics_bundle(
     last_family_timeline_digest: Option<Value>,
     last_guardian_rule_proposal: Option<Value>,
     last_guardian_rule_evaluation: Option<Value>,
+    guardian_queue: Value,
+    runtime_backpressure: Value,
+    admin_state_stats: Value,
     last_general_message_nsp_route: Value,
     last_home_assistant_task_api_workflow: Value,
     evt_readiness: Value,
@@ -10849,6 +11556,9 @@ fn build_redacted_diagnostics_bundle(
                 last_guardian_rule_evaluation,
                 "No Home Guardian rule evaluation has been recorded in this API process.",
             ),
+            "guardian_queue": guardian_queue,
+            "runtime_backpressure": runtime_backpressure,
+            "admin_state": admin_state_stats,
             "general_message_nsp_route": last_general_message_nsp_route,
             "home_assistant_task_api_workflow": last_home_assistant_task_api_workflow,
             "evt_readiness": evt_readiness_workflow_summary(&evt_readiness),
@@ -10915,6 +11625,9 @@ fn build_evt_diagnostics_workflow(
     last_family_timeline_digest: Option<Value>,
     last_guardian_rule_proposal: Option<Value>,
     last_guardian_rule_evaluation: Option<Value>,
+    guardian_queue: Value,
+    runtime_backpressure: Value,
+    admin_state_stats: Value,
     last_general_message_nsp_route: Value,
     last_home_assistant_task_api_workflow: Value,
 ) -> Value {
@@ -10939,6 +11652,9 @@ fn build_evt_diagnostics_workflow(
             last_guardian_rule_evaluation,
             "No Home Guardian rule evaluation has been recorded in this API process.",
         ),
+        "guardian_queue": guardian_queue,
+        "runtime_backpressure": runtime_backpressure,
+        "admin_state": admin_state_stats,
         "general_message_nsp_route": last_general_message_nsp_route,
         "home_assistant_task_api_workflow": last_home_assistant_task_api_workflow,
         "evt_readiness": evt_readiness_workflow_summary(evt_readiness),
@@ -16837,7 +17553,7 @@ mod tests {
         build_local_model_catalog, build_local_vision_event_notification_blocked_response,
         build_model_capabilities_response, build_rag_readiness_response,
         build_redacted_diagnostics_bundle, build_release_readiness_response,
-        build_rtsp_url_from_patch, camera_stream_url_with_credentials,
+        build_rtsp_url_from_patch, camera_stream_url_with_credentials, current_epoch_secs,
         default_model_download_target_path, default_model_download_target_path_in_root,
         default_model_endpoints, ensure_local_admin_access, ensure_local_camera_access,
         harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
@@ -16873,15 +17589,18 @@ mod tests {
         redacted_home_assistant_task_api_event_summary, release_item, request_identity_hints,
         resolve_harbor_assistant_asset_path, resolve_knowledge_preview_path,
         run_knowledge_index_jobs, run_model_download_job, run_model_download_transfer,
-        scan_request_task_args, url_encode_path_segment, validate_home_assistant_service_fields,
-        validate_home_assistant_service_smoke, AdminApi, HomeAssistantServiceSmokeRequest,
-        KnowledgeSearchApiRequest, LocalModelRuntimeProjection, ManualAddRequest,
-        ModelRuntimeActivationRequest, ModelRuntimeActivationResult, DEFAULT_HF_ENDPOINT,
+        scan_request_task_args, service_overloaded_response, url_encode_path_segment,
+        validate_home_assistant_service_fields, validate_home_assistant_service_smoke, AdminApi,
+        HomeAssistantServiceSmokeRequest, HomeGuardianEvaluationQueue, KnowledgeSearchApiRequest,
+        LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
+        ModelRuntimeActivationResult, VisionIngestLimiter, DEFAULT_HF_ENDPOINT,
+        HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
+        MAX_VISION_EVENT_INGEST_INFLIGHT,
     };
-    use harborbeacon_local_agent::control_plane::events::EventRecord;
     use harborbeacon_local_agent::control_plane::audit::{
         build_metadata_audit_record, AuditActorKind,
     };
+    use harborbeacon_local_agent::control_plane::events::EventRecord;
     use harborbeacon_local_agent::control_plane::media::{
         MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
         ShareLink,
@@ -16917,6 +17636,7 @@ mod tests {
     use std::net::TcpListener;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -17054,6 +17774,162 @@ mod tests {
             audit_record: json!({"metadata_only": true}),
             ha_mqtt_payload: json!({"metadata_only": true}),
         }
+    }
+
+    #[test]
+    fn home_guardian_evaluation_queue_drops_when_full() {
+        let (sender, _receiver) = sync_channel(1);
+        let queue = HomeGuardianEvaluationQueue::new(sender);
+
+        assert_eq!(
+            queue.enqueue(sample_stored_local_vision_event("queued-1")),
+            "queued"
+        );
+        assert_eq!(
+            queue.enqueue(sample_stored_local_vision_event("queued-2")),
+            "dropped"
+        );
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot["queued_total"], json!(1));
+        assert_eq!(snapshot["dropped_total"], json!(1));
+        assert_eq!(snapshot["bounded"], json!(true));
+    }
+
+    #[test]
+    fn service_overloaded_response_is_metadata_only() {
+        let (status, body) = response_json(service_overloaded_response());
+
+        assert_eq!(status, StatusCode(503));
+        assert_eq!(body["status"], json!("blocked"));
+        assert_eq!(body["metadata_only"], json!(true));
+        assert_eq!(body["secret_scan"], json!("clean"));
+        let text = serde_json::to_string(&body).expect("serialize");
+        assert!(!text.contains("rtsp://"));
+        assert!(!text.contains("token"));
+        assert!(!text.contains("route_key"));
+    }
+
+    #[test]
+    fn vision_ingest_limiter_blocks_after_max_inflight() {
+        let limiter = VisionIngestLimiter::new();
+        let mut guards = Vec::new();
+        for _ in 0..MAX_VISION_EVENT_INGEST_INFLIGHT {
+            guards.push(limiter.try_acquire().expect("acquire below limit"));
+        }
+
+        assert!(limiter.try_acquire().is_none());
+        assert_eq!(
+            limiter.snapshot()["active_inflight"],
+            json!(MAX_VISION_EVENT_INGEST_INFLIGHT)
+        );
+        assert_eq!(limiter.snapshot()["rejected_total"], json!(1));
+
+        drop(guards);
+        assert!(limiter.try_acquire().is_some());
+    }
+
+    #[test]
+    fn home_guardian_rule_cache_tracks_active_reviews_only() {
+        let (api, paths) = build_test_admin_api("guardian-rule-cache");
+        api.admin_store
+            .upsert_automation_review(sample_home_guardian_review("pending"))
+            .expect("save pending");
+        api.refresh_home_guardian_rule_cache()
+            .expect("refresh pending");
+        assert_eq!(
+            api.guardian_rule_cache_snapshot()["active_rule_count"],
+            json!(0)
+        );
+
+        api.admin_store
+            .set_automation_review_status("guardian_review_shape_1", "active")
+            .expect("activate");
+        api.refresh_home_guardian_rule_cache()
+            .expect("refresh active");
+        assert_eq!(
+            api.guardian_rule_cache_snapshot()["active_rule_count"],
+            json!(1)
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn home_guardian_auto_evaluation_does_not_persist_run_summaries() {
+        let (api, paths) = build_test_admin_api("guardian-auto-no-hot-write");
+        api.admin_store
+            .upsert_automation_review(sample_home_guardian_review("active"))
+            .expect("save active");
+        api.refresh_home_guardian_rule_cache()
+            .expect("refresh cache");
+
+        let stored = sample_stored_local_vision_event("auto-no-hot-write-event");
+        let response = api
+            .evaluate_home_guardian_rules_for_event(&stored, None, true)
+            .expect("auto evaluate");
+        assert_eq!(response.metadata_only, true);
+
+        let state = api.admin_store.load_state().expect("reload state");
+        let review = state
+            .automation_reviews
+            .iter()
+            .find(|review| review.review_id == "guardian_review_shape_1")
+            .expect("review");
+        assert_eq!(review.run_summaries.len(), 0);
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn home_guardian_action_cooldown_is_rule_camera_action_scoped() {
+        let (api, paths) = build_test_admin_api("guardian-cooldown");
+        let review = sample_home_guardian_review("active");
+        let stored = sample_stored_local_vision_event("cooldown-event-1");
+        let now = current_epoch_secs();
+
+        assert!(!api.guardian_action_in_cooldown(&review, &stored, "notify_default_target", now));
+        api.mark_guardian_action_cooldown(&review, &stored, "notify_default_target", now);
+
+        assert!(api.guardian_action_in_cooldown(
+            &review,
+            &stored,
+            "notify_default_target",
+            now + 1
+        ));
+        assert!(!api.guardian_action_in_cooldown(
+            &review,
+            &stored,
+            "home_assistant:light.turn_on",
+            now + 1
+        ));
+        assert!(!api.guardian_action_in_cooldown(
+            &review,
+            &stored,
+            "notify_default_target",
+            now + HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS + 1
+        ));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn home_guardian_auto_evaluation_coalesces_same_camera_event_type() {
+        let (api, paths) = build_test_admin_api("guardian-auto-coalesce");
+        let mut stored = sample_stored_local_vision_event("auto-event-1");
+        let now = current_epoch_secs();
+
+        assert!(api.guardian_auto_evaluation_due(&stored, now));
+        assert!(!api.guardian_auto_evaluation_due(&stored, now + 1));
+        assert!(api.guardian_auto_evaluation_due(
+            &stored,
+            now + HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS + 1
+        ));
+
+        stored.event.event_type = "vehicle_detected".to_string();
+        assert!(api.guardian_auto_evaluation_due(&stored, now + 2));
+
+        cleanup_test_paths(&paths);
     }
 
     struct EnvGuard {
@@ -17389,7 +18265,10 @@ mod tests {
         assert_eq!(body["metadata_only"], json!(true));
         assert_eq!(body["secret_scan"], json!("clean"));
         assert_eq!(body["total"], json!(1));
-        assert_eq!(body["records"][0]["action"], json!("model.route_policy.save"));
+        assert_eq!(
+            body["records"][0]["action"],
+            json!("model.route_policy.save")
+        );
         assert!(is_admin_surface_path("/api/audit/records"));
         assert_eq!(
             normalize_unified_admin_path("/api/beacon/audit/records"),
@@ -17402,10 +18281,8 @@ mod tests {
         assert!(!text.contains("tokenizer"));
         assert!(text.contains("metadata_only"));
 
-        let (status, summary) = response_json(api.handle_audit_summary(
-            "/api/audit/summary?window=24h",
-            &hints,
-        ));
+        let (status, summary) =
+            response_json(api.handle_audit_summary("/api/audit/summary?window=24h", &hints));
         assert_eq!(status, StatusCode(200));
         assert_eq!(summary["total"], json!(2));
         assert_eq!(summary["by_action"]["vision_event.notify"], json!(1));
@@ -17426,7 +18303,11 @@ mod tests {
                     } else {
                         "vision_event"
                     },
-                    if index == 1 { "rule-front" } else { "event-front" },
+                    if index == 1 {
+                        "rule-front"
+                    } else {
+                        "event-front"
+                    },
                     if index == 1 {
                         "home_guardian.evaluate_latest"
                     } else {
@@ -17552,6 +18433,23 @@ mod tests {
             None,
             None,
             None,
+            json!({
+                "queued_total": 0,
+                "dropped_total": 0,
+                "metadata_only": true,
+            }),
+            json!({
+                "http": {"active_requests": 0, "metadata_only": true},
+                "vision_ingest": {"active_inflight": 0, "metadata_only": true},
+                "metadata_only": true,
+            }),
+            json!({
+                "exists": true,
+                "file_bytes": 0,
+                "automation_review_count": 0,
+                "audit_record_count": 0,
+                "metadata_only": true,
+            }),
             json!({
                 "status": "not_run",
                 "redacted": true,

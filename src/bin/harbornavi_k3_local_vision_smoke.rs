@@ -25,6 +25,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 const RETAINED_RUN_LIMIT: usize = 120;
+const PERSISTENT_FRAME_COPY_ATTEMPTS: usize = 8;
+const PERSISTENT_FRAME_COPY_RETRY_MS: u64 = 150;
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -961,6 +963,37 @@ fn validate_snapshot_file(snapshot_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn copy_non_empty_snapshot_with_retry(
+    source_path: &Path,
+    snapshot_path: &Path,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<u64, String> {
+    let attempts = attempts.max(1);
+    let mut last_error = "persistent capture source did not produce a valid frame".to_string();
+    for attempt in 0..attempts {
+        match fs::copy(source_path, snapshot_path) {
+            Ok(bytes) => match validate_snapshot_file(snapshot_path) {
+                Ok(()) => return Ok(bytes),
+                Err(error) => {
+                    last_error = sanitize_sensitive(&error);
+                    let _ = fs::remove_file(snapshot_path);
+                }
+            },
+            Err(error) => {
+                last_error = format!(
+                    "failed to copy persistent capture frame to snapshot: {}",
+                    sanitize_sensitive(&error.to_string())
+                );
+            }
+        }
+        if attempt + 1 < attempts {
+            thread::sleep(retry_delay);
+        }
+    }
+    Err(last_error)
+}
+
 fn run_analyzer(
     cli: &Cli,
     snapshot_path: &Path,
@@ -1150,15 +1183,15 @@ impl PersistentCaptureWorker {
         self.ensure_running()?;
         let (frame_age_ms, byte_size) = self.wait_for_fresh_frame()?;
         let copy_started = Instant::now();
-        fs::copy(&self.latest_path, snapshot_path).map_err(|error| {
-            format!(
-                "failed to copy persistent capture frame to snapshot: {}",
-                sanitize_sensitive(&error.to_string())
-            )
-        })?;
+        let copied_bytes = copy_non_empty_snapshot_with_retry(
+            &self.latest_path,
+            snapshot_path,
+            PERSISTENT_FRAME_COPY_ATTEMPTS,
+            Duration::from_millis(PERSISTENT_FRAME_COPY_RETRY_MS),
+        )?;
         let capture_read_ms = copy_started.elapsed().as_millis() as u64;
         let stream_uptime_ms = self.started_at.elapsed().as_millis() as u64;
-        self.write_latest_metadata(frame_age_ms, byte_size, stream_uptime_ms)?;
+        self.write_latest_metadata(frame_age_ms, copied_bytes.max(byte_size), stream_uptime_ms)?;
         Ok(CaptureResult {
             capture_ms: started.elapsed().as_millis() as u64,
             capture_read_ms: Some(capture_read_ms),
@@ -1907,6 +1940,59 @@ mod tests {
                 .trim(),
             "1"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persistent_capture_copy_retries_until_snapshot_is_non_empty() {
+        let dir = unique_temp_dir("persistent-copy-retry");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let latest_path = dir.join("latest.jpg");
+        let snapshot_path = dir.join("snapshot.jpg");
+
+        let writer_path = latest_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            fs::write(writer_path, [0xff, 0xd8, 0xff, 0xd9]).expect("write valid frame bytes");
+        });
+
+        let copied = copy_non_empty_snapshot_with_retry(
+            &latest_path,
+            &snapshot_path,
+            8,
+            Duration::from_millis(10),
+        )
+        .expect("copy should retry past transient empty frame");
+        writer.join().expect("writer joins");
+
+        assert!(copied > 0);
+        assert!(
+            fs::metadata(&snapshot_path)
+                .expect("snapshot metadata")
+                .len()
+                > 0
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persistent_capture_copy_fails_when_latest_stays_empty() {
+        let dir = unique_temp_dir("persistent-copy-empty");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let latest_path = dir.join("latest.jpg");
+        let snapshot_path = dir.join("snapshot.jpg");
+        fs::write(&latest_path, []).expect("write empty latest frame");
+
+        let error = copy_non_empty_snapshot_with_retry(
+            &latest_path,
+            &snapshot_path,
+            2,
+            Duration::from_millis(1),
+        )
+        .expect_err("empty latest frame should fail");
+
+        assert!(error.contains("empty snapshot"));
+        assert!(!snapshot_path.exists());
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -75,6 +75,13 @@ pub enum HomeGuardianRuleEvaluationPlan {
 pub fn build_home_guardian_activity_response(
     reviews: Vec<AutomationRuleReview>,
 ) -> HomeGuardianActivityResponse {
+    build_home_guardian_activity_response_with_activity(reviews, Vec::new())
+}
+
+pub fn build_home_guardian_activity_response_with_activity(
+    reviews: Vec<AutomationRuleReview>,
+    mut external_activity: Vec<Value>,
+) -> HomeGuardianActivityResponse {
     let rules = reviews
         .iter()
         .filter(|review| automation_review_is_home_guardian(review))
@@ -84,11 +91,14 @@ pub fn build_home_guardian_activity_response(
         .iter()
         .filter(|review| automation_review_is_home_guardian(review) && review.status == "active")
         .count();
-    let mut activity = reviews
-        .iter()
-        .filter(|review| automation_review_is_home_guardian(review))
-        .flat_map(|review| review.run_summaries.iter().cloned())
-        .collect::<Vec<_>>();
+    if external_activity.is_empty() {
+        external_activity = reviews
+            .iter()
+            .filter(|review| automation_review_is_home_guardian(review))
+            .flat_map(|review| review.run_summaries.iter().cloned())
+            .collect::<Vec<_>>();
+    }
+    let mut activity = external_activity;
     activity.sort_by(|left, right| {
         json_string_at_paths(right, &["/created_at", "/evaluated_at"]).cmp(&json_string_at_paths(
             left,
@@ -515,7 +525,7 @@ pub fn build_home_guardian_rule_evaluation_plan(
                 Vec::new(),
             ),
             review,
-            persist_summary: true,
+            persist_summary: only_review_requested,
         });
     }
 

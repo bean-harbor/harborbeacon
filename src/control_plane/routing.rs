@@ -158,8 +158,9 @@ fn default_routing_boundaries() -> Vec<RoutingBoundaryProjection> {
             boundary_id: "beacon_business_routing".to_string(),
             owner_lane: "harbor-framework".to_string(),
             status: "beacon_owned".to_string(),
-            note: "Planner, model route policy, approval, artifact, and audit truth stay in Beacon."
-                .to_string(),
+            note:
+                "Planner, model route policy, approval, artifact, and audit truth stay in Beacon."
+                    .to_string(),
         },
     ]
 }
@@ -199,7 +200,8 @@ fn project_model_route_policy(
         cloud_fallback_allowed,
         endpoint_counts: endpoint_kind_counts(policy, endpoints),
         selected_endpoint_id: selected.map(|endpoint| endpoint.model_endpoint_id.clone()),
-        selected_endpoint_kind: selected.map(|endpoint| endpoint.endpoint_kind.as_str().to_string()),
+        selected_endpoint_kind: selected
+            .map(|endpoint| endpoint.endpoint_kind.as_str().to_string()),
         blockers,
     }
 }
@@ -234,22 +236,35 @@ fn endpoint_matches_policy(endpoint: &ModelEndpoint, policy: &ModelRoutePolicy) 
     {
         return true;
     }
-    if let Some(capability) = policy.metadata.get("capability").and_then(|value| value.as_str()) {
+    if let Some(capability) = policy
+        .metadata
+        .get("capability")
+        .and_then(|value| value.as_str())
+    {
         return endpoint
             .capability_tags
             .iter()
             .any(|tag| tag.eq_ignore_ascii_case(capability));
     }
-    endpoint.model_kind.as_str().eq_ignore_ascii_case(&policy.modality)
+    endpoint
+        .model_kind
+        .as_str()
+        .eq_ignore_ascii_case(&policy.modality)
         || policy.modality.eq_ignore_ascii_case("text")
             && endpoint.model_kind.as_str().eq_ignore_ascii_case("llm")
         || policy.modality.eq_ignore_ascii_case("multimodal")
             && matches!(endpoint.model_kind.as_str(), "llm" | "vlm")
 }
 
-fn endpoint_kind_counts(policy: &ModelRoutePolicy, endpoints: &[ModelEndpoint]) -> EndpointKindCounts {
+fn endpoint_kind_counts(
+    policy: &ModelRoutePolicy,
+    endpoints: &[ModelEndpoint],
+) -> EndpointKindCounts {
     let mut counts = EndpointKindCounts::default();
-    for endpoint in endpoints.iter().filter(|endpoint| endpoint_matches_policy(endpoint, policy)) {
+    for endpoint in endpoints
+        .iter()
+        .filter(|endpoint| endpoint_matches_policy(endpoint, policy))
+    {
         if endpoint.status == ModelEndpointStatus::Disabled {
             counts.disabled += 1;
             continue;
@@ -356,7 +371,11 @@ mod tests {
         }
     }
 
-    fn policy(id: &str, privacy_level: PrivacyLevel, fallback_order: Vec<&str>) -> ModelRoutePolicy {
+    fn policy(
+        id: &str,
+        privacy_level: PrivacyLevel,
+        fallback_order: Vec<&str>,
+    ) -> ModelRoutePolicy {
         ModelRoutePolicy {
             route_policy_id: id.to_string(),
             workspace_id: "home-1".to_string(),
@@ -383,8 +402,16 @@ mod tests {
     #[test]
     fn semantic_router_policy_prefers_local_endpoint_and_blocks_cloud() {
         let endpoints = vec![
-            endpoint("cloud-router", ModelEndpointKind::Cloud, &["semantic_router"]),
-            endpoint("local-router", ModelEndpointKind::Local, &["semantic_router"]),
+            endpoint(
+                "cloud-router",
+                ModelEndpointKind::Cloud,
+                &["semantic_router"],
+            ),
+            endpoint(
+                "local-router",
+                ModelEndpointKind::Local,
+                &["semantic_router"],
+            ),
         ];
         let policies = vec![policy(
             "semantic.router",

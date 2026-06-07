@@ -719,6 +719,23 @@ pub struct AdminConsoleStore {
     registry_store: DeviceRegistryStore,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminConsoleStateStats {
+    pub exists: bool,
+    pub file_bytes: u64,
+    pub automation_review_count: usize,
+    pub audit_record_count: usize,
+    pub notification_target_count: usize,
+    pub device_credential_count: usize,
+    pub platform_credential_count: usize,
+    pub platform_credential_duplicate_count: usize,
+    pub knowledge_index_job_count: usize,
+    pub model_download_job_count: usize,
+    pub top_level_section_sizes: Value,
+    pub section_size_scan_skipped: bool,
+    pub metadata_only: bool,
+}
+
 const DEFAULT_WORKSPACE_ID: &str = "home-1";
 const DEFAULT_WORKSPACE_OWNER_ID: &str = "local-owner";
 const LOCAL_RTSP_PROVIDER_ACCOUNT_ID: &str = "provider-local-rtsp";
@@ -790,6 +807,62 @@ impl AdminConsoleStore {
         Ok(state)
     }
 
+    pub fn state_stats(&self, state: Option<&AdminConsoleState>) -> AdminConsoleStateStats {
+        let file_bytes = fs::metadata(&self.path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let mut stats = AdminConsoleStateStats {
+            exists: self.path.exists(),
+            file_bytes,
+            automation_review_count: 0,
+            audit_record_count: 0,
+            notification_target_count: 0,
+            device_credential_count: 0,
+            platform_credential_count: 0,
+            platform_credential_duplicate_count: 0,
+            knowledge_index_job_count: 0,
+            model_download_job_count: 0,
+            top_level_section_sizes: json!({
+                "status": "skipped",
+                "reason": "section byte sizing is skipped for large admin state files",
+            }),
+            section_size_scan_skipped: true,
+            metadata_only: true,
+        };
+        if let Some(state) = state {
+            stats.automation_review_count = state.automation_reviews.len();
+            stats.audit_record_count = state.audit_records.len();
+            stats.notification_target_count = state.notification_targets.len();
+            stats.device_credential_count = state.device_credentials.len();
+            stats.platform_credential_count = state.platform.credentials.len();
+            let mut credential_ids = HashSet::new();
+            stats.platform_credential_duplicate_count = state
+                .platform
+                .credentials
+                .iter()
+                .filter(|credential| !credential_ids.insert(credential.credential_id.clone()))
+                .count();
+            stats.knowledge_index_job_count = state.knowledge_index_jobs.len();
+            stats.model_download_job_count = state.model_download_jobs.len();
+            if file_bytes <= 4 * 1024 * 1024 {
+                if let Ok(value) = serde_json::to_value(state) {
+                    if let Some(object) = value.as_object() {
+                        let mut sizes = serde_json::Map::new();
+                        for (key, value) in object {
+                            let bytes = serde_json::to_vec(value)
+                                .map(|bytes| bytes.len())
+                                .unwrap_or(0);
+                            sizes.insert(key.clone(), json!(bytes));
+                        }
+                        stats.top_level_section_sizes = Value::Object(sizes);
+                        stats.section_size_scan_skipped = false;
+                    }
+                }
+            }
+        }
+        stats
+    }
+
     fn save_state(&self, state: &AdminConsoleState) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
@@ -847,12 +920,12 @@ impl AdminConsoleStore {
 
     pub fn home_assistant_state(&self) -> Result<HomeAssistantAdminState, String> {
         Ok(redact_home_assistant_state(
-            self.load_or_create_state()?.home_assistant,
+            self.load_state()?.home_assistant,
         ))
     }
 
     pub fn home_assistant_secret_state(&self) -> Result<HomeAssistantAdminState, String> {
-        Ok(self.load_or_create_state()?.home_assistant)
+        Ok(self.load_state()?.home_assistant)
     }
 
     pub fn save_home_assistant_config(
@@ -4110,7 +4183,11 @@ fn sync_platform_from_legacy(state: &AdminConsoleState) -> AdminPlatformState {
     platform
         .credentials
         .retain(|credential| credential.credential_id != LOCAL_RTSP_CREDENTIAL_ID);
-    platform.credentials.extend(build_credentials(state));
+    dedupe_credentials_by_id(&mut platform.credentials);
+    for credential in build_credentials(state) {
+        upsert_credential(&mut platform.credentials, credential);
+    }
+    dedupe_credentials_by_id(&mut platform.credentials);
 
     platform
         .recording_policies
@@ -4421,6 +4498,22 @@ fn upsert_provider_account(providers: &mut Vec<ProviderAccount>, provider: Provi
     } else {
         providers.push(provider);
     }
+}
+
+fn upsert_credential(credentials: &mut Vec<CredentialRecord>, credential: CredentialRecord) {
+    if let Some(existing) = credentials
+        .iter_mut()
+        .find(|existing| existing.credential_id == credential.credential_id)
+    {
+        *existing = credential;
+    } else {
+        credentials.push(credential);
+    }
+}
+
+fn dedupe_credentials_by_id(credentials: &mut Vec<CredentialRecord>) {
+    let mut seen = HashSet::new();
+    credentials.retain(|credential| seen.insert(credential.credential_id.clone()));
 }
 
 fn preferred_workspace_mut(platform: &mut AdminPlatformState) -> Option<&mut Workspace> {
@@ -5501,6 +5594,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
+    use crate::control_plane::credentials::{
+        CredentialKind, CredentialRecord, CredentialRotationState,
+    };
     use crate::control_plane::media::RecordingTriggerMode;
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
@@ -5518,9 +5614,10 @@ mod tests {
         normalize_binding_code, normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path,
         resolved_identity_binding_records, resolved_remote_view_config,
         sanitize_bridge_provider_config, sanitize_defaults, sanitize_model_center_state,
-        user_default_delivery_surface, user_recent_interactive_surface, AdminConsoleStore,
-        AdminDefaults, AdminModelCenterState, AutomationRuleReview, BridgeProviderCapabilities,
-        BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings,
+        sync_platform_from_legacy, user_default_delivery_surface, user_recent_interactive_surface,
+        AdminConsoleState, AdminConsoleStore, AdminDefaults, AdminModelCenterState,
+        AutomationRuleReview, BridgeProviderCapabilities, BridgeProviderConfig,
+        DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings,
         HomeAssistantConfigUpdate, IdentityBindingRecord, KnowledgeSettings, KnowledgeSourceRoot,
         RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID,
         LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
@@ -5931,6 +6028,49 @@ mod tests {
     }
 
     #[test]
+    fn platform_sync_dedupes_projected_credentials() {
+        let mut state = AdminConsoleState::default();
+        state.defaults.rtsp_password = "secret-rtsp".to_string();
+        state.platform.credentials = vec![
+            CredentialRecord {
+                credential_id: LOCAL_RTSP_CREDENTIAL_ID.to_string(),
+                provider_account_id: LOCAL_RTSP_PROVIDER_ACCOUNT_ID.to_string(),
+                credential_kind: CredentialKind::SessionSecret,
+                vault_key: "stale".to_string(),
+                scope: json!({}),
+                expires_at: None,
+                rotation_state: CredentialRotationState::Valid,
+                last_verified_at: None,
+                metadata: json!({"stale": true}),
+            },
+            CredentialRecord {
+                credential_id: LOCAL_RTSP_CREDENTIAL_ID.to_string(),
+                provider_account_id: LOCAL_RTSP_PROVIDER_ACCOUNT_ID.to_string(),
+                credential_kind: CredentialKind::SessionSecret,
+                vault_key: "stale-duplicate".to_string(),
+                scope: json!({}),
+                expires_at: None,
+                rotation_state: CredentialRotationState::Valid,
+                last_verified_at: None,
+                metadata: json!({"stale": true}),
+            },
+        ];
+
+        let platform = sync_platform_from_legacy(&state);
+        let matching = platform
+            .credentials
+            .iter()
+            .filter(|credential| credential.credential_id == LOCAL_RTSP_CREDENTIAL_ID)
+            .collect::<Vec<_>>();
+
+        assert_eq!(matching.len(), 1);
+        assert_eq!(
+            matching[0].vault_key,
+            "admin_console.defaults.rtsp_password"
+        );
+    }
+
+    #[test]
     fn save_knowledge_settings_rejects_index_root_inside_source_root() {
         let registry_path = temp_path("registry-knowledge-invalid");
         let admin_path = temp_path("admin-knowledge-invalid");
@@ -6321,6 +6461,25 @@ mod tests {
             })
             .expect_err("sensitive review should be rejected");
         assert!(error.contains("敏感字段"));
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn load_state_reads_without_rewriting_admin_file() {
+        let registry_path = temp_path("registry-readonly-load");
+        let admin_path = temp_path("admin-readonly-load");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        store.load_or_create_state().expect("bootstrap state");
+        let before = std::fs::read_to_string(&admin_path).expect("read before");
+
+        store.load_state().expect("read-only load");
+
+        let after = std::fs::read_to_string(&admin_path).expect("read after");
+        assert_eq!(after, before);
 
         let _ = std::fs::remove_file(admin_path);
         let _ = std::fs::remove_file(registry_path);

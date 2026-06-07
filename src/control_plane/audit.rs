@@ -168,7 +168,9 @@ pub fn build_audit_summary(records: &[AuditRecord], window: impl Into<String>) -
     let mut by_action = BTreeMap::new();
     let mut by_actor_kind = BTreeMap::new();
     for record in records {
-        *by_entity_kind.entry(record.entity_kind.clone()).or_insert(0) += 1;
+        *by_entity_kind
+            .entry(record.entity_kind.clone())
+            .or_insert(0) += 1;
         *by_action.entry(record.action.clone()).or_insert(0) += 1;
         *by_actor_kind
             .entry(actor_kind_key(record.actor_kind).to_string())
