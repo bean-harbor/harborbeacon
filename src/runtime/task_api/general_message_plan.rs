@@ -34,6 +34,12 @@ pub(super) enum GeneralMessagePlanKind {
     GuardianRuleEnable,
     GuardianRulePause,
     GuardianStatus,
+    FamilyMemoryConfirm,
+    FamilyMemoryFavorite,
+    FamilyMemoryHide,
+    FamilyMemoryCorrectSummary,
+    FamilyMemoryCorrectLabels,
+    FamilyMemoryShowFavorites,
     #[allow(dead_code)]
     Unsupported,
 }
@@ -79,6 +85,9 @@ pub(super) struct GeneralMessagePlan {
     pub(super) query: Option<String>,
     pub(super) home_assistant_action: Option<HomeAssistantNaturalAction>,
     pub(super) guardian_rule: Option<Value>,
+    pub(super) event_id: Option<String>,
+    pub(super) corrected_summary: Option<String>,
+    pub(super) corrected_labels: Option<Vec<String>>,
     pub(super) confidence: Option<u8>,
     pub(super) recent_clip: Option<RecentClipPlaybackState>,
     pub(super) reason: Option<String>,
@@ -114,6 +123,12 @@ pub(super) struct GeneralMessagePlanPayload {
     pub(super) ha: Option<GeneralMessageHomeAssistantPlanPayload>,
     #[serde(default)]
     pub(super) guardian_rule: Option<Value>,
+    #[serde(default)]
+    pub(super) event_id: Option<String>,
+    #[serde(default)]
+    pub(super) corrected_summary: Option<String>,
+    #[serde(default)]
+    pub(super) corrected_labels: Option<Vec<String>>,
     #[serde(default)]
     pub(super) reason: Option<String>,
 }

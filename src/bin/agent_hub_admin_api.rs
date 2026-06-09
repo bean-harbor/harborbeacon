@@ -79,6 +79,14 @@ use harborbeacon_local_agent::runtime::evt_readiness::{
     build_evt_evidence_bundle, build_evt_readiness_report, evt_preflight_workflow_summary,
     evt_readiness_workflow_summary, run_evt_preflight_report,
 };
+use harborbeacon_local_agent::runtime::family_memory::{
+    append_family_memory_feedback_default, apply_family_memory_overlays_to_events,
+    build_family_memory_event_views, build_family_memory_stats,
+    compact_family_memory_feedback_evidence, family_memory_overlays_default,
+    family_memory_stats_default, list_family_memory_feedback_default, FamilyMemoryEventFilter,
+    FamilyMemoryEventView, FamilyMemoryFeedbackRecord, FamilyMemoryFeedbackRequest,
+    FamilyMemoryStats, DEFAULT_FAMILY_MEMORY_FEEDBACK_LIMIT,
+};
 use harborbeacon_local_agent::runtime::family_timeline::{
     build_family_timeline_digest_from_query, build_family_timeline_from_query,
     FamilyTimelineDigest, FamilyTimelineQueryOptions, FamilyTimelineResponse,
@@ -136,6 +144,7 @@ const ADMIN_HTTP_WORKER_COUNT: usize = 32;
 const ADMIN_HTTP_REQUEST_QUEUE_CAPACITY: usize = 256;
 const MAX_VISION_EVENT_INGEST_INFLIGHT: usize = 8;
 const HOME_GUARDIAN_ACTIVITY_LIMIT: usize = 500;
+const MAX_FAMILY_MEMORY_FEEDBACK_JSON_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -263,6 +272,7 @@ pub struct AdminApi {
     last_evt_preflight: Arc<Mutex<Option<Value>>>,
     last_vlm_enrichment: Arc<Mutex<Option<Value>>>,
     last_family_timeline_digest: Arc<Mutex<Option<Value>>>,
+    last_family_memory_feedback: Arc<Mutex<Option<Value>>>,
     last_guardian_rule_proposal: Arc<Mutex<Option<Value>>>,
     last_guardian_rule_evaluation: Arc<Mutex<Option<Value>>>,
     guardian_queue: HomeGuardianEvaluationQueue,
@@ -868,12 +878,43 @@ struct VisionEventsResponse {
 struct FamilyTimelineApiResponse {
     #[serde(flatten)]
     timeline: FamilyTimelineResponse,
+    memory_overlay: FamilyMemoryStats,
 }
 
 #[derive(Debug, Serialize)]
 struct FamilyTimelineDigestApiResponse {
     #[serde(flatten)]
     digest: FamilyTimelineDigest,
+    memory_overlay: FamilyMemoryStats,
+}
+
+#[derive(Debug, Serialize)]
+struct FamilyMemoryEventsResponse {
+    generated_at: String,
+    limit: usize,
+    metadata_only: bool,
+    secret_scan: String,
+    memory_overlay: FamilyMemoryStats,
+    events: Vec<FamilyMemoryEventView>,
+}
+
+#[derive(Debug, Serialize)]
+struct FamilyMemoryEventResponse {
+    generated_at: String,
+    metadata_only: bool,
+    secret_scan: String,
+    event: FamilyMemoryEventView,
+}
+
+#[derive(Debug, Serialize)]
+struct FamilyMemoryFeedbackResponse {
+    status: String,
+    event_id: String,
+    feedback: FamilyMemoryFeedbackRecord,
+    memory_overlay: FamilyMemoryStats,
+    evidence: Value,
+    metadata_only: bool,
+    secret_scan: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1626,6 +1667,7 @@ impl AdminApi {
             last_evt_preflight: Arc::new(Mutex::new(None)),
             last_vlm_enrichment: Arc::new(Mutex::new(None)),
             last_family_timeline_digest: Arc::new(Mutex::new(None)),
+            last_family_memory_feedback: Arc::new(Mutex::new(None)),
             last_guardian_rule_proposal: Arc::new(Mutex::new(None)),
             last_guardian_rule_evaluation: Arc::new(Mutex::new(None)),
             guardian_queue: HomeGuardianEvaluationQueue::new(guardian_sender),
@@ -1971,6 +2013,13 @@ impl AdminApi {
         *guard = Some(serde_json::to_value(digest).unwrap_or_else(|_| json!({})));
     }
 
+    fn record_last_family_memory_feedback(&self, record: &FamilyMemoryFeedbackRecord) {
+        let Ok(mut guard) = self.last_family_memory_feedback.lock() else {
+            return;
+        };
+        *guard = Some(compact_family_memory_feedback_evidence(record));
+    }
+
     fn record_last_guardian_rule_proposal(&self, proposal: &Value) {
         let Ok(mut guard) = self.last_guardian_rule_proposal.lock() else {
             return;
@@ -1987,6 +2036,13 @@ impl AdminApi {
 
     fn last_family_timeline_digest(&self) -> Option<Value> {
         self.last_family_timeline_digest
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn last_family_memory_feedback(&self) -> Option<Value> {
+        self.last_family_memory_feedback
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
@@ -2320,6 +2376,22 @@ impl AdminApi {
             Method::Get if path == "/api/family/timeline/digest" => self
                 .handle_family_timeline_digest(&raw_url, &identity_hints)
                 .boxed(),
+            Method::Get if path == "/api/family/memory/events" => self
+                .handle_family_memory_events(&raw_url, &identity_hints)
+                .boxed(),
+            Method::Get if path == "/api/family/memory/stats" => {
+                self.handle_family_memory_stats(&identity_hints).boxed()
+            }
+            Method::Get if path.starts_with("/api/family/memory/events/") => self
+                .handle_family_memory_event(&path, &identity_hints)
+                .boxed(),
+            Method::Post
+                if path.starts_with("/api/family/memory/events/")
+                    && path.ends_with("/feedback") =>
+            {
+                self.handle_family_memory_feedback(&path, &mut request, &identity_hints)
+                    .boxed()
+            }
             Method::Get if path == "/api/home-guardian/activity" => {
                 self.handle_home_guardian_activity(&identity_hints).boxed()
             }
@@ -2946,6 +3018,7 @@ impl AdminApi {
             self.last_vlm_enrichment(),
             self.last_home_assistant_service_action(),
             self.last_family_timeline_digest(),
+            self.last_family_memory_feedback(),
             self.last_guardian_rule_proposal(),
             self.last_guardian_rule_evaluation(),
             self.home_guardian_queue_snapshot(),
@@ -2953,6 +3026,7 @@ impl AdminApi {
             admin_state_stats,
             build_latest_general_message_nsp_route_workflow(&self.task_service),
             build_latest_home_assistant_task_api_workflow(&self.task_service),
+            build_latest_family_memory_task_api_workflow(&self.task_service),
         );
         let bundle =
             build_evt_evidence_bundle(readiness, self.last_evt_preflight(), diagnostics_workflow);
@@ -2998,6 +3072,7 @@ impl AdminApi {
             self.last_vlm_enrichment(),
             self.last_home_assistant_service_action(),
             self.last_family_timeline_digest(),
+            self.last_family_memory_feedback(),
             self.last_guardian_rule_proposal(),
             self.last_guardian_rule_evaluation(),
             self.home_guardian_queue_snapshot(),
@@ -3006,6 +3081,7 @@ impl AdminApi {
                 .unwrap_or_else(|_| json!({})),
             build_latest_general_message_nsp_route_workflow(&self.task_service),
             build_latest_home_assistant_task_api_workflow(&self.task_service),
+            build_latest_family_memory_task_api_workflow(&self.task_service),
             evt_readiness,
             self.last_evt_preflight(),
             &admin_state.notification_targets,
@@ -4468,6 +4544,7 @@ impl AdminApi {
             .unwrap_or(24 * 60 * 60);
         let camera_filter = parse_query_param(raw_url, "camera_id");
         let label_filter = parse_query_param(raw_url, "label");
+        let include_hidden = parse_query_bool(raw_url, "include_hidden").unwrap_or(false);
         let query = FamilyTimelineQueryOptions::new(
             window_seconds,
             camera_filter.clone(),
@@ -4478,8 +4555,20 @@ impl AdminApi {
             Ok(events) => events,
             Err(error) => return error_json(StatusCode(500), &error),
         };
+        let overlays = match family_memory_overlays_default() {
+            Ok(overlays) => overlays,
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let memory_overlay = match family_memory_stats_default() {
+            Ok(stats) => stats,
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let events = apply_family_memory_overlays_to_events(&events, &overlays, include_hidden);
         match build_family_timeline_from_query(&events, &query) {
-            Ok(timeline) => ok_json(&FamilyTimelineApiResponse { timeline }),
+            Ok(timeline) => ok_json(&FamilyTimelineApiResponse {
+                timeline,
+                memory_overlay,
+            }),
             Err(error) => error_json(StatusCode(422), &error),
         }
     }
@@ -4501,12 +4590,201 @@ impl AdminApi {
             Ok(events) => events,
             Err(error) => return error_json(StatusCode(500), &error),
         };
+        let overlays = match family_memory_overlays_default() {
+            Ok(overlays) => overlays,
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let records =
+            match list_family_memory_feedback_default(DEFAULT_FAMILY_MEMORY_FEEDBACK_LIMIT) {
+                Ok(records) => records,
+                Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+            };
+        let memory_overlay = build_family_memory_stats(&records);
+        let events = apply_family_memory_overlays_to_events(&events, &overlays, false);
         match build_family_timeline_digest_from_query(&events, &query) {
             Ok(digest) => {
                 self.record_last_family_timeline_digest(&digest);
-                ok_json(&FamilyTimelineDigestApiResponse { digest })
+                ok_json(&FamilyTimelineDigestApiResponse {
+                    digest,
+                    memory_overlay,
+                })
             }
             Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_family_memory_events(
+        &self,
+        raw_url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let limit = parse_query_param(raw_url, "limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(1, 100))
+            .unwrap_or(50);
+        let window_seconds = parse_query_param(raw_url, "window_seconds")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| value.clamp(60, 7 * 24 * 60 * 60))
+            .unwrap_or(24 * 60 * 60);
+        let query = FamilyTimelineQueryOptions::new(
+            window_seconds,
+            parse_query_param(raw_url, "camera_id"),
+            parse_query_param(raw_url, "label"),
+            limit,
+        );
+        let filter = FamilyMemoryEventFilter {
+            include_hidden: parse_query_bool(raw_url, "include_hidden").unwrap_or(false),
+            favorites_only: parse_query_bool(raw_url, "favorites_only").unwrap_or(false),
+            hidden_only: parse_query_bool(raw_url, "hidden_only").unwrap_or(false),
+            corrected_only: parse_query_bool(raw_url, "corrected_only").unwrap_or(false),
+            limit,
+        };
+        let events = match list_recent_local_vision_events_default(limit) {
+            Ok(events) => events,
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let records =
+            match list_family_memory_feedback_default(DEFAULT_FAMILY_MEMORY_FEEDBACK_LIMIT) {
+                Ok(records) => records,
+                Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+            };
+        let overlays =
+            harborbeacon_local_agent::runtime::family_memory::build_family_memory_overlays(
+                &records,
+            );
+        let memory_overlay = build_family_memory_stats(&records);
+        match build_family_memory_event_views(&events, &overlays, &filter, &query) {
+            Ok(events) => ok_json(&FamilyMemoryEventsResponse {
+                generated_at: now_unix_string(),
+                limit,
+                metadata_only: true,
+                secret_scan: "clean".to_string(),
+                memory_overlay,
+                events,
+            }),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_family_memory_event(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let event_id = match parse_family_memory_event_path(path) {
+            Some(event_id) => event_id,
+            None => return error_json(StatusCode(400), "invalid family memory event path"),
+        };
+        let event = match find_recent_local_vision_event(&event_id) {
+            Ok(Some(event)) => event,
+            Ok(None) => return error_json(StatusCode(404), "family memory event not found"),
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let records =
+            match list_family_memory_feedback_default(DEFAULT_FAMILY_MEMORY_FEEDBACK_LIMIT) {
+                Ok(records) => records,
+                Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+            };
+        let overlays =
+            harborbeacon_local_agent::runtime::family_memory::build_family_memory_overlays(
+                &records,
+            );
+        let filter = FamilyMemoryEventFilter {
+            include_hidden: true,
+            limit: 1,
+            ..FamilyMemoryEventFilter::default()
+        };
+        let query = FamilyTimelineQueryOptions::new(7 * 24 * 60 * 60, None, None, 1);
+        match build_family_memory_event_views(&[event], &overlays, &filter, &query) {
+            Ok(mut events) => match events.pop() {
+                Some(event) => ok_json(&FamilyMemoryEventResponse {
+                    generated_at: now_unix_string(),
+                    metadata_only: true,
+                    secret_scan: "clean".to_string(),
+                    event,
+                }),
+                None => error_json(StatusCode(404), "family memory event not available"),
+            },
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_family_memory_feedback(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let event_id = match parse_family_memory_feedback_path(path) {
+            Some(event_id) => event_id,
+            None => return error_json(StatusCode(400), "invalid family memory feedback path"),
+        };
+        match find_recent_local_vision_event(&event_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return error_json(StatusCode(404), "family memory event not found"),
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+        let body = match read_json_body_limited::<FamilyMemoryFeedbackRequest>(
+            request,
+            MAX_FAMILY_MEMORY_FEEDBACK_JSON_BYTES,
+        ) {
+            Ok(body) => body,
+            Err(error) if error.contains("exceeds") => return error_json(StatusCode(413), &error),
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let record = match append_family_memory_feedback_default(&event_id, body, "webui") {
+            Ok(record) => record,
+            Err(error) => return error_json(StatusCode(422), &redact_admin_string(&error)),
+        };
+        self.record_last_family_memory_feedback(&record);
+        let evidence = compact_family_memory_feedback_evidence(&record);
+        self.record_admin_audit(
+            &principal,
+            "family_memory_event",
+            &event_id,
+            "family_memory.feedback",
+            json!({
+                "action": record.action.as_str(),
+                "has_corrected_summary": record.corrected_summary.is_some(),
+                "corrected_label_count": record.corrected_labels.as_ref().map(Vec::len).unwrap_or(0),
+                "metadata_only": true,
+            }),
+            evidence.clone(),
+        );
+        match family_memory_stats_default() {
+            Ok(memory_overlay) => ok_json(&FamilyMemoryFeedbackResponse {
+                status: "stored".to_string(),
+                event_id,
+                feedback: record,
+                memory_overlay,
+                evidence,
+                metadata_only: true,
+                secret_scan: "clean".to_string(),
+            }),
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+    }
+
+    fn handle_family_memory_stats(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match family_memory_stats_default() {
+            Ok(stats) => ok_json(&stats),
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
         }
     }
 
@@ -7829,6 +8107,14 @@ fn parse_query_param(url: &str, key: &str) -> Option<String> {
     None
 }
 
+fn parse_query_bool(url: &str, key: &str) -> Option<bool> {
+    parse_query_param(url, key).and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    })
+}
+
 fn parse_automation_review_action_path(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/automation/reviews/")?;
     let (review_id, action) = trimmed.rsplit_once('/')?;
@@ -7966,6 +8252,23 @@ fn parse_local_vision_event_vlm_enrich_path(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/vision/events/")?;
     let event_id = trimmed.strip_suffix("/vlm-enrich")?.trim();
     if event_id.is_empty() || event_id.contains('/') || event_id == "latest" {
+        return None;
+    }
+    percent_decode_path_segment(event_id).ok()
+}
+
+fn parse_family_memory_event_path(path: &str) -> Option<String> {
+    let event_id = path.strip_prefix("/api/family/memory/events/")?.trim();
+    if event_id.is_empty() || event_id.contains('/') {
+        return None;
+    }
+    percent_decode_path_segment(event_id).ok()
+}
+
+fn parse_family_memory_feedback_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/family/memory/events/")?;
+    let event_id = trimmed.strip_suffix("/feedback")?.trim();
+    if event_id.is_empty() || event_id.contains('/') {
         return None;
     }
     percent_decode_path_segment(event_id).ok()
@@ -9084,6 +9387,9 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/audit/summary"
         || path == "/api/family/timeline"
         || path == "/api/family/timeline/digest"
+        || path == "/api/family/memory/events"
+        || path == "/api/family/memory/stats"
+        || path.starts_with("/api/family/memory/events/")
         || path == "/api/home-guardian/activity"
         || path == "/api/knowledge/settings"
         || path == "/api/knowledge/search"
@@ -11577,6 +11883,45 @@ fn build_latest_home_assistant_task_api_workflow(task_service: &TaskApiService) 
     })
 }
 
+fn build_latest_family_memory_task_api_workflow(task_service: &TaskApiService) -> Value {
+    let events = match task_service.conversation_store().recent_events(200) {
+        Ok(events) => events,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "message": redact_admin_string(&error),
+                "redacted": true,
+            })
+        }
+    };
+    let summaries = events
+        .iter()
+        .filter_map(redacted_family_memory_task_api_event_summary)
+        .collect::<Vec<_>>();
+    let Some(latest_event) = summaries.last().cloned() else {
+        return json!({
+            "status": "not_run",
+            "message": "No Family Memory Task API workflow evidence has been recorded.",
+            "redacted": true,
+        });
+    };
+    let recent_events = summaries
+        .iter()
+        .rev()
+        .take(6)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    json!({
+        "status": "available",
+        "redacted": true,
+        "latest_event": latest_event,
+        "recent_events": recent_events,
+    })
+}
+
 fn build_latest_general_message_nsp_route_workflow(task_service: &TaskApiService) -> Value {
     let steps = match task_service.conversation_store().recent_task_steps(200) {
         Ok(steps) => steps,
@@ -11675,6 +12020,26 @@ fn redacted_home_assistant_task_api_event_summary(event: &EventRecord) -> Option
     }))
 }
 
+fn redacted_family_memory_task_api_event_summary(event: &EventRecord) -> Option<Value> {
+    if !event.event_type.starts_with("family_memory.") {
+        return None;
+    }
+    let payload = &event.payload;
+    Some(json!({
+        "event_type": event.event_type,
+        "status": json_string_at_paths(payload, &["/status"]),
+        "event_id": json_string_at_paths(payload, &["/event_id"]),
+        "camera_id": json_string_at_paths(payload, &["/camera_id"]),
+        "action": json_string_at_paths(payload, &["/feedback/action"]),
+        "favorite_count": json_usize_at_paths(payload, &["/memory_overlay/favorite_count", "/favorite_count"]),
+        "returned_count": json_usize_at_paths(payload, &["/returned_count"]),
+        "metadata_only": true,
+        "secret_scan": "clean",
+        "occurred_at": event.occurred_at,
+        "redacted": true,
+    }))
+}
+
 fn json_string_at_paths(value: &Value, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|path| {
         value
@@ -11763,6 +12128,7 @@ fn build_redacted_diagnostics_bundle(
     last_vlm_enrichment: Option<Value>,
     last_home_assistant_service_action: Option<Value>,
     last_family_timeline_digest: Option<Value>,
+    last_family_memory_feedback: Option<Value>,
     last_guardian_rule_proposal: Option<Value>,
     last_guardian_rule_evaluation: Option<Value>,
     guardian_queue: Value,
@@ -11770,6 +12136,7 @@ fn build_redacted_diagnostics_bundle(
     admin_state_stats: Value,
     last_general_message_nsp_route: Value,
     last_home_assistant_task_api_workflow: Value,
+    last_family_memory_task_api_workflow: Value,
     evt_readiness: Value,
     last_evt_preflight: Option<Value>,
     notification_targets: &[NotificationTargetRecord],
@@ -11860,6 +12227,10 @@ fn build_redacted_diagnostics_bundle(
                 last_family_timeline_digest,
                 "No Family Timeline digest has been generated in this API process.",
             ),
+            "family_memory_feedback": home_guardian_optional_workflow(
+                last_family_memory_feedback,
+                "No Family Memory feedback has been recorded in this API process.",
+            ),
             "guardian_rule_proposal": home_guardian_optional_workflow(
                 last_guardian_rule_proposal,
                 "No Home Guardian rule proposal has been recorded in this API process.",
@@ -11873,6 +12244,7 @@ fn build_redacted_diagnostics_bundle(
             "admin_state": admin_state_stats,
             "general_message_nsp_route": last_general_message_nsp_route,
             "home_assistant_task_api_workflow": last_home_assistant_task_api_workflow,
+            "family_memory_task_api_workflow": last_family_memory_task_api_workflow,
             "evt_readiness": evt_readiness_workflow_summary(&evt_readiness),
             "evt_preflight": evt_preflight_workflow_summary(last_evt_preflight),
             "default_notification_target": build_default_notification_target_readiness(
@@ -11936,6 +12308,7 @@ fn build_evt_diagnostics_workflow(
     last_vlm_enrichment: Option<Value>,
     last_home_assistant_service_action: Option<Value>,
     last_family_timeline_digest: Option<Value>,
+    last_family_memory_feedback: Option<Value>,
     last_guardian_rule_proposal: Option<Value>,
     last_guardian_rule_evaluation: Option<Value>,
     guardian_queue: Value,
@@ -11943,6 +12316,7 @@ fn build_evt_diagnostics_workflow(
     admin_state_stats: Value,
     last_general_message_nsp_route: Value,
     last_home_assistant_task_api_workflow: Value,
+    last_family_memory_task_api_workflow: Value,
 ) -> Value {
     json!({
         "event_notification": last_event_notification_attempt.unwrap_or_else(|| json!({
@@ -11961,6 +12335,10 @@ fn build_evt_diagnostics_workflow(
             last_family_timeline_digest,
             "No Family Timeline digest has been generated in this API process.",
         ),
+        "family_memory_feedback": home_guardian_optional_workflow(
+            last_family_memory_feedback,
+            "No Family Memory feedback has been recorded in this API process.",
+        ),
         "guardian_rule_proposal": home_guardian_optional_workflow(
             last_guardian_rule_proposal,
             "No Home Guardian rule proposal has been recorded in this API process.",
@@ -11974,6 +12352,7 @@ fn build_evt_diagnostics_workflow(
         "admin_state": admin_state_stats,
         "general_message_nsp_route": last_general_message_nsp_route,
         "home_assistant_task_api_workflow": last_home_assistant_task_api_workflow,
+        "family_memory_task_api_workflow": last_family_memory_task_api_workflow,
         "evt_readiness": evt_readiness_workflow_summary(evt_readiness),
         "evt_preflight": evt_preflight_workflow_summary(last_evt_preflight),
         "redacted": true,
@@ -18786,6 +19165,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             json!({
                 "queued_total": 0,
                 "dropped_total": 0,
@@ -18802,6 +19182,10 @@ mod tests {
                 "automation_review_count": 0,
                 "audit_record_count": 0,
                 "metadata_only": true,
+            }),
+            json!({
+                "status": "not_run",
+                "redacted": true,
             }),
             json!({
                 "status": "not_run",

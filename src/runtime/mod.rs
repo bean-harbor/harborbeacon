@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod dvr;
 pub mod events;
 pub mod evt_readiness;
+pub mod family_memory;
 pub mod family_timeline;
 pub mod home_guardian;
 pub mod hub;

@@ -576,6 +576,9 @@ pub(super) fn plan_from_general_message_candidate(
         query: candidate.query.clone(),
         home_assistant_action: None,
         guardian_rule: None,
+        event_id: None,
+        corrected_summary: None,
+        corrected_labels: None,
         confidence: Some(candidate.confidence),
         recent_clip: candidate.recent_clip.clone(),
         reason: Some(candidate.reason.clone()),
@@ -671,6 +674,20 @@ pub(super) fn general_message_nsp_schema_valid(plan: &GeneralMessagePlan) -> boo
     {
         return false;
     }
+    if plan.kind == GeneralMessagePlanKind::FamilyMemoryCorrectSummary
+        && plan.corrected_summary.is_none()
+        && plan.query.is_none()
+    {
+        return false;
+    }
+    if plan.kind == GeneralMessagePlanKind::FamilyMemoryCorrectLabels
+        && plan
+            .corrected_labels
+            .as_ref()
+            .map_or(true, |labels| labels.is_empty())
+    {
+        return false;
+    }
     true
 }
 
@@ -699,6 +716,12 @@ pub(super) fn general_message_plan_is_actionable_tool(kind: GeneralMessagePlanKi
             | GeneralMessagePlanKind::GuardianRuleEnable
             | GeneralMessagePlanKind::GuardianRulePause
             | GeneralMessagePlanKind::GuardianStatus
+            | GeneralMessagePlanKind::FamilyMemoryConfirm
+            | GeneralMessagePlanKind::FamilyMemoryFavorite
+            | GeneralMessagePlanKind::FamilyMemoryHide
+            | GeneralMessagePlanKind::FamilyMemoryCorrectSummary
+            | GeneralMessagePlanKind::FamilyMemoryCorrectLabels
+            | GeneralMessagePlanKind::FamilyMemoryShowFavorites
     )
 }
 
@@ -770,6 +793,12 @@ pub(super) fn general_message_plan_decision_label(plan: &GeneralMessagePlan) -> 
         GeneralMessagePlanKind::GuardianRuleEnable => "guardian_rule_enable",
         GeneralMessagePlanKind::GuardianRulePause => "guardian_rule_pause",
         GeneralMessagePlanKind::GuardianStatus => "guardian_status",
+        GeneralMessagePlanKind::FamilyMemoryConfirm => "family_memory_confirm",
+        GeneralMessagePlanKind::FamilyMemoryFavorite => "family_memory_favorite",
+        GeneralMessagePlanKind::FamilyMemoryHide => "family_memory_hide",
+        GeneralMessagePlanKind::FamilyMemoryCorrectSummary => "family_memory_correct_summary",
+        GeneralMessagePlanKind::FamilyMemoryCorrectLabels => "family_memory_correct_labels",
+        GeneralMessagePlanKind::FamilyMemoryShowFavorites => "family_memory_show_favorites",
         GeneralMessagePlanKind::ConversationAct => plan
             .conversation_act
             .map(GeneralMessageConversationAct::reply_pack_kind)
@@ -791,7 +820,8 @@ pub(super) fn build_general_message_router_system_prompt() -> String {
         "You are HarborBeacon's local-only Natural Semantic Parser (NSP). ",
         "Return exactly one valid JSON object and no markdown. Schema: ",
         "{\"decision\":\"...\",\"confidence\":0.95,\"canonical_phrase\":\"...\",",
-        "\"camera_hint\":null,\"query\":null,",
+        "\"camera_hint\":null,\"query\":null,\"event_id\":null,",
+        "\"corrected_summary\":null,\"corrected_labels\":null,",
         "\"home_assistant\":{\"domain\":null,\"service\":null,\"entity_hint\":null},",
         "\"conversation_act\":null,\"reply_text\":null,\"reason\":\"...\"}. ",
         "Closed decisions: capability_summary, camera_snapshot, camera_record_clip, ",
@@ -800,6 +830,9 @@ pub(super) fn build_general_message_router_system_prompt() -> String {
         "evt_readiness, evt_preflight, evt_evidence_bundle, family_timeline_summary, ",
         "family_timeline_query, guardian_rule_proposal, guardian_rule_list, guardian_rule_enable, ",
         "guardian_rule_pause, guardian_status, knowledge_search, rag_answer, ",
+        "family_memory_confirm, family_memory_favorite, family_memory_hide, ",
+        "family_memory_correct_summary, family_memory_correct_labels, ",
+        "family_memory_show_favorites, ",
         "clarify, conversation_continue, conversation_boundary, ",
         "conversation_repair, conversation_cancel, conversation_clarify_continue. ",
         "For ha_service_action, fill only domain/service/entity_hint. Allowed HA outputs are ",
@@ -822,7 +855,10 @@ pub(super) fn build_general_message_router_system_prompt() -> String {
         "recording/video/clip means camera_record_clip; asking what the camera recently saw means ",
         "vision_event_summary; asking to describe or understand the latest visual event means ",
         "vlm_describe_latest_event; asking what is worth noticing at home means ",
-        "family_memory_summary; asking to send/share/notify the latest camera situation means ",
+        "family_memory_summary; asking to confirm/use, favorite, hide, restore/show favorites, ",
+        "or correct the previous referenced family event means the matching family_memory_* ",
+        "decision; use event_id only when explicitly given, and put short corrected text in ",
+        "corrected_summary or corrected_labels slots; asking to send/share/notify the latest camera situation means ",
         "vision_event_notify_latest, including requests to send it to the default notification ",
         "target/contact; asking to run/activate/execute a scene/routine means ha_service_action ",
         "with domain scene, service turn_on, and entity_hint copied as a short scene description; ",
@@ -840,6 +876,10 @@ pub(super) fn build_general_message_router_system_prompt() -> String {
         "今天家里发生了什么 => {\"decision\":\"family_timeline_summary\",\"confidence\":0.95}; ",
         "刚才门口发生了什么 => {\"decision\":\"vlm_describe_latest_event\",\"confidence\":0.95,\"camera_hint\":\"门口\"}; ",
         "今天家里有什么值得注意的 => {\"decision\":\"family_memory_summary\",\"confidence\":0.95}; ",
+        "收藏这个 => {\"decision\":\"family_memory_favorite\",\"confidence\":0.95}; ",
+        "隐藏这个事件 => {\"decision\":\"family_memory_hide\",\"confidence\":0.95}; ",
+        "这个不对，是快递 => {\"decision\":\"family_memory_correct_summary\",\"confidence\":0.95,\"corrected_summary\":\"快递\"}; ",
+        "看我收藏的家庭记忆 => {\"decision\":\"family_memory_show_favorites\",\"confidence\":0.95}; ",
         "以后门口有人就通知我 => {\"decision\":\"guardian_rule_proposal\",\"confidence\":0.95,",
         "\"guardian_rule\":{\"trigger\":{\"camera_id\":\"门口\",\"event_type\":\"person_detected\",",
         "\"labels\":[\"person\"],\"min_confidence\":0.6},\"action_plan\":{\"actions\":[{\"kind\":\"notify_default_target\"}]}}}; ",
@@ -972,6 +1012,22 @@ pub(super) fn parse_general_message_router_decision(
             "guardian_status" | "home_guardian_status" => {
                 return Some((GeneralMessagePlanKind::GuardianStatus, None))
             }
+            "family_memory_confirm" => {
+                return Some((GeneralMessagePlanKind::FamilyMemoryConfirm, None))
+            }
+            "family_memory_favorite" => {
+                return Some((GeneralMessagePlanKind::FamilyMemoryFavorite, None))
+            }
+            "family_memory_hide" => return Some((GeneralMessagePlanKind::FamilyMemoryHide, None)),
+            "family_memory_correct_summary" => {
+                return Some((GeneralMessagePlanKind::FamilyMemoryCorrectSummary, None))
+            }
+            "family_memory_correct_labels" => {
+                return Some((GeneralMessagePlanKind::FamilyMemoryCorrectLabels, None))
+            }
+            "family_memory_show_favorites" => {
+                return Some((GeneralMessagePlanKind::FamilyMemoryShowFavorites, None))
+            }
             "conversation" | "conversation_continue" | "continue" => {
                 return Some((
                     GeneralMessagePlanKind::ConversationAct,
@@ -1057,6 +1113,12 @@ pub(super) fn build_general_message_renderer_prompt(
             GeneralMessagePlanKind::GuardianRuleEnable => "guardian_rule_enable",
             GeneralMessagePlanKind::GuardianRulePause => "guardian_rule_pause",
             GeneralMessagePlanKind::GuardianStatus => "guardian_status",
+            GeneralMessagePlanKind::FamilyMemoryConfirm => "family_memory_confirm",
+            GeneralMessagePlanKind::FamilyMemoryFavorite => "family_memory_favorite",
+            GeneralMessagePlanKind::FamilyMemoryHide => "family_memory_hide",
+            GeneralMessagePlanKind::FamilyMemoryCorrectSummary => "family_memory_correct_summary",
+            GeneralMessagePlanKind::FamilyMemoryCorrectLabels => "family_memory_correct_labels",
+            GeneralMessagePlanKind::FamilyMemoryShowFavorites => "family_memory_show_favorites",
         },
         message = request.intent.raw_text,
         pending_loop = serde_json::to_string(&pending_loop.map(|pending| {
@@ -1352,6 +1414,22 @@ pub(super) fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePla
         "guardian_status" | "home_guardian_status" => {
             (GeneralMessagePlanKind::GuardianStatus, None)
         }
+        "family_memory_confirm" | "memory_confirm" => {
+            (GeneralMessagePlanKind::FamilyMemoryConfirm, None)
+        }
+        "family_memory_favorite" | "memory_favorite" => {
+            (GeneralMessagePlanKind::FamilyMemoryFavorite, None)
+        }
+        "family_memory_hide" | "memory_hide" => (GeneralMessagePlanKind::FamilyMemoryHide, None),
+        "family_memory_correct_summary" | "memory_correct_summary" => {
+            (GeneralMessagePlanKind::FamilyMemoryCorrectSummary, None)
+        }
+        "family_memory_correct_labels" | "memory_correct_labels" => {
+            (GeneralMessagePlanKind::FamilyMemoryCorrectLabels, None)
+        }
+        "family_memory_show_favorites" | "memory_show_favorites" => {
+            (GeneralMessagePlanKind::FamilyMemoryShowFavorites, None)
+        }
         "conversation" | "conversation_continue" | "continue" => (
             GeneralMessagePlanKind::ConversationAct,
             Some(payload_conversation_act.unwrap_or(GeneralMessageConversationAct::Continue)),
@@ -1391,6 +1469,9 @@ pub(super) fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePla
         query: normalize_optional_general_message_plan_field(payload.query),
         home_assistant_action,
         guardian_rule: payload.guardian_rule,
+        event_id: normalize_optional_general_message_plan_field(payload.event_id),
+        corrected_summary: normalize_optional_general_message_plan_field(payload.corrected_summary),
+        corrected_labels: payload.corrected_labels,
         confidence,
         recent_clip: None,
         reason: normalize_optional_general_message_plan_field(payload.reason),
@@ -1495,6 +1576,9 @@ pub(super) fn fallback_general_message_plan(
             query: None,
             home_assistant_action: None,
             guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
             confidence: Some(100),
             recent_clip: None,
             reason: Some("evt_long_run_requires_operator_supervisor".to_string()),
@@ -1511,6 +1595,9 @@ pub(super) fn fallback_general_message_plan(
             query: None,
             home_assistant_action: None,
             guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
             confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a capability summary request".to_string()),
@@ -1527,6 +1614,9 @@ pub(super) fn fallback_general_message_plan(
             query: None,
             home_assistant_action: None,
             guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
             confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a latest event notification request".to_string()),
@@ -1542,6 +1632,9 @@ pub(super) fn fallback_general_message_plan(
             query: None,
             home_assistant_action: None,
             guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
             confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a recent event summary request".to_string()),
@@ -1557,6 +1650,9 @@ pub(super) fn fallback_general_message_plan(
             query: None,
             home_assistant_action: None,
             guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
             confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a system readiness request".to_string()),
@@ -1572,6 +1668,9 @@ pub(super) fn fallback_general_message_plan(
             query: None,
             home_assistant_action: None,
             guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
             confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a Home Assistant service action".to_string()),
@@ -1593,6 +1692,9 @@ pub(super) fn fallback_general_message_plan(
             query: None,
             home_assistant_action: None,
             guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
             confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a short clip request".to_string()),
@@ -1608,6 +1710,9 @@ pub(super) fn fallback_general_message_plan(
             query: None,
             home_assistant_action: None,
             guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
             confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a snapshot request".to_string()),
@@ -1623,6 +1728,9 @@ pub(super) fn fallback_general_message_plan(
             query: infer_query_from_raw_text(raw_text),
             home_assistant_action: None,
             guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
             confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a RAG answer request".to_string()),
@@ -1654,6 +1762,9 @@ pub(super) fn fallback_general_message_plan(
             query: infer_query_from_raw_text(raw_text),
             home_assistant_action: None,
             guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
             confidence: None,
             recent_clip: None,
             reason: Some("fallback rule inferred a knowledge search request".to_string()),

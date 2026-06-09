@@ -108,9 +108,10 @@ use crate::runtime::remote_view;
 use crate::runtime::task_session::{
     session_state_value_from_conversation, PendingTaskCandidate, PendingTaskClipConfirmation,
     PendingTaskConnect, PendingTaskGeneralMessageLoop, PendingTaskHomeAssistantCandidate,
-    PendingTaskHomeAssistantClarification, RecentClipPlaybackState, TaskConversationState,
-    TaskConversationStore,
+    PendingTaskHomeAssistantClarification, RecentClipPlaybackState, RecentFamilyMemoryEventState,
+    TaskConversationState, TaskConversationStore,
 };
+use crate::runtime::vision_event::StoredLocalVisionEvent;
 const ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV: &str = "HARBOR_ALLOW_NON_HARBOROS_CAPTURE_ROOT";
 const GENERAL_MESSAGE_RECAP_LIMIT: usize = 3;
 const GENERAL_MESSAGE_TURN_BUDGET_MS: u64 = 24_000;
@@ -127,6 +128,7 @@ const RAG_ANSWER_MAX_TOKENS: u32 = 256;
 const RAG_ANSWER_BUDGET_MS_ENV: &str = "HARBOR_RAG_ANSWER_BUDGET_MS";
 const RAG_ANSWER_MAX_TOKENS_ENV: &str = "HARBOR_RAG_ANSWER_MAX_TOKENS";
 const RECENT_CLIP_PLAYBACK_WINDOW_MS: u128 = 15 * 60 * 1000;
+const RECENT_FAMILY_MEMORY_EVENT_WINDOW_MS: u128 = 24 * 60 * 60 * 1000;
 const DEFAULT_TURN_INTENT_DOMAIN: &str = "general";
 const DEFAULT_TURN_INTENT_ACTION: &str = "message";
 const CONTINUATION_TOKEN_KEY: &str = "continuation_token";
@@ -2220,6 +2222,19 @@ impl TaskApiService {
                 }
                 self.handle_general_message_guardian_status_update(request, "paused")
             }
+            GeneralMessagePlanKind::FamilyMemoryConfirm
+            | GeneralMessagePlanKind::FamilyMemoryFavorite
+            | GeneralMessagePlanKind::FamilyMemoryHide
+            | GeneralMessagePlanKind::FamilyMemoryCorrectSummary
+            | GeneralMessagePlanKind::FamilyMemoryCorrectLabels
+            | GeneralMessagePlanKind::FamilyMemoryShowFavorites => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_family_memory_feedback(request, &plan)
+            }
             GeneralMessagePlanKind::Unsupported => {
                 if let Err(response) =
                     self.clear_general_message_loop_if_matches(request, prior_pending)
@@ -2633,6 +2648,9 @@ impl TaskApiService {
                 .or_else(|| infer_query_from_raw_text(request.intent.raw_text.as_str())),
             home_assistant_action: None,
             guardian_rule: None,
+            event_id: None,
+            corrected_summary: None,
+            corrected_labels: None,
             confidence: None,
             recent_clip: None,
             reason: Some("no_supported_candidate".to_string()),
@@ -4701,6 +4719,38 @@ impl TaskApiService {
             })
     }
 
+    fn remember_family_memory_event(
+        &self,
+        request: &TaskRequest,
+        stored: &StoredLocalVisionEvent,
+    ) -> Result<(), String> {
+        let mut conversation = self.load_or_create_conversation(request);
+        conversation.set_recent_family_memory_event(Some(RecentFamilyMemoryEventState {
+            event_id: stored.event.event_id.clone(),
+            camera_id: stored.event.camera_id.clone(),
+            event_type: stored.event.event_type.clone(),
+            summary: redact_task_api_text(&stored.event.summary)
+                .chars()
+                .take(160)
+                .collect(),
+            referenced_at_epoch_ms: current_epoch_ms(),
+        }));
+        self.save_conversation(request, &conversation)
+    }
+
+    fn recent_family_memory_event_for_request(
+        &self,
+        request: &TaskRequest,
+    ) -> Option<RecentFamilyMemoryEventState> {
+        self.load_conversation(request)
+            .and_then(|conversation| conversation.recent_family_memory_event())
+            .filter(|recent| {
+                !recent.event_id.trim().is_empty()
+                    && current_epoch_ms().saturating_sub(recent.referenced_at_epoch_ms)
+                        <= RECENT_FAMILY_MEMORY_EVENT_WINDOW_MS
+            })
+    }
+
     fn save_conversation(
         &self,
         request: &TaskRequest,
@@ -5426,7 +5476,13 @@ fn clip_confirmation_active_frame_decision(plan: &GeneralMessagePlan) -> ActiveF
         | GeneralMessagePlanKind::GuardianRuleList
         | GeneralMessagePlanKind::GuardianRuleEnable
         | GeneralMessagePlanKind::GuardianRulePause
-        | GeneralMessagePlanKind::GuardianStatus => ActiveFrameDecision::Supersede,
+        | GeneralMessagePlanKind::GuardianStatus
+        | GeneralMessagePlanKind::FamilyMemoryConfirm
+        | GeneralMessagePlanKind::FamilyMemoryFavorite
+        | GeneralMessagePlanKind::FamilyMemoryHide
+        | GeneralMessagePlanKind::FamilyMemoryCorrectSummary
+        | GeneralMessagePlanKind::FamilyMemoryCorrectLabels
+        | GeneralMessagePlanKind::FamilyMemoryShowFavorites => ActiveFrameDecision::Supersede,
         GeneralMessagePlanKind::ConversationAct
             if plan.conversation_act == Some(GeneralMessageConversationAct::Cancel) =>
         {

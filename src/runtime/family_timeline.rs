@@ -316,7 +316,7 @@ fn family_timeline_window_label(window_seconds: u64) -> String {
     }
 }
 
-fn family_timeline_event(stored: &StoredLocalVisionEvent) -> FamilyTimelineEvent {
+pub fn family_timeline_event(stored: &StoredLocalVisionEvent) -> FamilyTimelineEvent {
     let event = &stored.event;
     FamilyTimelineEvent {
         event_id: event.event_id.clone(),

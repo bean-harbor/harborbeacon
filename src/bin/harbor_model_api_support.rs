@@ -649,6 +649,8 @@ fn semantic_router_decision(request: &SemanticRouterRequest) -> Value {
     let mut camera_hint = Value::Null;
     let mut query = Value::Null;
     let mut guardian_rule = Value::Null;
+    let mut corrected_summary = Value::Null;
+    let mut corrected_labels = Value::Null;
 
     let stress = contains_any(text, &lower, &["evt", "stress", "压测", "压力测试"]);
     if stress
@@ -700,6 +702,26 @@ fn semantic_router_decision(request: &SemanticRouterRequest) -> Value {
     } else if contains_any(text, &lower, &["你能干什么", "帮助", "help", "能力"]) {
         decision = "capability_summary";
         confidence = 0.95;
+    } else if semantic_router_asks_for_family_memory_favorites(text, &lower) {
+        decision = "family_memory_show_favorites";
+        confidence = 0.95;
+    } else if let Some(labels) = semantic_router_family_memory_corrected_labels(text, &lower) {
+        decision = "family_memory_correct_labels";
+        confidence = 0.95;
+        corrected_labels = json!(labels);
+    } else if let Some(summary) = semantic_router_family_memory_corrected_summary(text, &lower) {
+        decision = "family_memory_correct_summary";
+        confidence = 0.95;
+        corrected_summary = json!(summary);
+    } else if semantic_router_asks_to_favorite_family_memory(text, &lower) {
+        decision = "family_memory_favorite";
+        confidence = 0.95;
+    } else if semantic_router_asks_to_hide_family_memory(text, &lower) {
+        decision = "family_memory_hide";
+        confidence = 0.95;
+    } else if semantic_router_confirms_family_memory(text, &lower) {
+        decision = "family_memory_confirm";
+        confidence = 0.94;
     } else if contains_any(
         text,
         &lower,
@@ -872,10 +894,87 @@ fn semantic_router_decision(request: &SemanticRouterRequest) -> Value {
         "query": query,
         "home_assistant": home_assistant,
         "guardian_rule": guardian_rule,
+        "corrected_summary": corrected_summary,
+        "corrected_labels": corrected_labels,
         "conversation_act": Value::Null,
         "reply_text": Value::Null,
         "reason": "local_only_semantic_router_backend",
     })
+}
+
+fn semantic_router_asks_for_family_memory_favorites(text: &str, lower: &str) -> bool {
+    contains_any(
+        text,
+        lower,
+        &["收藏的家庭记忆", "收藏的记忆", "收藏事件", "favorites"],
+    ) && contains_any(text, lower, &["看", "列", "显示", "show", "list"])
+}
+
+fn semantic_router_asks_to_favorite_family_memory(text: &str, lower: &str) -> bool {
+    contains_any(text, lower, &["收藏", "favorite", "save"])
+        && contains_any(text, lower, &["这个", "这条", "事件", "记忆", "it"])
+        && !semantic_router_asks_for_family_memory_favorites(text, lower)
+}
+
+fn semantic_router_asks_to_hide_family_memory(text: &str, lower: &str) -> bool {
+    contains_any(text, lower, &["隐藏", "不显示", "hide"])
+        && contains_any(text, lower, &["这个", "这条", "事件", "记忆", "it"])
+}
+
+fn semantic_router_confirms_family_memory(text: &str, lower: &str) -> bool {
+    contains_any(
+        text,
+        lower,
+        &["有用", "确认", "对的", "没错", "useful", "confirm"],
+    ) && contains_any(text, lower, &["这个", "这条", "事件", "记忆", "it"])
+}
+
+fn semantic_router_family_memory_corrected_summary(text: &str, lower: &str) -> Option<String> {
+    if !contains_any(
+        text,
+        lower,
+        &[
+            "不对",
+            "不是",
+            "其实是",
+            "应该是",
+            "改成",
+            "修正为",
+            "correct",
+        ],
+    ) {
+        return None;
+    }
+    for marker in ["其实是", "应该是", "修正为", "改成", "不是", "是"] {
+        if let Some((_, tail)) = text.split_once(marker) {
+            let summary = tail
+                .trim()
+                .trim_matches(|ch: char| matches!(ch, '。' | '，' | ',' | '.' | '：' | ':'));
+            if !summary.is_empty() && summary.chars().count() <= 160 {
+                return Some(summary.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn semantic_router_family_memory_corrected_labels(text: &str, lower: &str) -> Option<Vec<String>> {
+    if !contains_any(text, lower, &["标签", "label", "labels"]) {
+        return None;
+    }
+    let raw = ["改成", "修正为", "是", ":", "："]
+        .iter()
+        .find_map(|marker| text.split_once(marker).map(|(_, tail)| tail))
+        .unwrap_or(text);
+    let labels = raw
+        .split(|ch: char| matches!(ch, ',' | '，' | '、' | '/' | ' '))
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .filter(|label| !matches!(*label, "标签" | "改成" | "修正为"))
+        .take(12)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    (!labels.is_empty()).then_some(labels)
 }
 
 fn semantic_router_asks_to_understand_visual_event(text: &str, lower: &str) -> bool {
@@ -2848,6 +2947,54 @@ mod tests {
             assert_eq!(decision["decision"], json!(expected));
             assert!(decision["confidence"].as_f64().unwrap_or_default() >= 0.9);
         }
+    }
+
+    #[test]
+    fn semantic_router_backend_routes_family_memory_feedback_decisions() {
+        for (message, expected) in [
+            ("User message: 收藏这个", "family_memory_favorite"),
+            ("User message: 隐藏这个事件", "family_memory_hide"),
+            ("User message: 这个有用", "family_memory_confirm"),
+            (
+                "User message: 看我收藏的家庭记忆",
+                "family_memory_show_favorites",
+            ),
+        ] {
+            let body = json!({
+                "messages": [
+                    {"role": "system", "content": "Return JSON only."},
+                    {"role": "user", "content": message}
+                ]
+            });
+            let request =
+                parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+                    .expect("semantic router request");
+            let decision = semantic_router_decision(&request);
+            assert_eq!(decision["decision"], json!(expected));
+            assert!(decision["confidence"].as_f64().unwrap_or_default() >= 0.9);
+        }
+
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "User message: 这个不对，是快递"}
+            ]
+        });
+        let request = parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+            .expect("semantic router request");
+        let decision = semantic_router_decision(&request);
+        assert_eq!(decision["decision"], json!("family_memory_correct_summary"));
+        assert_eq!(decision["corrected_summary"], json!("快递"));
+
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "User message: 标签改成 快递 门口"}
+            ]
+        });
+        let request = parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+            .expect("semantic router request");
+        let decision = semantic_router_decision(&request);
+        assert_eq!(decision["decision"], json!("family_memory_correct_labels"));
+        assert_eq!(decision["corrected_labels"], json!(["快递", "门口"]));
     }
 
     #[test]

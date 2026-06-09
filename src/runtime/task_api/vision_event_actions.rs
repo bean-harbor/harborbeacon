@@ -70,6 +70,7 @@ impl TaskApiService {
         };
         let summary = build_redacted_vision_event_summary(&stored);
         let message = latest_vision_event_reply(&stored);
+        let _ = self.remember_family_memory_event(request, &stored);
         let event = self.serialize_event_record(&build_task_event_record(
             request,
             &step_id_for_request(request),
@@ -503,6 +504,7 @@ impl TaskApiService {
         } else {
             "vlm_describe_latest_event"
         };
+        let _ = self.remember_family_memory_event(request, stored);
         self.completed_with_context(
             request,
             "vision_vlm_enrichment",

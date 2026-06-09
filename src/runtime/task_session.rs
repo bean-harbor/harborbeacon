@@ -90,6 +90,20 @@ pub struct RecentClipPlaybackState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RecentFamilyMemoryEventState {
+    #[serde(default)]
+    pub event_id: String,
+    #[serde(default)]
+    pub camera_id: String,
+    #[serde(default)]
+    pub event_type: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub referenced_at_epoch_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct PendingTaskGeneralMessageLoop {
     #[serde(default)]
     pub resume_token: String,
@@ -177,6 +191,8 @@ pub struct TaskConversationState {
     pub pending_connect: Option<PendingTaskConnect>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_clip_playback: Option<RecentClipPlaybackState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_family_memory_event: Option<RecentFamilyMemoryEventState>,
     #[serde(default)]
     pub last_scan_cidr: String,
 }
@@ -253,6 +269,17 @@ impl TaskConversationState {
 
     pub fn set_recent_clip_playback(&mut self, recent_clip: Option<RecentClipPlaybackState>) {
         self.recent_clip_playback = recent_clip;
+    }
+
+    pub fn recent_family_memory_event(&self) -> Option<RecentFamilyMemoryEventState> {
+        self.recent_family_memory_event.clone()
+    }
+
+    pub fn set_recent_family_memory_event(
+        &mut self,
+        recent_event: Option<RecentFamilyMemoryEventState>,
+    ) {
+        self.recent_family_memory_event = recent_event;
     }
 }
 

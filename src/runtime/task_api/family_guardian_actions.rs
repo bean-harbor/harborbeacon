@@ -6,6 +6,12 @@ use uuid::Uuid;
 use crate::control_plane::events::EventSeverity;
 use crate::orchestrator::contracts::RiskLevel;
 use crate::runtime::admin_console::AutomationRuleReview;
+use crate::runtime::family_memory::{
+    append_family_memory_feedback_default, apply_family_memory_overlays_to_events,
+    build_family_memory_stats, compact_family_memory_feedback_evidence,
+    family_memory_overlays_default, list_family_memory_feedback_default,
+    FamilyMemoryFeedbackRequest, DEFAULT_FAMILY_MEMORY_FEEDBACK_LIMIT,
+};
 use crate::runtime::family_timeline::{
     build_family_timeline_digest_from_query, FamilyTimelineQueryOptions,
 };
@@ -41,7 +47,33 @@ impl TaskApiService {
             }
         };
         let query = FamilyTimelineQueryOptions::default();
-        let digest = match build_family_timeline_digest_from_query(&events, &query) {
+        let overlays = match family_memory_overlays_default() {
+            Ok(overlays) => overlays,
+            Err(error) => {
+                return self.failed(
+                    request,
+                    "agentic_interpreter",
+                    RiskLevel::Low,
+                    format!(
+                        "读取家庭记忆 overlay 失败：{}",
+                        redact_task_api_text(&error)
+                    ),
+                )
+            }
+        };
+        let visible_events = apply_family_memory_overlays_to_events(&events, &overlays, false);
+        if let Some(latest_event_id) = visible_events
+            .first()
+            .map(|stored| stored.event.event_id.clone())
+        {
+            if let Some(stored) = visible_events
+                .iter()
+                .find(|stored| stored.event.event_id == latest_event_id)
+            {
+                let _ = self.remember_family_memory_event(request, stored);
+            }
+        }
+        let digest = match build_family_timeline_digest_from_query(&visible_events, &query) {
             Ok(digest) => digest,
             Err(error) => {
                 return self.failed(
@@ -74,6 +106,7 @@ impl TaskApiService {
                 "status": digest.status,
                 "event_count": digest.event_count,
                 "vlm_coverage": digest.vlm_coverage,
+                "latest_event_id": digest.latest_event_id,
                 "metadata_only": true,
                 "secret_scan": "clean",
                 "redacted": true,
@@ -106,6 +139,259 @@ impl TaskApiService {
                 "家庭守护状态".to_string(),
                 "以后门口有人就通知我".to_string(),
             ],
+        )
+    }
+
+    pub(super) fn handle_general_message_family_memory_feedback(
+        &self,
+        request: &TaskRequest,
+        plan: &GeneralMessagePlan,
+    ) -> TaskResponse {
+        if plan.kind == GeneralMessagePlanKind::FamilyMemoryShowFavorites {
+            return self.handle_general_message_family_memory_favorites(request);
+        }
+        let event_id = plan
+            .event_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.recent_family_memory_event_for_request(request)
+                    .map(|recent| recent.event_id)
+            });
+        let Some(event_id) = event_id else {
+            let message = "我还不知道“这个”指哪条家庭事件。你可以先问“最近事件”或“今天家里发生了什么”，再回复收藏、隐藏或修正。".to_string();
+            return self.completed_with_context(
+                request,
+                "family_memory_review",
+                RiskLevel::Low,
+                message.clone(),
+                json!({
+                    "reply_pack": {
+                        "kind": "family_memory_feedback",
+                        "status": "needs_input",
+                        "reason": "no_recent_event_context",
+                        "summary": message,
+                        "redacted": true,
+                    }
+                }),
+                Vec::new(),
+                Vec::new(),
+                vec!["最近事件".to_string(), "今天家里发生了什么".to_string()],
+            );
+        };
+        let events = match list_recent_local_vision_events_default(100) {
+            Ok(events) => events,
+            Err(error) => {
+                return self.failed(
+                    request,
+                    "family_memory_review",
+                    RiskLevel::Low,
+                    format!("读取家庭事件失败：{}", redact_task_api_text(&error)),
+                )
+            }
+        };
+        let Some(stored) = events
+            .iter()
+            .find(|stored| stored.event.event_id == event_id)
+            .cloned()
+        else {
+            let message = "这条家庭事件已经不在最近事件窗口里了，不能直接纠错。".to_string();
+            return self.completed_with_context(
+                request,
+                "family_memory_review",
+                RiskLevel::Low,
+                message.clone(),
+                json!({
+                    "reply_pack": {
+                        "kind": "family_memory_feedback",
+                        "status": "blocked",
+                        "reason": "event_not_found",
+                        "event_id": event_id,
+                        "summary": message,
+                        "redacted": true,
+                    }
+                }),
+                Vec::new(),
+                Vec::new(),
+                vec!["最近事件".to_string()],
+            );
+        };
+        let feedback_request = match family_memory_feedback_request_from_plan(plan) {
+            Ok(request) => request,
+            Err(error) => {
+                return self.completed_with_context(
+                    request,
+                    "family_memory_review",
+                    RiskLevel::Low,
+                    error.clone(),
+                    json!({
+                        "reply_pack": {
+                            "kind": "family_memory_feedback",
+                            "status": "needs_input",
+                            "reason": "feedback_slot_missing",
+                            "summary": error,
+                            "event_id": event_id,
+                            "redacted": true,
+                        }
+                    }),
+                    Vec::new(),
+                    Vec::new(),
+                    vec!["最近事件".to_string()],
+                )
+            }
+        };
+        let record =
+            match append_family_memory_feedback_default(&event_id, feedback_request, "wechat") {
+                Ok(record) => record,
+                Err(error) => {
+                    return self.failed(
+                        request,
+                        "family_memory_review",
+                        RiskLevel::Low,
+                        format!("保存家庭记忆反馈失败：{}", redact_task_api_text(&error)),
+                    )
+                }
+            };
+        let _ = self.remember_family_memory_event(request, &stored);
+        let evidence = compact_family_memory_feedback_evidence(&record);
+        let stats = list_family_memory_feedback_default(DEFAULT_FAMILY_MEMORY_FEEDBACK_LIMIT)
+            .map(|records| build_family_memory_stats(&records))
+            .ok();
+        let message = family_memory_feedback_reply(record.action.as_str(), &stored);
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "family_memory.feedback_recorded",
+            EventSeverity::Info,
+            json!({
+                "status": "stored",
+                "event_id": event_id,
+                "camera_id": stored.event.camera_id,
+                "feedback": evidence,
+                "memory_overlay": stats,
+                "metadata_only": true,
+                "secret_scan": "clean",
+                "redacted": true,
+            }),
+        ));
+        self.completed_with_context(
+            request,
+            "family_memory_review",
+            RiskLevel::Low,
+            message.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "family_memory_feedback",
+                    "status": "stored",
+                    "summary": message,
+                    "event_id": event_id,
+                    "camera_id": stored.event.camera_id,
+                    "feedback": evidence,
+                    "memory_overlay": stats,
+                    "redacted": true,
+                }
+            }),
+            Vec::new(),
+            vec![event],
+            vec![
+                "看我收藏的家庭记忆".to_string(),
+                "今天家里发生了什么".to_string(),
+            ],
+        )
+    }
+
+    fn handle_general_message_family_memory_favorites(
+        &self,
+        request: &TaskRequest,
+    ) -> TaskResponse {
+        let events = match list_recent_local_vision_events_default(100) {
+            Ok(events) => events,
+            Err(error) => {
+                return self.failed(
+                    request,
+                    "family_memory_review",
+                    RiskLevel::Low,
+                    format!("读取家庭记忆失败：{}", redact_task_api_text(&error)),
+                )
+            }
+        };
+        let records =
+            match list_family_memory_feedback_default(DEFAULT_FAMILY_MEMORY_FEEDBACK_LIMIT) {
+                Ok(records) => records,
+                Err(error) => {
+                    return self.failed(
+                        request,
+                        "family_memory_review",
+                        RiskLevel::Low,
+                        format!(
+                            "读取家庭记忆 overlay 失败：{}",
+                            redact_task_api_text(&error)
+                        ),
+                    )
+                }
+            };
+        let overlays = crate::runtime::family_memory::build_family_memory_overlays(&records);
+        let visible_events = apply_family_memory_overlays_to_events(&events, &overlays, false);
+        let favorites = visible_events
+            .iter()
+            .filter(|stored| {
+                overlays
+                    .get(&stored.event.event_id)
+                    .is_some_and(|overlay| overlay.favorite)
+            })
+            .take(5)
+            .collect::<Vec<_>>();
+        let message = if favorites.is_empty() {
+            "目前还没有收藏的家庭记忆。".to_string()
+        } else {
+            let lines = favorites
+                .iter()
+                .map(|stored| {
+                    format!(
+                        "{}：{}",
+                        stored.event.camera_id,
+                        redact_task_api_text(&stored.event.summary)
+                    )
+                })
+                .collect::<Vec<_>>();
+            format!("已收藏的家庭记忆：\n{}", lines.join("\n"))
+        };
+        if let Some(stored) = favorites.first() {
+            let _ = self.remember_family_memory_event(request, stored);
+        }
+        let stats = build_family_memory_stats(&records);
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "family_memory.favorites_read",
+            EventSeverity::Info,
+            json!({
+                "favorite_count": stats.favorite_count,
+                "returned_count": favorites.len(),
+                "metadata_only": true,
+                "secret_scan": "clean",
+                "redacted": true,
+            }),
+        ));
+        self.completed_with_context(
+            request,
+            "family_memory_review",
+            RiskLevel::Low,
+            message.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "family_memory_show_favorites",
+                    "status": "available",
+                    "summary": message,
+                    "memory_overlay": stats,
+                    "redacted": true,
+                }
+            }),
+            Vec::new(),
+            vec![event],
+            vec!["今天家里发生了什么".to_string()],
         )
     }
 
@@ -626,6 +912,64 @@ impl TaskApiService {
             }],
             "metadata_only": true,
         }))
+    }
+}
+
+fn family_memory_feedback_request_from_plan(
+    plan: &GeneralMessagePlan,
+) -> Result<FamilyMemoryFeedbackRequest, String> {
+    match plan.kind {
+        GeneralMessagePlanKind::FamilyMemoryConfirm => Ok(FamilyMemoryFeedbackRequest {
+            action: "confirm_useful".to_string(),
+            ..FamilyMemoryFeedbackRequest::default()
+        }),
+        GeneralMessagePlanKind::FamilyMemoryFavorite => Ok(FamilyMemoryFeedbackRequest {
+            action: "favorite".to_string(),
+            ..FamilyMemoryFeedbackRequest::default()
+        }),
+        GeneralMessagePlanKind::FamilyMemoryHide => Ok(FamilyMemoryFeedbackRequest {
+            action: "hide".to_string(),
+            ..FamilyMemoryFeedbackRequest::default()
+        }),
+        GeneralMessagePlanKind::FamilyMemoryCorrectSummary => {
+            let summary = plan
+                .corrected_summary
+                .as_deref()
+                .or(plan.query.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "你要把这条事件改成什么摘要？".to_string())?;
+            Ok(FamilyMemoryFeedbackRequest {
+                action: "correct_summary".to_string(),
+                corrected_summary: Some(summary.to_string()),
+                ..FamilyMemoryFeedbackRequest::default()
+            })
+        }
+        GeneralMessagePlanKind::FamilyMemoryCorrectLabels => {
+            let labels = plan
+                .corrected_labels
+                .clone()
+                .filter(|labels| !labels.is_empty())
+                .ok_or_else(|| "你要把这条事件改成哪些标签？".to_string())?;
+            Ok(FamilyMemoryFeedbackRequest {
+                action: "correct_labels".to_string(),
+                corrected_labels: Some(labels),
+                ..FamilyMemoryFeedbackRequest::default()
+            })
+        }
+        _ => Err("这类家庭记忆反馈还不支持。".to_string()),
+    }
+}
+
+fn family_memory_feedback_reply(action: &str, stored: &StoredLocalVisionEvent) -> String {
+    let camera = stored.event.camera_id.as_str();
+    match action {
+        "confirm_useful" => format!("已确认这条 {camera} 事件有用。"),
+        "favorite" => format!("已收藏这条 {camera} 家庭记忆。"),
+        "hide" => format!("已隐藏这条 {camera} 事件；原始事件审计不会被修改。"),
+        "correct_summary" => format!("已修正这条 {camera} 事件摘要。"),
+        "correct_labels" => format!("已修正这条 {camera} 事件标签。"),
+        _ => format!("已记录这条 {camera} 事件的家庭记忆反馈。"),
     }
 }
 
