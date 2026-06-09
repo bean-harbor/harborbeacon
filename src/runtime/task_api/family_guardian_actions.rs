@@ -57,6 +57,14 @@ impl TaskApiService {
             message.push_str("\n");
             message.push_str(&digest.bullets.join("\n"));
         }
+        if plan.kind == GeneralMessagePlanKind::FamilyMemorySummary {
+            message.push_str(&format!(
+                "\n家庭记忆 VLM 覆盖：active {}，degraded {}，未抽样 {}。",
+                digest.vlm_coverage.active,
+                digest.vlm_coverage.degraded,
+                digest.vlm_coverage.not_sampled
+            ));
+        }
         let event = self.serialize_event_record(&build_task_event_record(
             request,
             &step_id_for_request(request),
@@ -65,6 +73,7 @@ impl TaskApiService {
             json!({
                 "status": digest.status,
                 "event_count": digest.event_count,
+                "vlm_coverage": digest.vlm_coverage,
                 "metadata_only": true,
                 "secret_scan": "clean",
                 "redacted": true,
@@ -79,10 +88,13 @@ impl TaskApiService {
                 "reply_pack": {
                     "kind": if plan.kind == GeneralMessagePlanKind::FamilyTimelineQuery {
                         "family_timeline_query"
+                    } else if plan.kind == GeneralMessagePlanKind::FamilyMemorySummary {
+                        "family_memory_summary"
                     } else {
                         "family_timeline_summary"
                     },
                     "summary": message,
+                    "summary_source": if digest.vlm_coverage.active > 0 { "vlm_mixed" } else { "yolo" },
                     "query": plan.query,
                     "digest": digest,
                     "redacted": true,

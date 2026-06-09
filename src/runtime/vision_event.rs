@@ -1,5 +1,6 @@
 //! Local vision event records for HarborNavi K3 viability testing.
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -516,6 +517,7 @@ fn parse_recent_events_from_tail(
     } else {
         tail
     };
+    let mut seen_event_ids = HashSet::new();
     let mut events = Vec::with_capacity(target_limit);
     for raw_line in slice.split(|byte| *byte == b'\n').rev() {
         let trimmed = trim_ascii_whitespace(raw_line);
@@ -531,6 +533,9 @@ fn parse_recent_events_from_tail(
         let Ok(event) = serde_json::from_str::<StoredLocalVisionEvent>(line) else {
             continue;
         };
+        if !seen_event_ids.insert(event.event.event_id.clone()) {
+            continue;
+        }
         events.push(event);
         if events.len() == target_limit {
             break;
@@ -1568,6 +1573,49 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event.event_id, "event-tail-2");
         assert_eq!(events[1].event.event_id, "event-tail-1");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_recent_local_vision_events_keeps_newest_event_version() {
+        let dir = std::env::temp_dir().join(format!("vision-event-dedupe-{}", Uuid::new_v4()));
+        let store = dir.join("events.jsonl");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let mut file = fs::File::create(&store).expect("create store");
+
+        let mut original = sample_event();
+        original.event_id = "event-same".to_string();
+        original.summary = "YOLO summary".to_string();
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&sample_stored_event(original)).expect("serialize original")
+        )
+        .expect("write original");
+        let mut other = sample_event();
+        other.event_id = "event-other".to_string();
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&sample_stored_event(other)).expect("serialize other")
+        )
+        .expect("write other");
+        let mut enriched = sample_event();
+        enriched.event_id = "event-same".to_string();
+        enriched.summary = "VLM summary".to_string();
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&sample_stored_event(enriched)).expect("serialize enriched")
+        )
+        .expect("write enriched");
+
+        let events = list_recent_local_vision_events(&store, 2).expect("list recent");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event.event_id, "event-same");
+        assert_eq!(events[0].event.summary, "VLM summary");
+        assert_eq!(events[1].event.event_id, "event-other");
         let _ = fs::remove_dir_all(dir);
     }
 

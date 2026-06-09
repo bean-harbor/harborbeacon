@@ -2130,6 +2130,23 @@ impl TaskApiService {
                 }
                 self.handle_general_message_notify_latest_vision_event(request)
             }
+            GeneralMessagePlanKind::VlmDescribeLatestEvent
+            | GeneralMessagePlanKind::VlmDescribeEvent => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_vlm_describe_latest_event(request, &plan)
+            }
+            GeneralMessagePlanKind::FamilyMemorySummary => {
+                if let Err(response) =
+                    self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.handle_general_message_family_timeline(request, &plan)
+            }
             GeneralMessagePlanKind::SystemReadiness => {
                 if let Err(response) =
                     self.clear_general_message_loop_if_matches(request, prior_pending)
@@ -2257,6 +2274,8 @@ impl TaskApiService {
                         "camera_record_clip",
                         "vision_event_summary",
                         "vision_event_notify_latest",
+                        "vlm_describe_latest_event",
+                        "family_memory_summary",
                         "ha_service_action",
                         "system_readiness",
                         "evt_readiness",
@@ -2311,6 +2330,8 @@ impl TaskApiService {
                         "camera_record_clip",
                         "vision_event_summary",
                         "vision_event_notify_latest",
+                        "vlm_describe_latest_event",
+                        "family_memory_summary",
                         "ha_service_action",
                         "system_readiness",
                         "evt_readiness",
@@ -5392,6 +5413,9 @@ fn clip_confirmation_active_frame_decision(plan: &GeneralMessagePlan) -> ActiveF
         | GeneralMessagePlanKind::HomeAssistantServiceAction
         | GeneralMessagePlanKind::VisionEventSummary
         | GeneralMessagePlanKind::VisionEventNotifyLatest
+        | GeneralMessagePlanKind::VlmDescribeLatestEvent
+        | GeneralMessagePlanKind::VlmDescribeEvent
+        | GeneralMessagePlanKind::FamilyMemorySummary
         | GeneralMessagePlanKind::SystemReadiness
         | GeneralMessagePlanKind::EvtReadiness
         | GeneralMessagePlanKind::EvtPreflight
@@ -15422,7 +15446,7 @@ mod tests {
             response.result.data["reply_pack"]["examples"]
                 .as_array()
                 .map(Vec::len),
-            Some(17)
+            Some(19)
         );
         assert!(response.result.data["reply_pack"]["capabilities"]
             .as_array()
@@ -15444,6 +15468,16 @@ mod tests {
             .expect("capabilities")
             .iter()
             .any(|capability| capability.as_str() == Some("guardian_rule_proposal")));
+        assert!(response.result.data["reply_pack"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .any(|capability| capability.as_str() == Some("vlm_describe_latest_event")));
+        assert!(response.result.data["reply_pack"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .any(|capability| capability.as_str() == Some("family_memory_summary")));
         assert!(response.result.data["reply_pack"]["examples"]
             .as_array()
             .expect("examples")

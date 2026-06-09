@@ -399,7 +399,6 @@ fn run_camera(
     camera_count: usize,
 ) -> CameraReport {
     let source_kind = camera.source_kind();
-    let capture = camera.resolved_capture(&config, camera_index, camera_count);
     let camera_output_dir = config.output_dir.join(&camera.camera_id);
     if let Err(error) = fs::create_dir_all(&camera_output_dir) {
         return CameraReport::system_error(
@@ -408,6 +407,62 @@ fn run_camera(
             &format!("failed to create camera output dir: {error}"),
         );
     }
+    let args = match build_local_smoke_args(
+        &camera,
+        &config,
+        camera_index,
+        camera_count,
+        &camera_output_dir,
+    ) {
+        Ok(args) => args,
+        Err(error) => return CameraReport::system_error(&camera.camera_id, &source_kind, &error),
+    };
+    let output = Command::new(&config.local_smoke_bin)
+        .args(&args)
+        .stdin(Stdio::null())
+        .output();
+    let report_path = camera_output_dir.join("local-vision-smoke-report.json");
+    match output {
+        Ok(output) => {
+            let exit_code = output.status.code();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            match read_single_report(&report_path) {
+                Ok(report) => summarize_camera_report(
+                    &camera.camera_id,
+                    &source_kind,
+                    exit_code,
+                    &report,
+                    if output.status.success() {
+                        None
+                    } else {
+                        Some(sanitize_sensitive(&truncate(&stderr, 600)))
+                    },
+                    &camera.resolved_capture(&config, camera_index, camera_count),
+                ),
+                Err(error) => CameraReport::system_error(
+                    &camera.camera_id,
+                    &source_kind,
+                    &format!("child report missing or invalid: {error}"),
+                )
+                .with_exit_code(exit_code),
+            }
+        }
+        Err(error) => CameraReport::system_error(
+            &camera.camera_id,
+            &source_kind,
+            &format!("failed to launch local vision smoke binary: {error}"),
+        ),
+    }
+}
+
+fn build_local_smoke_args(
+    camera: &CameraSource,
+    config: &ResolvedConfig,
+    camera_index: usize,
+    camera_count: usize,
+    camera_output_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let capture = camera.resolved_capture(config, camera_index, camera_count);
     let mut args = vec![
         "--camera-id".to_string(),
         camera.camera_id.clone(),
@@ -514,49 +569,9 @@ fn run_camera(
         args.push("--snapshot-url".to_string());
         args.push(snapshot_url.to_string());
     } else {
-        return CameraReport::system_error(
-            &camera.camera_id,
-            &source_kind,
-            "camera source must define rtspUrl, snapshotUrl, or fixture=true",
-        );
+        return Err("camera source must define rtspUrl, snapshotUrl, or fixture=true".to_string());
     }
-
-    let output = Command::new(&config.local_smoke_bin)
-        .args(&args)
-        .stdin(Stdio::null())
-        .output();
-    let report_path = camera_output_dir.join("local-vision-smoke-report.json");
-    match output {
-        Ok(output) => {
-            let exit_code = output.status.code();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            match read_single_report(&report_path) {
-                Ok(report) => summarize_camera_report(
-                    &camera.camera_id,
-                    &source_kind,
-                    exit_code,
-                    &report,
-                    if output.status.success() {
-                        None
-                    } else {
-                        Some(sanitize_sensitive(&truncate(&stderr, 600)))
-                    },
-                    &capture,
-                ),
-                Err(error) => CameraReport::system_error(
-                    &camera.camera_id,
-                    &source_kind,
-                    &format!("child report missing or invalid: {error}"),
-                )
-                .with_exit_code(exit_code),
-            }
-        }
-        Err(error) => CameraReport::system_error(
-            &camera.camera_id,
-            &source_kind,
-            &format!("failed to launch local vision smoke binary: {error}"),
-        ),
-    }
+    Ok(args)
 }
 
 fn read_single_report(path: &Path) -> Result<SingleSmokeReport, String> {
@@ -1376,10 +1391,84 @@ mod tests {
     }
 
     #[test]
+    fn vlm_manifest_options_are_passed_to_child_runner() {
+        let config = ResolvedConfig {
+            schema: "test".to_string(),
+            output_dir: PathBuf::from("/tmp/test"),
+            duration_seconds: 30,
+            interval_seconds: 10,
+            beacon_url: "http://127.0.0.1:4174".to_string(),
+            analyzer_command: None,
+            model_path: None,
+            label_path: None,
+            provider: "cpu".to_string(),
+            no_post: false,
+            local_smoke_bin: "harbornavi-k3-local-vision-smoke".to_string(),
+            capture: CaptureSettings::default(),
+            vlm_enrich: true,
+            vlm_api_base: Some("http://127.0.0.1:8080/v1".to_string()),
+            vlm_model: Some("local-vlm".to_string()),
+            vlm_api_key: None,
+            vlm_sample_every: Some(360),
+            vlm_max_samples: Some(2),
+            vlm_queue: Some(VlmQueueSettings {
+                mode: Some("global_serial".to_string()),
+                lock_path: Some(PathBuf::from("/tmp/harbornavi-vlm/vlm.queue.lock")),
+                global_max_samples: Some(4),
+                trigger_policy: Some("periodic".to_string()),
+            }),
+        };
+        let camera = CameraSource {
+            camera_id: "cam-vlm".to_string(),
+            kind: None,
+            rtsp_url: None,
+            snapshot_url: None,
+            fixture: Some(true),
+            duration_seconds: None,
+            interval_seconds: None,
+            source_secret_ref: None,
+            capture_mode: None,
+            phase_offset_ms: None,
+            max_frame_age_ms: None,
+            capture_root: None,
+            decode_backend: None,
+            capture: None,
+            vlm_enrich: None,
+            vlm_sample_every: Some(120),
+            vlm_max_samples: None,
+        };
+
+        let args = build_local_smoke_args(&camera, &config, 0, 4, Path::new("/tmp/test/cam-vlm"))
+            .expect("args");
+
+        assert!(args.contains(&"--vlm-enrich".to_string()));
+        assert_arg_value(&args, "--vlm-api-base", "http://127.0.0.1:8080/v1");
+        assert_arg_value(&args, "--vlm-model", "local-vlm");
+        assert_arg_value(&args, "--vlm-sample-every", "120");
+        assert_arg_value(&args, "--vlm-max-samples", "2");
+        assert_arg_value(
+            &args,
+            "--vlm-queue-lock-path",
+            "/tmp/harbornavi-vlm/vlm.queue.lock",
+        );
+        assert_arg_value(&args, "--vlm-global-max-samples", "4");
+        assert_arg_value(&args, "--vlm-trigger-policy", "periodic");
+        assert!(args.contains(&"--fixture".to_string()));
+    }
+
+    #[test]
     fn p95_uses_nearest_upper_rank() {
         assert_eq!(p95(&[1, 2, 3, 4, 5]), 5);
         assert_eq!(p95(&[50, 10, 30, 20]), 50);
         assert_eq!(p95(&[]), 0);
+    }
+
+    fn assert_arg_value(args: &[String], flag: &str, expected: &str) {
+        let index = args
+            .iter()
+            .position(|arg| arg == flag)
+            .unwrap_or_else(|| panic!("{flag} missing from args: {args:?}"));
+        assert_eq!(args.get(index + 1).map(String::as_str), Some(expected));
     }
 
     #[test]

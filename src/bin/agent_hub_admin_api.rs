@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use hf_hub::{
@@ -108,7 +108,8 @@ use harborbeacon_local_agent::runtime::knowledge_index::{
 use harborbeacon_local_agent::runtime::media::{SnapshotCaptureRequest, SnapshotFormat};
 use harborbeacon_local_agent::runtime::media_tools::{ffmpeg_resolution_hint, resolve_ffmpeg_bin};
 use harborbeacon_local_agent::runtime::model_center::{
-    redact_model_endpoint, test_model_endpoint, ModelEndpointTestResult, ADMIN_STATE_PATH_ENV,
+    redact_model_endpoint, run_vlm_summary_with_state, test_model_endpoint, vlm_endpoint_readiness,
+    vlm_execution_runtime_snapshot, ModelEndpointTestResult, ADMIN_STATE_PATH_ENV,
 };
 use harborbeacon_local_agent::runtime::registry::{
     CameraCapabilities, CameraDevice, DeviceRegistryStore, HomeAssistantRegistryEntity,
@@ -120,9 +121,10 @@ use harborbeacon_local_agent::runtime::task_api::{
 };
 use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
 use harborbeacon_local_agent::runtime::vision_event::{
-    build_local_vision_notification_intent, ingest_local_vision_event_default,
-    list_recent_local_vision_events_default, local_vision_event_store_stats_default,
-    LocalVisionEvent, StoredLocalVisionEvent, MAX_LOCAL_VISION_EVENT_JSON_BYTES,
+    attach_vlm_summary_to_event, build_local_vision_notification_intent,
+    ingest_local_vision_event_default, list_recent_local_vision_events_default,
+    local_vision_event_store_stats_default, LocalVisionEvent, StoredLocalVisionEvent,
+    MAX_LOCAL_VISION_EVENT_JSON_BYTES,
 };
 
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
@@ -259,6 +261,7 @@ pub struct AdminApi {
     last_event_notification_attempt: Arc<Mutex<Option<Value>>>,
     last_home_assistant_service_action: Arc<Mutex<Option<Value>>>,
     last_evt_preflight: Arc<Mutex<Option<Value>>>,
+    last_vlm_enrichment: Arc<Mutex<Option<Value>>>,
     last_family_timeline_digest: Arc<Mutex<Option<Value>>>,
     last_guardian_rule_proposal: Arc<Mutex<Option<Value>>>,
     last_guardian_rule_evaluation: Arc<Mutex<Option<Value>>>,
@@ -1621,6 +1624,7 @@ impl AdminApi {
             last_event_notification_attempt: Arc::new(Mutex::new(None)),
             last_home_assistant_service_action: Arc::new(Mutex::new(None)),
             last_evt_preflight: Arc::new(Mutex::new(None)),
+            last_vlm_enrichment: Arc::new(Mutex::new(None)),
             last_family_timeline_digest: Arc::new(Mutex::new(None)),
             last_guardian_rule_proposal: Arc::new(Mutex::new(None)),
             last_guardian_rule_evaluation: Arc::new(Mutex::new(None)),
@@ -1799,6 +1803,7 @@ impl AdminApi {
         json!({
             "http": self.http_runtime.snapshot(),
             "vision_ingest": self.vision_ingest_limiter.snapshot(),
+            "vlm": vlm_execution_runtime_snapshot(),
             "home_guardian": self.home_guardian_queue_snapshot(),
             "home_guardian_rule_cache": self.guardian_rule_cache_snapshot(),
             "metadata_only": true,
@@ -1940,6 +1945,20 @@ impl AdminApi {
 
     fn last_evt_preflight(&self) -> Option<Value> {
         self.last_evt_preflight
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn record_last_vlm_enrichment(&self, evidence: Value) {
+        let Ok(mut guard) = self.last_vlm_enrichment.lock() else {
+            return;
+        };
+        *guard = Some(evidence);
+    }
+
+    fn last_vlm_enrichment(&self) -> Option<Value> {
+        self.last_vlm_enrichment
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
@@ -2274,9 +2293,21 @@ impl AdminApi {
             Method::Get if path == "/api/vision/events" => self
                 .handle_list_local_vision_events(&raw_url, &identity_hints)
                 .boxed(),
+            Method::Get if path == "/api/vision/vlm/status" => {
+                self.handle_vision_vlm_status(&identity_hints).boxed()
+            }
             Method::Post if path == "/api/vision/events" => self
                 .handle_ingest_local_vision_event(&mut request, &identity_hints)
                 .boxed(),
+            Method::Post if path == "/api/vision/events/latest/vlm-enrich" => self
+                .handle_vlm_enrich_latest_local_vision_event(&identity_hints)
+                .boxed(),
+            Method::Post
+                if path.starts_with("/api/vision/events/") && path.ends_with("/vlm-enrich") =>
+            {
+                self.handle_vlm_enrich_local_vision_event(&path, &identity_hints)
+                    .boxed()
+            }
             Method::Post
                 if path.starts_with("/api/vision/events/") && path.ends_with("/notify") =>
             {
@@ -2836,6 +2867,12 @@ impl AdminApi {
                 "runtime_backpressure".to_string(),
                 self.runtime_backpressure_snapshot(),
             );
+            if let Ok(state) = self.admin_store.load_state() {
+                let models = object.entry("models").or_insert_with(|| json!({}));
+                if let Some(models_object) = models.as_object_mut() {
+                    models_object.insert("vlm".to_string(), vlm_endpoint_readiness(&state.models));
+                }
+            }
         }
         Ok(readiness)
     }
@@ -2906,6 +2943,7 @@ impl AdminApi {
             &readiness,
             self.last_evt_preflight(),
             self.last_event_notification_attempt(),
+            self.last_vlm_enrichment(),
             self.last_home_assistant_service_action(),
             self.last_family_timeline_digest(),
             self.last_guardian_rule_proposal(),
@@ -2957,6 +2995,7 @@ impl AdminApi {
             &build_home_assistant_status_response(&home_assistant),
             &runtime_projection,
             self.last_event_notification_attempt(),
+            self.last_vlm_enrichment(),
             self.last_home_assistant_service_action(),
             self.last_family_timeline_digest(),
             self.last_guardian_rule_proposal(),
@@ -4152,6 +4191,262 @@ impl AdminApi {
                 events,
             }),
             Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_vision_vlm_status(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.load_state() {
+            Ok(state) => ok_json(&json!({
+                "generated_at": now_unix_string(),
+                "kind": "vision_vlm_status_v1",
+                "readiness": vlm_endpoint_readiness(&state.models),
+                "latest_enrichment": self.last_vlm_enrichment().unwrap_or_else(|| json!({
+                    "status": "not_run",
+                    "message": "No VLM enrichment has been attempted in this API process.",
+                    "metadata_only": true,
+                    "secret_scan": "clean",
+                })),
+                "metadata_only": true,
+                "secret_scan": "clean",
+            })),
+            Err(error) => error_json(StatusCode(500), &redact_admin_string(&error)),
+        }
+    }
+
+    fn handle_vlm_enrich_latest_local_vision_event(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let event = match list_recent_local_vision_events_default(1) {
+            Ok(mut events) => match events.pop() {
+                Some(event) => event,
+                None => return error_json(StatusCode(404), "no local vision event available"),
+            },
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        self.enrich_local_vision_event_with_vlm(&principal, event, "latest")
+    }
+
+    fn handle_vlm_enrich_local_vision_event(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let event_id = match parse_local_vision_event_vlm_enrich_path(path) {
+            Some(event_id) => event_id,
+            None => return error_json(StatusCode(400), "invalid local vision event VLM path"),
+        };
+        let event = match find_recent_local_vision_event(&event_id) {
+            Ok(Some(event)) => event,
+            Ok(None) => return error_json(StatusCode(404), "local vision event not found"),
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        self.enrich_local_vision_event_with_vlm(&principal, event, "event_id")
+    }
+
+    fn enrich_local_vision_event_with_vlm(
+        &self,
+        principal: &AccessPrincipal,
+        stored: StoredLocalVisionEvent,
+        trigger: &str,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let state = match self.admin_store.load_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &redact_admin_string(&error)),
+        };
+        let readiness = vlm_endpoint_readiness(&state.models);
+        if readiness
+            .get("endpoint_ready")
+            .and_then(Value::as_bool)
+            .is_some_and(|ready| !ready)
+        {
+            let evidence = build_vlm_enrichment_evidence(
+                &stored,
+                "blocked",
+                0,
+                None,
+                "endpoint_not_ready",
+                trigger,
+                readiness.clone(),
+            );
+            self.record_last_vlm_enrichment(evidence.clone());
+            self.record_admin_audit(
+                principal,
+                "local_vision_event",
+                &stored.event.event_id,
+                "local_vision_event.vlm_enrichment_blocked",
+                json!({"source": "vision_vlm_api", "trigger": trigger}),
+                evidence.clone(),
+            );
+            return json_response(
+                StatusCode(409),
+                &json!({
+                    "status": "blocked",
+                    "reason": "endpoint_not_ready",
+                    "message": "Local-only VLM endpoint is not ready.",
+                    "event_id": stored.event.event_id,
+                    "camera_id": stored.event.camera_id,
+                    "readiness": readiness,
+                    "evidence": evidence,
+                    "metadata_only": true,
+                    "secret_scan": "clean",
+                }),
+            );
+        }
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("harbornavi-vlm-enrich-{}", Uuid::new_v4().simple()));
+        let frame_path = temp_dir.join("frame.jpg");
+        let started = Instant::now();
+        let result = (|| -> Result<StoredLocalVisionEvent, String> {
+            fs::create_dir_all(&temp_dir)
+                .map_err(|error| format!("failed to create VLM temp dir: {error}"))?;
+            let bytes = self.capture_camera_snapshot(&stored.event.camera_id)?;
+            fs::write(&frame_path, bytes)
+                .map_err(|error| format!("failed to write VLM temp frame: {error}"))?;
+            let execution = run_vlm_summary_with_state(&frame_path, &state.models);
+            if execution.status == "busy" {
+                return Err("vlm_queue_busy".to_string());
+            }
+            if execution.status == "blocked" {
+                return Err("vlm_local_only_blocked".to_string());
+            }
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let enriched = attach_vlm_summary_to_event(
+                stored.event.clone(),
+                execution.clone(),
+                elapsed_ms,
+                json!({
+                    "trigger": trigger,
+                    "frame_source": "fresh_camera_snapshot",
+                    "queue_mode": "global_serial_try_lock",
+                    "local_only": true,
+                    "fallback_allowed": false,
+                    "model_endpoint_id": execution.model_endpoint_id,
+                    "provider_key": execution.provider_key,
+                }),
+            );
+            ingest_local_vision_event_default(enriched)
+        })();
+        let _ = fs::remove_dir_all(&temp_dir);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        match result {
+            Ok(enriched) => {
+                let status = enriched
+                    .event
+                    .vlm
+                    .as_ref()
+                    .map(|vlm| vlm.status.as_str())
+                    .unwrap_or("degraded");
+                let reason = if status == "active" {
+                    "enriched"
+                } else if status == "busy" {
+                    "queue_busy"
+                } else if status == "blocked" {
+                    "local_only_blocked"
+                } else {
+                    "vlm_degraded"
+                };
+                let evidence = build_vlm_enrichment_evidence(
+                    &enriched,
+                    status,
+                    elapsed_ms,
+                    enriched
+                        .event
+                        .vlm
+                        .as_ref()
+                        .and_then(|vlm| vlm.vlm_metrics.get("model_endpoint_id").cloned()),
+                    reason,
+                    trigger,
+                    readiness,
+                );
+                self.record_last_vlm_enrichment(evidence.clone());
+                self.record_admin_audit(
+                    principal,
+                    "local_vision_event",
+                    &enriched.event.event_id,
+                    "local_vision_event.vlm_enrichment_attempted",
+                    json!({"source": "vision_vlm_api", "trigger": trigger}),
+                    evidence.clone(),
+                );
+                ok_json(&json!({
+                    "status": status,
+                    "reason": reason,
+                    "event": enriched,
+                    "evidence": evidence,
+                    "metadata_only": true,
+                    "secret_scan": "clean",
+                }))
+            }
+            Err(error) => {
+                let redacted_error = redact_admin_string(&error);
+                let (http_status, status, reason, message, audit_action) =
+                    if redacted_error == "vlm_queue_busy" {
+                        (
+                            StatusCode(409),
+                            "busy",
+                            "queue_busy",
+                            "VLM queue is busy; no event version was updated.",
+                            "local_vision_event.vlm_enrichment_busy",
+                        )
+                    } else if redacted_error == "vlm_local_only_blocked" {
+                        (
+                            StatusCode(409),
+                            "blocked",
+                            "local_only_blocked",
+                            "Local-only VLM guard blocked this enrichment.",
+                            "local_vision_event.vlm_enrichment_blocked",
+                        )
+                    } else {
+                        (
+                            StatusCode(422),
+                            "failed",
+                            redacted_error.as_str(),
+                            "VLM enrichment failed.",
+                            "local_vision_event.vlm_enrichment_failed",
+                        )
+                    };
+                let evidence = build_vlm_enrichment_evidence(
+                    &stored, status, elapsed_ms, None, reason, trigger, readiness,
+                );
+                self.record_last_vlm_enrichment(evidence.clone());
+                self.record_admin_audit(
+                    principal,
+                    "local_vision_event",
+                    &stored.event.event_id,
+                    audit_action,
+                    json!({"source": "vision_vlm_api", "trigger": trigger}),
+                    evidence.clone(),
+                );
+                json_response(
+                    http_status,
+                    &json!({
+                        "status": status,
+                        "reason": reason,
+                        "message": message,
+                        "event_id": stored.event.event_id,
+                        "camera_id": stored.event.camera_id,
+                        "evidence": evidence,
+                        "metadata_only": true,
+                        "secret_scan": "clean",
+                    }),
+                )
+            }
         }
     }
 
@@ -7667,6 +7962,15 @@ fn parse_local_vision_event_notify_path(path: &str) -> Option<String> {
     percent_decode_path_segment(event_id).ok()
 }
 
+fn parse_local_vision_event_vlm_enrich_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/vision/events/")?;
+    let event_id = trimmed.strip_suffix("/vlm-enrich")?.trim();
+    if event_id.is_empty() || event_id.contains('/') || event_id == "latest" {
+        return None;
+    }
+    percent_decode_path_segment(event_id).ok()
+}
+
 fn parse_model_endpoint_path(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/models/endpoints/")?;
     if trimmed.trim().is_empty() || trimmed.ends_with("/test") {
@@ -8813,7 +9117,10 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/models/local-catalog"
         || path == "/api/models/policies"
         || path == "/api/vision/events"
+        || path == "/api/vision/vlm/status"
+        || path == "/api/vision/events/latest/vlm-enrich"
         || (path.starts_with("/api/vision/events/") && path.ends_with("/notify"))
+        || (path.starts_with("/api/vision/events/") && path.ends_with("/vlm-enrich"))
         || path == "/admin/models"
         || path == "/api/access/members"
         || path == "/api/share-links"
@@ -11453,6 +11760,7 @@ fn build_redacted_diagnostics_bundle(
     home_assistant: &HomeAssistantStatusResponse,
     runtime: &LocalModelRuntimeProjection,
     last_event_notification_attempt: Option<Value>,
+    last_vlm_enrichment: Option<Value>,
     last_home_assistant_service_action: Option<Value>,
     last_family_timeline_digest: Option<Value>,
     last_guardian_rule_proposal: Option<Value>,
@@ -11540,6 +11848,10 @@ fn build_redacted_diagnostics_bundle(
                 "status": "not_run",
                 "message": "No event notification has been attempted in this API process.",
             })),
+            "vlm_enrichment": home_guardian_optional_workflow(
+                last_vlm_enrichment,
+                "No VLM enrichment has been attempted in this API process.",
+            ),
             "home_assistant_service_action": last_home_assistant_service_action.unwrap_or_else(|| json!({
                 "status": "not_run",
                 "message": "No Home Assistant service action has been attempted in this API process.",
@@ -11621,6 +11933,7 @@ fn build_evt_diagnostics_workflow(
     evt_readiness: &Value,
     last_evt_preflight: Option<Value>,
     last_event_notification_attempt: Option<Value>,
+    last_vlm_enrichment: Option<Value>,
     last_home_assistant_service_action: Option<Value>,
     last_family_timeline_digest: Option<Value>,
     last_guardian_rule_proposal: Option<Value>,
@@ -11636,6 +11949,10 @@ fn build_evt_diagnostics_workflow(
             "status": "not_run",
             "message": "No event notification has been attempted in this API process.",
         })),
+        "vlm_enrichment": home_guardian_optional_workflow(
+            last_vlm_enrichment,
+            "No VLM enrichment has been attempted in this API process.",
+        ),
         "home_assistant_service_action": last_home_assistant_service_action.unwrap_or_else(|| json!({
             "status": "not_run",
             "message": "No Home Assistant service action has been attempted in this API process.",
@@ -11886,6 +12203,41 @@ fn find_recent_local_vision_event(
     Ok(list_recent_local_vision_events_default(50)?
         .into_iter()
         .find(|stored| stored.event.event_id == event_id))
+}
+
+fn build_vlm_enrichment_evidence(
+    stored: &StoredLocalVisionEvent,
+    status: &str,
+    elapsed_ms: u64,
+    model_endpoint_id: Option<Value>,
+    reason: &str,
+    trigger: &str,
+    readiness: Value,
+) -> Value {
+    json!({
+        "kind": "vision_vlm_enrichment_v1",
+        "status": status,
+        "event_id": stored.event.event_id,
+        "camera_id": stored.event.camera_id,
+        "event_type": stored.event.event_type,
+        "elapsed_ms": elapsed_ms,
+        "model_endpoint_id": model_endpoint_id,
+        "model_endpoint_id_redacted": false,
+        "local_only": true,
+        "fallback_allowed": false,
+        "queue_result": if status == "busy" { "busy" } else { "accepted" },
+        "frame_source": "fresh_camera_snapshot",
+        "frame_path_redacted": true,
+        "raw_image_included": false,
+        "local_paths_included": false,
+        "summary_source": if status == "active" { "vlm" } else { "degraded_fallback" },
+        "redaction_status": "clean",
+        "reason": redact_admin_string(reason),
+        "trigger": trigger,
+        "readiness": readiness,
+        "metadata_only": true,
+        "secret_scan": "clean",
+    })
 }
 
 fn default_notification_target_record(
@@ -18428,6 +18780,7 @@ mod tests {
             &state,
             &home_assistant,
             &LocalModelRuntimeProjection::default(),
+            None,
             None,
             None,
             None,

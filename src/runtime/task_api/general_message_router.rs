@@ -685,6 +685,9 @@ pub(super) fn general_message_plan_is_actionable_tool(kind: GeneralMessagePlanKi
             | GeneralMessagePlanKind::HomeAssistantServiceAction
             | GeneralMessagePlanKind::VisionEventSummary
             | GeneralMessagePlanKind::VisionEventNotifyLatest
+            | GeneralMessagePlanKind::VlmDescribeLatestEvent
+            | GeneralMessagePlanKind::VlmDescribeEvent
+            | GeneralMessagePlanKind::FamilyMemorySummary
             | GeneralMessagePlanKind::SystemReadiness
             | GeneralMessagePlanKind::EvtReadiness
             | GeneralMessagePlanKind::EvtPreflight
@@ -753,6 +756,9 @@ pub(super) fn general_message_plan_decision_label(plan: &GeneralMessagePlan) -> 
         GeneralMessagePlanKind::HomeAssistantServiceAction => "ha_service_action",
         GeneralMessagePlanKind::VisionEventSummary => "vision_event_summary",
         GeneralMessagePlanKind::VisionEventNotifyLatest => "vision_event_notify_latest",
+        GeneralMessagePlanKind::VlmDescribeLatestEvent => "vlm_describe_latest_event",
+        GeneralMessagePlanKind::VlmDescribeEvent => "vlm_describe_event",
+        GeneralMessagePlanKind::FamilyMemorySummary => "family_memory_summary",
         GeneralMessagePlanKind::SystemReadiness => "system_readiness",
         GeneralMessagePlanKind::EvtReadiness => "evt_readiness",
         GeneralMessagePlanKind::EvtPreflight => "evt_preflight",
@@ -789,7 +795,8 @@ pub(super) fn build_general_message_router_system_prompt() -> String {
         "\"home_assistant\":{\"domain\":null,\"service\":null,\"entity_hint\":null},",
         "\"conversation_act\":null,\"reply_text\":null,\"reason\":\"...\"}. ",
         "Closed decisions: capability_summary, camera_snapshot, camera_record_clip, ",
-        "vision_event_summary, vision_event_notify_latest, ha_service_action, system_readiness, ",
+        "vision_event_summary, vision_event_notify_latest, vlm_describe_latest_event, ",
+        "vlm_describe_event, family_memory_summary, ha_service_action, system_readiness, ",
         "evt_readiness, evt_preflight, evt_evidence_bundle, family_timeline_summary, ",
         "family_timeline_query, guardian_rule_proposal, guardian_rule_list, guardian_rule_enable, ",
         "guardian_rule_pause, guardian_status, knowledge_search, rag_answer, ",
@@ -813,7 +820,9 @@ pub(super) fn build_general_message_router_system_prompt() -> String {
         "asking family guardian status means guardian_status; asking to ",
         "look/check/see the door/front/current camera means camera_snapshot; asking for a short ",
         "recording/video/clip means camera_record_clip; asking what the camera recently saw means ",
-        "vision_event_summary; asking to send/share/notify the latest camera situation means ",
+        "vision_event_summary; asking to describe or understand the latest visual event means ",
+        "vlm_describe_latest_event; asking what is worth noticing at home means ",
+        "family_memory_summary; asking to send/share/notify the latest camera situation means ",
         "vision_event_notify_latest, including requests to send it to the default notification ",
         "target/contact; asking to run/activate/execute a scene/routine means ha_service_action ",
         "with domain scene, service turn_on, and entity_hint copied as a short scene description; ",
@@ -829,6 +838,8 @@ pub(super) fn build_general_message_router_system_prompt() -> String {
         "帮我做一下EVT预检 => {\"decision\":\"evt_preflight\",\"confidence\":0.95}; ",
         "生成压测证据 => {\"decision\":\"evt_evidence_bundle\",\"confidence\":0.95}; ",
         "今天家里发生了什么 => {\"decision\":\"family_timeline_summary\",\"confidence\":0.95}; ",
+        "刚才门口发生了什么 => {\"decision\":\"vlm_describe_latest_event\",\"confidence\":0.95,\"camera_hint\":\"门口\"}; ",
+        "今天家里有什么值得注意的 => {\"decision\":\"family_memory_summary\",\"confidence\":0.95}; ",
         "以后门口有人就通知我 => {\"decision\":\"guardian_rule_proposal\",\"confidence\":0.95,",
         "\"guardian_rule\":{\"trigger\":{\"camera_id\":\"门口\",\"event_type\":\"person_detected\",",
         "\"labels\":[\"person\"],\"min_confidence\":0.6},\"action_plan\":{\"actions\":[{\"kind\":\"notify_default_target\"}]}}}; ",
@@ -918,6 +929,15 @@ pub(super) fn parse_general_message_router_decision(
             }
             "vision_event_notify_latest" | "event_notify" | "notify_latest_event" => {
                 return Some((GeneralMessagePlanKind::VisionEventNotifyLatest, None))
+            }
+            "vlm_describe_latest_event" | "vlm_describe_latest" | "describe_latest_event" => {
+                return Some((GeneralMessagePlanKind::VlmDescribeLatestEvent, None))
+            }
+            "vlm_describe_event" | "describe_event" => {
+                return Some((GeneralMessagePlanKind::VlmDescribeEvent, None))
+            }
+            "family_memory_summary" | "family_memory" => {
+                return Some((GeneralMessagePlanKind::FamilyMemorySummary, None))
             }
             "system_readiness" | "status" | "diagnostics" => {
                 return Some((GeneralMessagePlanKind::SystemReadiness, None))
@@ -1023,6 +1043,9 @@ pub(super) fn build_general_message_renderer_prompt(
             GeneralMessagePlanKind::HomeAssistantServiceAction => "ha_service_action",
             GeneralMessagePlanKind::VisionEventSummary => "vision_event_summary",
             GeneralMessagePlanKind::VisionEventNotifyLatest => "vision_event_notify_latest",
+            GeneralMessagePlanKind::VlmDescribeLatestEvent => "vlm_describe_latest_event",
+            GeneralMessagePlanKind::VlmDescribeEvent => "vlm_describe_event",
+            GeneralMessagePlanKind::FamilyMemorySummary => "family_memory_summary",
             GeneralMessagePlanKind::SystemReadiness => "system_readiness",
             GeneralMessagePlanKind::EvtReadiness => "evt_readiness",
             GeneralMessagePlanKind::EvtPreflight => "evt_preflight",
@@ -1146,6 +1169,8 @@ pub(super) fn general_message_supported_examples() -> Vec<String> {
         "帮我做一下EVT预检".to_string(),
         "生成压测证据".to_string(),
         "今天家里发生了什么".to_string(),
+        "刚才门口发生了什么".to_string(),
+        "今天家里有什么值得注意的".to_string(),
         "以后门口有人就通知我".to_string(),
         "家庭守护状态".to_string(),
         "帮我找到和樱花有关的文件".to_string(),
@@ -1162,7 +1187,7 @@ pub(super) fn general_message_support_summary_for_request(raw_text: &str) -> Str
 }
 
 pub(super) fn general_message_support_summary() -> String {
-    "我可以作为 K3 家庭入口：摄像头抓拍/短视频、最近事件、通知最新事件、家庭时间线、家庭守护规则草稿/启用/暂停、低风险家居动作、状态诊断、EVT 就绪/预检/脱敏证据包，也能搜索/问答已有知识库；守护规则只有你明确启用后才会自动执行，遇到多个家居实体时我会先让你选择，不会猜着执行，4h/72h 长压测必须走 operator supervisor。".to_string()
+    "我可以作为 K3 家庭入口：摄像头抓拍/短视频、最近事件、通知最新事件、按需 VLM 理解最新事件、家庭记忆摘要、家庭时间线、家庭守护规则草稿/启用/暂停、低风险家居动作、状态诊断、EVT 就绪/预检/脱敏证据包，也能搜索/问答已有知识库；守护规则只有你明确启用后才会自动执行，遇到多个家居实体时我会先让你选择，不会猜着执行，VLM 只走本地按需/低频抽样，4h/72h 长压测必须走 operator supervisor。".to_string()
 }
 
 pub(super) fn general_message_unsupported_summary() -> String {
@@ -1288,6 +1313,13 @@ pub(super) fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePla
         }
         "vision_event_notify_latest" | "event_notify" | "notify_latest_event" => {
             (GeneralMessagePlanKind::VisionEventNotifyLatest, None)
+        }
+        "vlm_describe_latest_event" | "vlm_describe_latest" | "describe_latest_event" => {
+            (GeneralMessagePlanKind::VlmDescribeLatestEvent, None)
+        }
+        "vlm_describe_event" | "describe_event" => (GeneralMessagePlanKind::VlmDescribeEvent, None),
+        "family_memory_summary" | "family_memory" => {
+            (GeneralMessagePlanKind::FamilyMemorySummary, None)
         }
         "system_readiness" | "status" | "diagnostics" => {
             (GeneralMessagePlanKind::SystemReadiness, None)

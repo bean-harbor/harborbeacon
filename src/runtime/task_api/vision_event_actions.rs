@@ -1,13 +1,20 @@
 //! General-message helpers for local vision event actions.
 
+use std::fs;
+use std::time::Instant;
+
+use base64::Engine as _;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::connectors::notifications::NotificationDeliveryService;
 use crate::control_plane::events::EventSeverity;
 use crate::orchestrator::contracts::RiskLevel;
 use crate::runtime::admin_console::NotificationTargetRecord;
+use crate::runtime::model_center::run_vlm_summary_with_state;
 use crate::runtime::vision_event::{
-    build_local_vision_notification_intent, list_recent_local_vision_events_default,
+    attach_vlm_summary_to_event, build_local_vision_notification_intent,
+    ingest_local_vision_event_default, list_recent_local_vision_events_default,
     LocalVisionEventArtifact, SnapshotArtifact, StoredLocalVisionEvent,
 };
 
@@ -15,7 +22,8 @@ use super::{
     build_task_event_record, classify_task_notification_delivery_error,
     default_notification_target_record, non_empty_task_string,
     notification_delivery_record_summary, redact_task_api_text, step_id_for_request,
-    TaskApiService, TaskRequest, TaskResponse,
+    GeneralMessagePlan, GeneralMessagePlanKind, TaskApiService, TaskRequest, TaskResponse,
+    BASE64_STANDARD,
 };
 
 impl TaskApiService {
@@ -98,6 +106,177 @@ impl TaskApiService {
                 "拍一张门口".to_string(),
             ],
         )
+    }
+
+    pub(super) fn handle_general_message_vlm_describe_latest_event(
+        &self,
+        request: &TaskRequest,
+        plan: &GeneralMessagePlan,
+    ) -> TaskResponse {
+        let stored = match latest_local_vision_event() {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                let message = "最近还没有可理解的摄像头事件。".to_string();
+                return self.completed_with_context(
+                    request,
+                    "vision_vlm_enrichment",
+                    RiskLevel::Low,
+                    message.clone(),
+                    json!({
+                        "reply_pack": {
+                            "kind": "vlm_describe_latest_event",
+                            "status": "blocked",
+                            "reason": "no_recent_event",
+                            "summary": message,
+                            "redacted": true,
+                        }
+                    }),
+                    Vec::new(),
+                    Vec::new(),
+                    vec!["拍一张门口".to_string(), "最近事件".to_string()],
+                );
+            }
+            Err(error) => {
+                return self.failed(
+                    request,
+                    "vision_vlm_enrichment",
+                    RiskLevel::Low,
+                    format!("读取最近摄像头事件失败：{}", redact_task_api_text(&error)),
+                )
+            }
+        };
+
+        if stored
+            .event
+            .vlm
+            .as_ref()
+            .is_some_and(|vlm| vlm.status == "active" && !vlm.summary.trim().is_empty())
+        {
+            return self.general_message_vlm_describe_response(
+                request,
+                &stored,
+                "active",
+                "cached_event_vlm",
+                "latest_event",
+                plan,
+            );
+        }
+
+        let admin_state = match self.admin_store.load_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return self.failed(
+                    request,
+                    "vision_vlm_enrichment",
+                    RiskLevel::Low,
+                    format!("读取模型配置失败：{}", redact_task_api_text(&error)),
+                )
+            }
+        };
+        let snapshot = match self
+            .hub()
+            .capture_camera_snapshot_result(&stored.event.camera_id)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let message = format!(
+                    "最新事件还没有 VLM 摘要，且抓取当前帧失败：{}",
+                    redact_task_api_text(&error)
+                );
+                return self.general_message_vlm_blocked_response(
+                    request,
+                    &stored,
+                    "snapshot_failed",
+                    &message,
+                    plan,
+                );
+            }
+        };
+        let temp_dir =
+            std::env::temp_dir().join(format!("harbornavi-task-vlm-{}", Uuid::new_v4().simple()));
+        let frame_path = temp_dir.join("frame.jpg");
+        let started = Instant::now();
+        let result = (|| -> Result<StoredLocalVisionEvent, String> {
+            fs::create_dir_all(&temp_dir)
+                .map_err(|error| format!("failed to create VLM temp dir: {error}"))?;
+            let bytes = BASE64_STANDARD
+                .decode(snapshot.bytes_base64.as_bytes())
+                .map_err(|error| format!("failed to decode VLM snapshot: {error}"))?;
+            fs::write(&frame_path, bytes)
+                .map_err(|error| format!("failed to write VLM temp frame: {error}"))?;
+            let execution = run_vlm_summary_with_state(&frame_path, &admin_state.models);
+            if execution.status == "busy" {
+                return Err("vlm_queue_busy".to_string());
+            }
+            if execution.status == "blocked" {
+                return Err("vlm_local_only_blocked".to_string());
+            }
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let enriched = attach_vlm_summary_to_event(
+                stored.event.clone(),
+                execution.clone(),
+                elapsed_ms,
+                json!({
+                    "trigger": "wechat_nsp",
+                    "decision": if plan.kind == GeneralMessagePlanKind::VlmDescribeEvent {
+                        "vlm_describe_event"
+                    } else {
+                        "vlm_describe_latest_event"
+                    },
+                    "frame_source": "fresh_camera_snapshot",
+                    "queue_mode": "global_serial_try_lock",
+                    "local_only": true,
+                    "fallback_allowed": false,
+                    "model_endpoint_id": execution.model_endpoint_id,
+                    "provider_key": execution.provider_key,
+                }),
+            );
+            ingest_local_vision_event_default(enriched)
+        })();
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        match result {
+            Ok(enriched) => {
+                let status = enriched
+                    .event
+                    .vlm
+                    .as_ref()
+                    .map(|vlm| vlm.status.as_str())
+                    .unwrap_or("degraded");
+                let reason = if status == "active" {
+                    "fresh_vlm_enriched"
+                } else if status == "busy" {
+                    "vlm_queue_busy"
+                } else if status == "blocked" {
+                    "vlm_local_only_blocked"
+                } else {
+                    "vlm_degraded"
+                };
+                self.general_message_vlm_describe_response(
+                    request,
+                    &enriched,
+                    status,
+                    reason,
+                    "fresh_camera_snapshot",
+                    plan,
+                )
+            }
+            Err(error) => {
+                let reason = match error.as_str() {
+                    "vlm_queue_busy" => "queue_busy",
+                    "vlm_local_only_blocked" => "local_only_blocked",
+                    _ => "vlm_failed",
+                };
+                let message = match reason {
+                    "queue_busy" => "VLM 正在处理上一条请求，这次没有更新事件摘要。".to_string(),
+                    "local_only_blocked" => {
+                        "VLM 只允许本地端点执行，当前配置被安全策略阻止。".to_string()
+                    }
+                    _ => format!("VLM 理解失败：{}", redact_task_api_text(&error)),
+                };
+                self.general_message_vlm_blocked_response(request, &stored, reason, &message, plan)
+            }
+        }
     }
 
     pub(super) fn handle_general_message_notify_latest_vision_event(
@@ -290,6 +469,117 @@ impl TaskApiService {
             vec!["最近事件".to_string(), "状态".to_string()],
         )
     }
+
+    fn general_message_vlm_describe_response(
+        &self,
+        request: &TaskRequest,
+        stored: &StoredLocalVisionEvent,
+        status: &str,
+        reason: &str,
+        frame_source: &str,
+        plan: &GeneralMessagePlan,
+    ) -> TaskResponse {
+        let message = vlm_describe_event_reply(stored, status, reason);
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "local_vision_event.vlm_describe",
+            EventSeverity::Info,
+            json!({
+                "status": status,
+                "reason": reason,
+                "event_id": stored.event.event_id,
+                "camera_id": stored.event.camera_id,
+                "frame_source": frame_source,
+                "frame_path_redacted": true,
+                "raw_image_included": false,
+                "local_paths_included": false,
+                "metadata_only": true,
+                "secret_scan": "clean",
+            }),
+        ));
+        let kind = if plan.kind == GeneralMessagePlanKind::VlmDescribeEvent {
+            "vlm_describe_event"
+        } else {
+            "vlm_describe_latest_event"
+        };
+        self.completed_with_context(
+            request,
+            "vision_vlm_enrichment",
+            RiskLevel::Low,
+            message.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": kind,
+                    "status": status,
+                    "reason": reason,
+                    "summary": message,
+                    "event": build_redacted_vision_event_summary(stored),
+                    "summary_source": if status == "active" { "vlm" } else { "degraded_fallback" },
+                    "frame_source": frame_source,
+                    "frame_path_redacted": true,
+                    "raw_image_included": false,
+                    "redacted": true,
+                }
+            }),
+            Vec::new(),
+            vec![event],
+            vec!["家庭时间线".to_string(), "通知最新事件".to_string()],
+        )
+    }
+
+    fn general_message_vlm_blocked_response(
+        &self,
+        request: &TaskRequest,
+        stored: &StoredLocalVisionEvent,
+        reason: &str,
+        message: &str,
+        plan: &GeneralMessagePlan,
+    ) -> TaskResponse {
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "local_vision_event.vlm_describe_blocked",
+            EventSeverity::Warning,
+            json!({
+                "status": "blocked",
+                "reason": reason,
+                "event_id": stored.event.event_id,
+                "camera_id": stored.event.camera_id,
+                "raw_image_included": false,
+                "local_paths_included": false,
+                "metadata_only": true,
+                "secret_scan": "clean",
+            }),
+        ));
+        let kind = if plan.kind == GeneralMessagePlanKind::VlmDescribeEvent {
+            "vlm_describe_event"
+        } else {
+            "vlm_describe_latest_event"
+        };
+        let redacted_message = redact_task_api_text(message);
+        self.completed_with_context(
+            request,
+            "vision_vlm_enrichment",
+            RiskLevel::Low,
+            redacted_message.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": kind,
+                    "status": "blocked",
+                    "reason": reason,
+                    "summary": redacted_message,
+                    "event": build_redacted_vision_event_summary(stored),
+                    "summary_source": "degraded_fallback",
+                    "raw_image_included": false,
+                    "redacted": true,
+                }
+            }),
+            Vec::new(),
+            vec![event],
+            vec!["最近事件".to_string(), "状态".to_string()],
+        )
+    }
 }
 
 pub(super) fn latest_local_vision_event() -> Result<Option<StoredLocalVisionEvent>, String> {
@@ -370,5 +660,41 @@ pub(super) fn latest_vision_event_reply(stored: &StoredLocalVisionEvent) -> Stri
         event.started_at,
         event.latency_ms,
         vlm_status
+    )
+}
+
+fn vlm_describe_event_reply(stored: &StoredLocalVisionEvent, status: &str, reason: &str) -> String {
+    let event = &stored.event;
+    let vlm_text = event
+        .vlm
+        .as_ref()
+        .and_then(|vlm| {
+            let text = if !vlm.summary.trim().is_empty() {
+                vlm.summary.trim()
+            } else {
+                vlm.derived_text.trim()
+            };
+            (!text.is_empty()).then(|| text.to_string())
+        })
+        .unwrap_or_else(|| event.summary.clone());
+    let labels = if event.labels.is_empty() {
+        "无标签".to_string()
+    } else {
+        event.labels.join("、")
+    };
+    let prefix = if status == "active" {
+        "VLM 理解"
+    } else {
+        "VLM 未完成，先用事件摘要"
+    };
+    format!(
+        "{}：{}；摄像头：{}；标签：{}；时间：{}；状态：{}（{}）。",
+        prefix,
+        redact_task_api_text(&vlm_text),
+        event.camera_id,
+        labels,
+        event.started_at,
+        status,
+        reason
     )
 }

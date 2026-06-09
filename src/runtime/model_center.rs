@@ -6,10 +6,12 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -41,6 +43,11 @@ const SEMANTIC_ROUTER_TOKEN_ENV: &str = "HARBOR_SEMANTIC_ROUTER_TOKEN";
 const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
 const DEFAULT_SEMANTIC_ROUTER_BASE_URL: &str = "http://127.0.0.1:4176/v1";
 const DEFAULT_SEMANTIC_ROUTER_MODEL: &str = "Qwen/Qwen2.5-0.5B-Instruct";
+static VLM_EXECUTION_BUSY: AtomicBool = AtomicBool::new(false);
+static VLM_EXECUTION_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VLM_EXECUTION_BUSY_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VLM_EXECUTION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VLM_EXECUTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelEndpointTestResult {
@@ -241,6 +248,8 @@ pub fn run_ocr_with_state(image_path: &Path, state: &AdminModelCenterState) -> O
             text: String::new(),
             details: json!({
                 "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
             }),
         };
     }
@@ -333,6 +342,22 @@ pub fn run_vlm_summary_with_state(
     image_path: &Path,
     state: &AdminModelCenterState,
 ) -> VlmSummaryExecution {
+    let Some(_guard) = VlmExecutionGuard::try_acquire() else {
+        return VlmSummaryExecution {
+            available: false,
+            status: "busy".to_string(),
+            summary: "VLM queue is busy; retry after the current local request completes."
+                .to_string(),
+            provider_key: String::new(),
+            model_endpoint_id: None,
+            text: String::new(),
+            details: json!({
+                "queue_result": "busy",
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    };
     let Some(endpoint) = resolve_endpoint(state, ModelKind::Vlm, VLM_POLICY_ID) else {
         return VlmSummaryExecution {
             available: false,
@@ -345,6 +370,22 @@ pub fn run_vlm_summary_with_state(
         };
     };
 
+    if let Some(reason) = vlm_endpoint_local_only_blocker(&endpoint) {
+        return VlmSummaryExecution {
+            available: false,
+            status: "blocked".to_string(),
+            summary: reason,
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            text: String::new(),
+            details: json!({
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": false,
+                "fallback_allowed": false,
+            }),
+        };
+    }
+
     if let Some(mock_text) = metadata_string(&endpoint.metadata, "mock_text") {
         return VlmSummaryExecution {
             available: !mock_text.trim().is_empty(),
@@ -355,6 +396,8 @@ pub fn run_vlm_summary_with_state(
             text: mock_text,
             details: json!({
                 "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
             }),
         };
     }
@@ -389,6 +432,8 @@ pub fn run_vlm_summary_with_state(
             text: String::new(),
             details: json!({
                 "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
             }),
         };
     };
@@ -404,7 +449,9 @@ pub fn run_vlm_summary_with_state(
                 model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
                 text: String::new(),
                 details: json!({
-                    "image_path": image_path.to_string_lossy(),
+                    "image_path_redacted": true,
+                    "local_only": true,
+                    "fallback_allowed": false,
                 }),
             };
         }
@@ -428,7 +475,9 @@ pub fn run_vlm_summary_with_state(
                 model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
                 text: String::new(),
                 details: json!({
-                    "image_path": image_path.to_string_lossy(),
+                    "image_path_redacted": true,
+                    "local_only": true,
+                    "fallback_allowed": false,
                 }),
             };
         }
@@ -449,6 +498,8 @@ pub fn run_vlm_summary_with_state(
             text: response.summary,
             details: json!({
                 "raw_response": response.raw_response,
+                "local_only": true,
+                "fallback_allowed": false,
             }),
         },
         Err(error) => VlmSummaryExecution {
@@ -459,9 +510,141 @@ pub fn run_vlm_summary_with_state(
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
             text: String::new(),
             details: json!({
-                "image_path": image_path.to_string_lossy(),
+                "image_path_redacted": true,
+                "local_only": true,
+                "fallback_allowed": false,
             }),
         },
+    }
+}
+
+pub fn vlm_execution_runtime_snapshot() -> Value {
+    json!({
+        "busy": VLM_EXECUTION_BUSY.load(Ordering::Relaxed),
+        "mode": "global_serial_try_lock",
+        "started_total": VLM_EXECUTION_STARTED_TOTAL.load(Ordering::Relaxed),
+        "busy_total": VLM_EXECUTION_BUSY_TOTAL.load(Ordering::Relaxed),
+        "completed_total": VLM_EXECUTION_COMPLETED_TOTAL.load(Ordering::Relaxed),
+        "failed_total": VLM_EXECUTION_FAILED_TOTAL.load(Ordering::Relaxed),
+        "metadata_only": true,
+        "secret_scan": "clean",
+    })
+}
+
+pub fn vlm_endpoint_readiness(state: &AdminModelCenterState) -> Value {
+    let endpoint = resolve_endpoint(state, ModelKind::Vlm, VLM_POLICY_ID);
+    let Some(endpoint) = endpoint.as_ref() else {
+        return json!({
+            "status": "not_configured",
+            "endpoint_ready": false,
+            "local_only": true,
+            "fallback_allowed": false,
+            "endpoint_bound": false,
+            "queue": vlm_execution_runtime_snapshot(),
+            "metadata_only": true,
+            "secret_scan": "clean",
+        });
+    };
+    let blocker = vlm_endpoint_local_only_blocker(endpoint);
+    let configured = endpoint.status != ModelEndpointStatus::Disabled;
+    let endpoint_ready = configured && blocker.is_none();
+    json!({
+        "status": if endpoint_ready {
+            "available"
+        } else if configured {
+            "blocked"
+        } else {
+            "not_configured"
+        },
+        "endpoint_ready": endpoint_ready,
+        "local_only": blocker.is_none(),
+        "fallback_allowed": false,
+        "endpoint_bound": true,
+        "endpoint": {
+            "model_endpoint_id": endpoint.model_endpoint_id,
+            "provider_key": endpoint.provider_key,
+            "endpoint_kind": endpoint.endpoint_kind.as_str(),
+            "status": endpoint.status.as_str(),
+            "model_name": endpoint.model_name,
+            "base_url_redacted": metadata_string(&endpoint.metadata, "base_url").is_some(),
+        },
+        "blocker": blocker,
+        "queue": vlm_execution_runtime_snapshot(),
+        "metadata_only": true,
+        "secret_scan": "clean",
+    })
+}
+
+struct VlmExecutionGuard {
+    completed: bool,
+}
+
+impl VlmExecutionGuard {
+    fn try_acquire() -> Option<Self> {
+        match VLM_EXECUTION_BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        {
+            Ok(_) => {
+                VLM_EXECUTION_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                Some(Self { completed: false })
+            }
+            Err(_) => {
+                VLM_EXECUTION_BUSY_TOTAL.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+}
+
+impl Drop for VlmExecutionGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            VLM_EXECUTION_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        } else if !std::thread::panicking() {
+            VLM_EXECUTION_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        } else {
+            VLM_EXECUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        VLM_EXECUTION_BUSY.store(false, Ordering::Release);
+    }
+}
+
+fn vlm_endpoint_local_only_blocker(endpoint: &ModelEndpoint) -> Option<String> {
+    if endpoint.endpoint_kind != ModelEndpointKind::Local {
+        return Some(
+            "VLM endpoint must be local-only; cloud or remote fallback is blocked.".to_string(),
+        );
+    }
+    let Some(base_url) = metadata_string(&endpoint.metadata, "base_url") else {
+        return None;
+    };
+    if !endpoint
+        .provider_key
+        .eq_ignore_ascii_case("openai_compatible")
+    {
+        return None;
+    }
+    if !url_is_loopback(&base_url) {
+        return Some(
+            "VLM endpoint base_url must bind to loopback for K3 local-only execution.".to_string(),
+        );
+    }
+    None
+}
+
+fn url_is_loopback(raw_url: &str) -> bool {
+    let Ok(url) = Url::parse(raw_url.trim()) else {
+        return false;
+    };
+    match url
+        .host_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "localhost" => true,
+        "::1" => true,
+        value if value.starts_with("127.") => true,
+        _ => false,
     }
 }
 
@@ -1832,7 +2015,8 @@ mod tests {
         clear_local_runtime_projection_cache, connectivity_url,
         openai_compatible_config_from_endpoint, redact_model_endpoint, run_embedding_with_state,
         run_llm_text_with_state, run_llm_text_with_state_and_options, run_vlm_summary_with_state,
-        semantic_router_local_only_model_state, test_model_endpoint, LlmTextOptions,
+        semantic_router_local_only_model_state, test_model_endpoint, vlm_endpoint_readiness,
+        LlmTextOptions,
     };
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
@@ -1939,6 +2123,70 @@ mod tests {
         };
 
         assert!(openai_compatible_config_from_endpoint(&endpoint).is_none());
+    }
+
+    #[test]
+    fn vlm_endpoint_readiness_blocks_cloud_and_non_loopback_endpoints() {
+        let cloud_state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "vlm-cloud".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Vlm,
+                endpoint_kind: ModelEndpointKind::Cloud,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "remote-vlm".to_string(),
+                capability_tags: vec!["vision".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "base_url": "https://example.invalid/v1",
+                    "api_key_configured": true,
+                }),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "retrieval.vision_summary".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "vision".to_string(),
+                privacy_level: PrivacyLevel::AllowCloud,
+                local_preferred: false,
+                max_cost_per_run: None,
+                fallback_order: vec!["cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+            ..Default::default()
+        };
+        let cloud_readiness = vlm_endpoint_readiness(&cloud_state);
+        assert_eq!(cloud_readiness["status"], json!("blocked"));
+        assert_eq!(cloud_readiness["endpoint_ready"], json!(false));
+        assert_eq!(cloud_readiness["local_only"], json!(false));
+
+        let remote_local_state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "vlm-remote-local".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Vlm,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "local-vlm".to_string(),
+                capability_tags: vec!["vision".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "base_url": "http://192.168.3.50:8080/v1",
+                    "local_only": true,
+                }),
+            }],
+            ..Default::default()
+        };
+        let remote_readiness = vlm_endpoint_readiness(&remote_local_state);
+        assert_eq!(remote_readiness["status"], json!("blocked"));
+        assert_eq!(remote_readiness["endpoint_ready"], json!(false));
+        assert_eq!(remote_readiness["local_only"], json!(false));
+        assert_eq!(remote_readiness["fallback_allowed"], json!(false));
     }
 
     #[test]

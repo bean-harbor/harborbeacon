@@ -73,6 +73,15 @@ pub struct FamilyTimelineDigest {
     pub latest_event_id: Option<String>,
     pub metadata_only: bool,
     pub secret_scan: String,
+    pub vlm_coverage: FamilyTimelineVlmCoverage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct FamilyTimelineVlmCoverage {
+    pub total: usize,
+    pub active: usize,
+    pub degraded: usize,
+    pub not_sampled: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +252,13 @@ pub fn build_family_timeline_digest_from_query(
     if bullets.is_empty() {
         bullets.push("暂无可汇总事件。".to_string());
     }
+    let vlm_coverage = family_timeline_vlm_coverage(&timeline.events);
+    if vlm_coverage.active > 0 || vlm_coverage.degraded > 0 {
+        bullets.push(format!(
+            "VLM 覆盖：{} 条 active，{} 条 degraded，{} 条未抽样。",
+            vlm_coverage.active, vlm_coverage.degraded, vlm_coverage.not_sampled
+        ));
+    }
     let digest = FamilyTimelineDigest {
         generated_at: now_epoch_ms_string(),
         status,
@@ -255,6 +271,7 @@ pub fn build_family_timeline_digest_from_query(
         latest_event_id,
         metadata_only: true,
         secret_scan: "clean".to_string(),
+        vlm_coverage,
     };
     validate_family_timeline_digest(&digest)?;
     Ok(digest)
@@ -386,6 +403,27 @@ fn build_family_timeline_buckets(events: &[FamilyTimelineEvent]) -> Vec<FamilyTi
     buckets
 }
 
+fn family_timeline_vlm_coverage(events: &[FamilyTimelineEvent]) -> FamilyTimelineVlmCoverage {
+    let mut coverage = FamilyTimelineVlmCoverage {
+        total: events.len(),
+        ..FamilyTimelineVlmCoverage::default()
+    };
+    for event in events {
+        match event.vlm_status.trim().to_ascii_lowercase().as_str() {
+            "active" | "completed" | "ready" => {
+                coverage.active = coverage.active.saturating_add(1);
+            }
+            "" | "not_sampled" | "not-sampled" | "none" | "not_available" | "unavailable" => {
+                coverage.not_sampled = coverage.not_sampled.saturating_add(1);
+            }
+            _ => {
+                coverage.degraded = coverage.degraded.saturating_add(1);
+            }
+        }
+    }
+    coverage
+}
+
 fn counted_strings(values: Vec<&str>, limit: usize) -> Vec<String> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for value in values {
@@ -433,9 +471,60 @@ mod tests {
         assert!(!timeline.events[0].artifact.raw_image_included);
         assert_eq!(digest.secret_scan, "clean");
         assert!(digest.headline.contains("1 条"));
+        assert_eq!(digest.vlm_coverage.total, 1);
+        assert_eq!(digest.vlm_coverage.not_sampled, 1);
         assert!(!text.contains("/tmp/source.jpg"));
         assert!(!text.contains("rtsp://"));
         assert!(!text.contains("data:image"));
+    }
+
+    #[test]
+    fn family_timeline_digest_reports_vlm_coverage() {
+        let mut active = sample_event();
+        active.event_id = "event-active".to_string();
+        active.vlm = Some(crate::runtime::vision_event::LocalVisionEventVlmSummary {
+            status: "active".to_string(),
+            summary: "VLM 已描述门口有人经过。".to_string(),
+            derived_text: "门口有人经过。".to_string(),
+            tags: vec!["person".to_string()],
+            labels: vec!["person".to_string()],
+            error: None,
+            artifacts: Vec::new(),
+            ingest_metadata: json!({"redacted": true}),
+            vlm_metrics: json!({"elapsed_ms": 1200}),
+        });
+        let mut degraded = sample_event();
+        degraded.event_id = "event-degraded".to_string();
+        degraded.vlm = Some(crate::runtime::vision_event::LocalVisionEventVlmSummary {
+            status: "degraded".to_string(),
+            summary: "VLM endpoint unavailable.".to_string(),
+            derived_text: String::new(),
+            tags: Vec::new(),
+            labels: Vec::new(),
+            error: Some("endpoint unavailable".to_string()),
+            artifacts: Vec::new(),
+            ingest_metadata: json!({"redacted": true}),
+            vlm_metrics: json!({}),
+        });
+        let plain = sample_event();
+        let digest = build_family_timeline_digest(
+            &[
+                sample_stored_event(active),
+                sample_stored_event(degraded),
+                sample_stored_event(plain),
+            ],
+            24 * 60 * 60,
+        )
+        .expect("digest");
+
+        assert_eq!(digest.vlm_coverage.total, 3);
+        assert_eq!(digest.vlm_coverage.active, 1);
+        assert_eq!(digest.vlm_coverage.degraded, 1);
+        assert_eq!(digest.vlm_coverage.not_sampled, 1);
+        assert!(digest
+            .bullets
+            .iter()
+            .any(|bullet| bullet.contains("VLM 覆盖")));
     }
 
     #[test]
