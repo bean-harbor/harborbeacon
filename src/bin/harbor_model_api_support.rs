@@ -783,6 +783,20 @@ fn semantic_router_decision(request: &SemanticRouterRequest) -> Value {
     } else if contains_any(
         text,
         &lower,
+        &[
+            "值得注意",
+            "注意的",
+            "需要注意",
+            "worth noticing",
+            "noteworthy",
+        ],
+    ) {
+        decision = "family_memory_summary";
+        confidence = 0.94;
+        query = json!(text);
+    } else if contains_any(
+        text,
+        &lower,
         &["今天有人", "有人来过", "门口今天", "今天门口", "家里今天"],
     ) {
         decision = "family_timeline_query";
@@ -801,8 +815,14 @@ fn semantic_router_decision(request: &SemanticRouterRequest) -> Value {
         &lower,
         &["最近事件", "最新摄像头事件", "最近看见", "event"],
     ) {
-        decision = "vision_event_summary";
-        confidence = 0.94;
+        if semantic_router_asks_to_understand_visual_event(text, &lower) {
+            decision = "vlm_describe_latest_event";
+            confidence = 0.95;
+            camera_hint = infer_camera_hint(text);
+        } else {
+            decision = "vision_event_summary";
+            confidence = 0.94;
+        }
     } else if contains_any(
         text,
         &lower,
@@ -810,6 +830,10 @@ fn semantic_router_decision(request: &SemanticRouterRequest) -> Value {
     ) {
         decision = "camera_record_clip";
         confidence = 0.94;
+        camera_hint = infer_camera_hint(text);
+    } else if semantic_router_asks_to_understand_visual_event(text, &lower) {
+        decision = "vlm_describe_latest_event";
+        confidence = 0.95;
         camera_hint = infer_camera_hint(text);
     } else if contains_any(
         text,
@@ -852,6 +876,40 @@ fn semantic_router_decision(request: &SemanticRouterRequest) -> Value {
         "reply_text": Value::Null,
         "reason": "local_only_semantic_router_backend",
     })
+}
+
+fn semantic_router_asks_to_understand_visual_event(text: &str, lower: &str) -> bool {
+    let visual_target = contains_any(
+        text,
+        lower,
+        &[
+            "最新事件",
+            "最近事件",
+            "刚才",
+            "门口",
+            "摄像头",
+            "画面",
+            "event",
+        ],
+    );
+    let understand_verb = contains_any(
+        text,
+        lower,
+        &[
+            "发生了什么",
+            "看一下",
+            "看看",
+            "看下",
+            "理解",
+            "描述",
+            "说明",
+            "到底是什么",
+            "what happened",
+            "describe",
+            "understand",
+        ],
+    );
+    visual_target && understand_verb
 }
 
 fn contains_any(text: &str, lower_ascii: &str, needles: &[&str]) -> bool {
@@ -2759,6 +2817,37 @@ mod tests {
             decision["guardian_rule"]["action_plan"]["actions"][0]["service"],
             json!("turn_on")
         );
+    }
+
+    #[test]
+    fn semantic_router_backend_routes_vlm_family_memory_decisions() {
+        for (message, expected) in [
+            (
+                "User message: 刚才门口发生了什么",
+                "vlm_describe_latest_event",
+            ),
+            (
+                "User message: 帮我看一下最新事件",
+                "vlm_describe_latest_event",
+            ),
+            (
+                "User message: 今天家里有什么值得注意的",
+                "family_memory_summary",
+            ),
+        ] {
+            let body = json!({
+                "messages": [
+                    {"role": "system", "content": "Return JSON only."},
+                    {"role": "user", "content": message}
+                ]
+            });
+            let request =
+                parse_semantic_router_request(serde_json::to_vec(&body).unwrap().as_slice())
+                    .expect("semantic router request");
+            let decision = semantic_router_decision(&request);
+            assert_eq!(decision["decision"], json!(expected));
+            assert!(decision["confidence"].as_f64().unwrap_or_default() >= 0.9);
+        }
     }
 
     #[test]
