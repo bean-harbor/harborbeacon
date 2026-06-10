@@ -23,6 +23,7 @@ use uuid::Uuid;
 use self::general_message_plan::{
     GeneralMessageCandidate, GeneralMessageControllerTrace, GeneralMessageConversationAct,
     GeneralMessagePlan, GeneralMessagePlanKind, GeneralMessagePlanPayload, GeneralMessageSignals,
+    GeneralMessageWorkflowCompilerShadowTrace,
 };
 #[cfg(test)]
 use self::general_message_router::general_message_requests_capability_summary;
@@ -33,11 +34,12 @@ use self::general_message_router::{
     enforce_general_message_nsp_hard_guards, extract_general_message_signals,
     fallback_general_message_plan, general_message_conversation_summary,
     general_message_default_clarification_prompt, general_message_nsp_schema_valid,
-    general_message_nsp_validation_failure, general_message_support_summary_for_request,
-    general_message_supported_examples, general_message_unsupported_summary,
-    infer_general_message_conversation_act, parse_general_message_plan,
-    parse_general_message_router_decision, record_general_message_nsp_plan_trace,
-    resolve_deterministic_general_message_plan, should_try_general_message_router_llm,
+    general_message_nsp_validation_failure, general_message_plan_decision_label,
+    general_message_support_summary_for_request, general_message_supported_examples,
+    general_message_unsupported_summary, infer_general_message_conversation_act,
+    parse_general_message_plan, parse_general_message_router_decision,
+    record_general_message_nsp_plan_trace, resolve_deterministic_general_message_plan,
+    should_try_general_message_router_llm,
 };
 #[cfg(test)]
 use self::system_readiness_actions::build_general_message_readiness_summary;
@@ -61,6 +63,7 @@ use crate::connectors::notifications::{
 use crate::connectors::notifications::{NotificationRecipient, NotificationRecipientIdType};
 use crate::connectors::storage::StorageTarget;
 use crate::control_plane::approvals::{ApprovalStatus, ApprovalTicket};
+use crate::control_plane::audit::{build_metadata_audit_record, AuditActorKind};
 use crate::control_plane::events::{EventRecord, EventSeverity, EventSourceKind};
 use crate::control_plane::media::{
     MediaAsset, MediaAssetKind, MediaDeliveryMode, MediaSession, MediaSessionKind,
@@ -84,6 +87,9 @@ use crate::orchestrator::policy::{
     ApprovalContext,
 };
 use crate::orchestrator::router::{Executor, Router};
+use crate::orchestrator::workflow_compiler::{
+    compile_system_diagnostics_candidate, WorkflowCandidate,
+};
 use crate::runtime::admin_console::{
     harboros_writable_root, AdminConsoleState, AdminConsoleStore, AdminModelCenterState,
     NotificationTargetRecord, RagResourceProfile,
@@ -103,6 +109,7 @@ use crate::runtime::model_center::{
     run_llm_text_with_state_and_options, run_ocr_with_state, run_vlm_summary_with_state,
     LlmTextExecution, LlmTextOptions,
 };
+use crate::runtime::privacy_gateway::{PrivacyGateway, PrivacyGatewayEvaluation};
 use crate::runtime::registry::ResolvedCameraTarget;
 use crate::runtime::remote_view;
 use crate::runtime::task_session::{
@@ -2548,6 +2555,8 @@ impl TaskApiService {
             &session_recap,
             recent_clip.as_ref(),
         );
+        let workflow_shadow_candidate =
+            compile_system_diagnostics_candidate(request.intent.raw_text.as_str());
         let mut trace = GeneralMessageControllerTrace {
             controller_stage: "candidate_builder".to_string(),
             candidate_count: candidates.len(),
@@ -2591,6 +2600,11 @@ impl TaskApiService {
                             &mut plan,
                             &mut trace,
                         );
+                        record_workflow_compiler_shadow(
+                            &mut trace,
+                            workflow_shadow_candidate.as_ref(),
+                            &plan,
+                        );
                         return Ok((plan, trace));
                     }
                 } else {
@@ -2613,6 +2627,7 @@ impl TaskApiService {
                 &mut plan,
                 &mut trace,
             );
+            record_workflow_compiler_shadow(&mut trace, workflow_shadow_candidate.as_ref(), &plan);
             return Ok((plan, trace));
         }
 
@@ -2631,6 +2646,7 @@ impl TaskApiService {
                 &mut plan,
                 &mut trace,
             );
+            record_workflow_compiler_shadow(&mut trace, workflow_shadow_candidate.as_ref(), &plan);
             return Ok((plan, trace));
         }
 
@@ -2666,6 +2682,7 @@ impl TaskApiService {
             &mut plan,
             &mut trace,
         );
+        record_workflow_compiler_shadow(&mut trace, workflow_shadow_candidate.as_ref(), &plan);
         Ok((plan, trace))
     }
 
@@ -3494,6 +3511,7 @@ impl TaskApiService {
                 &citations,
                 Value::Null,
                 search_result.warnings.clone(),
+                Value::Null,
             );
             return self.failed_with_context(
                 request,
@@ -3521,6 +3539,7 @@ impl TaskApiService {
                 &citations,
                 Value::Null,
                 search_result.warnings.clone(),
+                Value::Null,
             );
             return self.completed(
                 request,
@@ -3533,105 +3552,151 @@ impl TaskApiService {
             );
         }
 
+        let privacy_gateway_evaluation = PrivacyGateway::evaluate_rag_answer_cloud_context(
+            &query,
+            &citations,
+            privacy_level,
+            &workspace_id_for_request(request),
+            &request.task_id,
+            request.source.user_id.as_str(),
+        );
+        let cloud_profile_requested = resource_profile == RagResourceProfile::CloudAllowed;
+        let mut capsule_prompt_used = false;
         let mut warnings = search_result.warnings.clone();
         let mut degraded_reason = search_result.degraded_reason.clone();
         let mut model = Value::Null;
         let mut answer = build_limited_rag_answer(&query, &citations);
+        let mut prompt = build_rag_answer_prompt(&query, &citations);
+        let mut skip_model = false;
 
-        match self.admin_store.load_or_create_state() {
-            Ok(admin_state) => {
-                match rag_answer_model_state_for_policy(
-                    &admin_state.models,
-                    privacy_level,
-                    resource_profile,
-                ) {
-                    Ok(model_state) => {
-                        let prompt = build_rag_answer_prompt(&query, &citations);
-                        let llm_result = run_llm_text_with_state_and_options(
-                            &prompt,
-                            &model_state,
-                            &LlmTextOptions {
-                                purpose: Some("rag.answer".to_string()),
-                                system_prompt: Some(build_rag_answer_system_prompt()),
-                                temperature: Some(0.0),
-                                max_tokens: Some(rag_answer_max_tokens()),
-                                timeout: Some(Duration::from_millis(rag_answer_budget_ms())),
-                            },
-                        );
-                        model = llm_execution_model_json(&llm_result);
-                        let generated = normalize_rag_answer_text(&llm_result.text);
-                        if llm_result.available && !generated.is_empty() {
-                            if rag_answer_has_citation_marker(&generated, citations.len()) {
-                                answer = generated;
-                            } else {
-                                let mut answered_by_cloud = false;
-                                if llm_selected_endpoint_kind(&llm_result) != Some("cloud") {
-                                    if let Some(cloud_state) = cloud_only_llm_model_state_for_policy(
-                                        &model_state,
-                                        "retrieval.answer",
-                                    ) {
-                                        let cloud_result = run_llm_text_with_state_and_options(
-                                            &prompt,
-                                            &cloud_state,
-                                            &LlmTextOptions {
-                                                purpose: Some("rag.answer".to_string()),
-                                                system_prompt: Some(
-                                                    build_rag_answer_system_prompt(),
-                                                ),
-                                                temperature: Some(0.0),
-                                                max_tokens: Some(rag_answer_max_tokens()),
-                                                timeout: Some(Duration::from_millis(
-                                                    rag_answer_budget_ms(),
-                                                )),
-                                            },
-                                        );
-                                        model = llm_execution_model_json(&cloud_result);
-                                        let cloud_generated =
-                                            normalize_rag_answer_text(&cloud_result.text);
-                                        if cloud_result.available
-                                            && !cloud_generated.is_empty()
-                                            && rag_answer_has_citation_marker(
-                                                &cloud_generated,
-                                                citations.len(),
+        if cloud_profile_requested && privacy_level == PrivacyLevel::AllowRedactedCloud {
+            if !privacy_gateway_evaluation.decision.cloud_allowed {
+                degraded_reason.get_or_insert_with(|| "privacy_gateway_blocked".to_string());
+                warnings.extend(privacy_gateway_evaluation.decision.warnings.clone());
+                answer = format!(
+                    "Privacy Gateway 已阻断云端回答：{}",
+                    privacy_gateway_evaluation.decision.reason
+                );
+                skip_model = true;
+            } else if let Some(capsule) = privacy_gateway_evaluation.semantic_capsule.as_ref() {
+                prompt = capsule.to_cloud_prompt();
+                capsule_prompt_used = true;
+            } else {
+                degraded_reason.get_or_insert_with(|| "privacy_gateway_blocked".to_string());
+                warnings.push(
+                    "Privacy Gateway 未能生成 semantic capsule，已跳过云端模型。".to_string(),
+                );
+                answer =
+                    "Privacy Gateway 未能生成可上云的 semantic capsule，已降级为本地引用摘要。"
+                        .to_string();
+                skip_model = true;
+            }
+        }
+
+        if !skip_model {
+            match self.admin_store.load_or_create_state() {
+                Ok(admin_state) => {
+                    match rag_answer_model_state_for_policy(
+                        &admin_state.models,
+                        privacy_level,
+                        resource_profile,
+                    ) {
+                        Ok(model_state) => {
+                            let llm_result = run_llm_text_with_state_and_options(
+                                &prompt,
+                                &model_state,
+                                &LlmTextOptions {
+                                    purpose: Some("rag.answer".to_string()),
+                                    system_prompt: Some(build_rag_answer_system_prompt()),
+                                    temperature: Some(0.0),
+                                    max_tokens: Some(rag_answer_max_tokens()),
+                                    timeout: Some(Duration::from_millis(rag_answer_budget_ms())),
+                                },
+                            );
+                            model = llm_execution_model_json(&llm_result);
+                            let generated = normalize_rag_answer_text(&llm_result.text);
+                            if llm_result.available && !generated.is_empty() {
+                                if rag_answer_has_citation_marker(&generated, citations.len()) {
+                                    answer = generated;
+                                } else {
+                                    let mut answered_by_cloud = false;
+                                    if llm_selected_endpoint_kind(&llm_result) != Some("cloud") {
+                                        if let Some(cloud_state) =
+                                            cloud_only_llm_model_state_for_policy(
+                                                &model_state,
+                                                "retrieval.answer",
                                             )
                                         {
-                                            answer = cloud_generated;
-                                            answered_by_cloud = true;
+                                            let cloud_result = run_llm_text_with_state_and_options(
+                                                &prompt,
+                                                &cloud_state,
+                                                &LlmTextOptions {
+                                                    purpose: Some("rag.answer".to_string()),
+                                                    system_prompt: Some(
+                                                        build_rag_answer_system_prompt(),
+                                                    ),
+                                                    temperature: Some(0.0),
+                                                    max_tokens: Some(rag_answer_max_tokens()),
+                                                    timeout: Some(Duration::from_millis(
+                                                        rag_answer_budget_ms(),
+                                                    )),
+                                                },
+                                            );
+                                            model = llm_execution_model_json(&cloud_result);
+                                            let cloud_generated =
+                                                normalize_rag_answer_text(&cloud_result.text);
+                                            if cloud_result.available
+                                                && !cloud_generated.is_empty()
+                                                && rag_answer_has_citation_marker(
+                                                    &cloud_generated,
+                                                    citations.len(),
+                                                )
+                                            {
+                                                answer = cloud_generated;
+                                                answered_by_cloud = true;
+                                            }
                                         }
                                     }
+                                    if !answered_by_cloud {
+                                        degraded_reason
+                                            .get_or_insert_with(|| "uncited_answer".to_string());
+                                        warnings.push(
+                                            "LLM 输出缺少可解析 citation 标记，已降级为引用片段摘要。"
+                                                .to_string(),
+                                        );
+                                    }
                                 }
-                                if !answered_by_cloud {
-                                    degraded_reason
-                                        .get_or_insert_with(|| "uncited_answer".to_string());
-                                    warnings.push(
-                                        "LLM 输出缺少可解析 citation 标记，已降级为引用片段摘要。"
-                                            .to_string(),
-                                    );
-                                }
+                            } else {
+                                degraded_reason
+                                    .get_or_insert_with(|| "llm_unavailable".to_string());
+                                warnings.push(format!(
+                                    "LLM 不可用，已降级为引用片段摘要：{}",
+                                    llm_result.summary
+                                ));
                             }
-                        } else {
-                            degraded_reason.get_or_insert_with(|| "llm_unavailable".to_string());
-                            warnings.push(format!(
-                                "LLM 不可用，已降级为引用片段摘要：{}",
-                                llm_result.summary
-                            ));
+                        }
+                        Err(error) => {
+                            degraded_reason.get_or_insert_with(|| "llm_policy_blocked".to_string());
+                            warnings.push(error);
                         }
                     }
-                    Err(error) => {
-                        degraded_reason.get_or_insert_with(|| "llm_policy_blocked".to_string());
-                        warnings.push(error);
-                    }
                 }
-            }
-            Err(error) => {
-                degraded_reason.get_or_insert_with(|| "model_settings_unavailable".to_string());
-                warnings.push(format!("模型设置不可用，已降级为引用片段摘要：{error}"));
+                Err(error) => {
+                    degraded_reason.get_or_insert_with(|| "model_settings_unavailable".to_string());
+                    warnings.push(format!("模型设置不可用，已降级为引用片段摘要：{error}"));
+                }
             }
         }
 
         let degraded = search_result.degraded || !warnings.is_empty() || degraded_reason.is_some();
         let status = if degraded { "degraded" } else { "completed" };
         let reason = degraded_reason.as_deref().unwrap_or("none");
+        let privacy_gateway = privacy_gateway_evaluation.evidence_value(capsule_prompt_used);
+        self.record_privacy_gateway_audit(
+            request,
+            &privacy_gateway_evaluation,
+            capsule_prompt_used,
+        );
         let data = build_rag_answer_data(
             &query,
             &answer,
@@ -3642,6 +3707,7 @@ impl TaskApiService {
             &citations,
             model,
             warnings,
+            privacy_gateway,
         );
         self.completed(
             request,
@@ -3683,6 +3749,7 @@ impl TaskApiService {
             &citations,
             Value::Null,
             Vec::new(),
+            Value::Null,
         );
         self.failed_with_context(
             request,
@@ -3692,6 +3759,36 @@ impl TaskApiService {
             data,
             Vec::new(),
         )
+    }
+
+    fn record_privacy_gateway_audit(
+        &self,
+        request: &TaskRequest,
+        evaluation: &PrivacyGatewayEvaluation,
+        capsule_prompt_used: bool,
+    ) {
+        let actor_id = first_non_empty(&[request.source.user_id.as_str()])
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "system".to_string());
+        let evidence = evaluation.evidence_value(capsule_prompt_used);
+        let record = build_metadata_audit_record(
+            evaluation.privacy_transform.workspace_id.clone(),
+            "privacy_transform",
+            evaluation.privacy_transform.privacy_transform_id.clone(),
+            "privacy_gateway.rag_answer.evaluate",
+            AuditActorKind::System,
+            actor_id,
+            json!({
+                "task_id": request.task_id,
+                "trace_id": request.trace_id,
+                "purpose": evaluation.flow.purpose,
+                "privacy_level": evaluation.flow.privacy_level,
+                "policy_version": evaluation.flow.policy_version,
+                "metadata_only": true,
+            }),
+            evidence,
+        );
+        let _ = self.admin_store.append_audit_record(record);
     }
 
     fn resolve_camera_target(&self, request: &TaskRequest) -> Result<ResolvedCameraTarget, String> {
@@ -6286,6 +6383,7 @@ fn build_rag_answer_data(
     citations: &[KnowledgeSearchCitation],
     model: Value,
     warnings: Vec<String>,
+    privacy_gateway: Value,
 ) -> Value {
     let degraded_reason = if degraded_reason == "none" {
         None
@@ -6308,6 +6406,7 @@ fn build_rag_answer_data(
         },
         "search": search,
         "model": model,
+        "privacy_gateway": privacy_gateway,
         "warnings": warnings,
         "privacy_level": search.privacy_level,
         "resource_profile": search.resource_profile,
@@ -6461,6 +6560,7 @@ fn llm_execution_model_json(result: &LlmTextExecution) -> Value {
         "provider_key": result.provider_key,
         "model_endpoint_id": result.model_endpoint_id,
         "selected_endpoint": result.details.get("selected_endpoint").cloned().unwrap_or(Value::Null),
+        "selected_endpoint_kind": result.details.get("selected_endpoint_kind").cloned().unwrap_or(Value::Null),
         "attempted_endpoints": result.details.get("attempted_endpoints").cloned().unwrap_or_else(|| json!([])),
         "fallback_reason": result.details.get("fallback_reason").cloned().unwrap_or(Value::Null),
         "fallback_used": result.details.get("fallback_used").cloned().unwrap_or(Value::Bool(false)),
@@ -8708,6 +8808,37 @@ fn maybe_render_general_message_reply(
     }
 }
 
+fn record_workflow_compiler_shadow(
+    trace: &mut GeneralMessageControllerTrace,
+    candidate: Option<&WorkflowCandidate>,
+    plan: &GeneralMessagePlan,
+) {
+    let current_plan = general_message_plan_decision_label(plan);
+    let shadow = match candidate {
+        Some(candidate) => GeneralMessageWorkflowCompilerShadowTrace {
+            workflow_id: Some(candidate.workflow_id.clone()),
+            node_id: Some(candidate.node_id.clone()),
+            candidate_kind: Some(candidate.candidate_kind.clone()),
+            confidence: Some(candidate.confidence),
+            matched_current_plan: candidate.candidate_kind == current_plan,
+            read_only: candidate.read_only,
+            unsafe_action: candidate.has_unsafe_action(),
+            reason: Some(candidate.reason.clone()),
+        },
+        None => GeneralMessageWorkflowCompilerShadowTrace {
+            workflow_id: None,
+            node_id: None,
+            candidate_kind: None,
+            confidence: None,
+            matched_current_plan: false,
+            read_only: true,
+            unsafe_action: false,
+            reason: Some("no workflow compiler candidate".to_string()),
+        },
+    };
+    trace.workflow_compiler_shadow = Some(shadow);
+}
+
 fn attach_general_message_controller_trace(
     response: &mut TaskResponse,
     trace: &GeneralMessageControllerTrace,
@@ -8735,6 +8866,18 @@ fn attach_general_message_controller_trace(
                 .map(redact_task_api_text),
             "fallback_reason": fallback_reason.clone(),
         });
+        let workflow_compiler_shadow = trace.workflow_compiler_shadow.as_ref().map(|shadow| {
+            json!({
+                "workflow_id": shadow.workflow_id,
+                "node_id": shadow.node_id,
+                "candidate_kind": shadow.candidate_kind,
+                "confidence": shadow.confidence,
+                "matched_current_plan": shadow.matched_current_plan,
+                "read_only": shadow.read_only,
+                "unsafe_action": shadow.unsafe_action,
+                "reason": shadow.reason.as_deref().map(redact_task_api_text),
+            })
+        });
         map.insert(
             "general_message_controller".to_string(),
             json!({
@@ -8745,6 +8888,7 @@ fn attach_general_message_controller_trace(
                 "candidate_count": trace.candidate_count,
                 "fallback_reason": fallback_reason.clone(),
                 "nsp_route": nsp_route.clone(),
+                "workflow_compiler_shadow": workflow_compiler_shadow,
                 "total_turn_latency_ms": elapsed.as_millis() as u64,
             }),
         );
@@ -9904,7 +10048,7 @@ mod tests {
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
     use crate::control_plane::media::{MediaAssetKind, StorageTargetKind};
     use crate::control_plane::models::{
-        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind,
+        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
     };
     use crate::control_plane::tasks::{
         ArtifactKind, ConversationSession, ExecutionRoute, TaskRunStatus, TaskStepRunStatus,
@@ -9912,7 +10056,8 @@ mod tests {
     use crate::orchestrator::contracts::RiskLevel;
     use crate::runtime::admin_console::{
         AdminConsoleState, AdminConsoleStore, HomeAssistantConfigUpdate, IdentityBindingRecord,
-        KnowledgeSettings, KnowledgeSourceRoot, NotificationTargetRecord, RemoteViewConfig,
+        KnowledgeSettings, KnowledgeSourceRoot, NotificationTargetRecord, RagResourceProfile,
+        RemoteViewConfig,
     };
     use crate::runtime::hub::HubScanResultItem;
     use crate::runtime::knowledge::{
@@ -10169,7 +10314,31 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{unique}"))
     }
 
+    fn restore_env_var(name: &str, previous: Option<std::ffi::OsString>) {
+        if let Some(value) = previous {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+
     fn configure_knowledge_source(store: &AdminConsoleStore, root: &Path, index_root: &Path) {
+        configure_knowledge_source_with_policy(
+            store,
+            root,
+            index_root,
+            PrivacyLevel::StrictLocal,
+            RagResourceProfile::CpuOnly,
+        );
+    }
+
+    fn configure_knowledge_source_with_policy(
+        store: &AdminConsoleStore,
+        root: &Path,
+        index_root: &Path,
+        privacy_level: PrivacyLevel,
+        default_resource_profile: RagResourceProfile,
+    ) {
         fs::create_dir_all(index_root).expect("create knowledge index root");
         store
             .save_knowledge_settings(KnowledgeSettings {
@@ -10183,7 +10352,8 @@ mod tests {
                     last_indexed_at: None,
                 }],
                 index_root: index_root.to_string_lossy().into_owned(),
-                ..Default::default()
+                privacy_level,
+                default_resource_profile,
             })
             .expect("save knowledge settings");
         KnowledgeIndexService::from_config(
@@ -10262,6 +10432,50 @@ mod tests {
                 }),
             })
             .expect("save mock llm endpoint");
+    }
+
+    fn configure_mock_cloud_llm(service: &TaskApiService, mock_text: &str) {
+        service
+            .clone()
+            .admin_store
+            .save_model_endpoint(ModelEndpoint {
+                model_endpoint_id: "llm-cloud-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Llm,
+                endpoint_kind: ModelEndpointKind::Cloud,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "harbor-cloud-chat".to_string(),
+                capability_tags: vec!["chat".to_string(), "cloud".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "mock_text": mock_text,
+                }),
+            })
+            .expect("save mock cloud llm endpoint");
+    }
+
+    fn configure_mock_embedding(service: &TaskApiService) {
+        service
+            .clone()
+            .admin_store
+            .save_model_endpoint(ModelEndpoint {
+                model_endpoint_id: "embedder-local-mock".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Embedder,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "mock".to_string(),
+                model_name: "harbor-mock-embedder".to_string(),
+                capability_tags: vec!["embedding".to_string(), "local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "mock_embedding_dimensions": 4,
+                }),
+            })
+            .expect("save mock embedding endpoint");
     }
 
     fn cleanup_task_api_service(
@@ -14204,6 +14418,271 @@ mod tests {
     }
 
     #[test]
+    fn handle_rag_answer_redacted_cloud_uses_privacy_capsule() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let previous_admin_state_path = std::env::var_os("HARBOR_ADMIN_STATE_PATH");
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_path);
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let knowledge_root = unique_dir("harborbeacon-rag-answer-redacted-cloud-root");
+        let index_root = unique_dir("harborbeacon-rag-answer-redacted-cloud-index");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::write(
+            knowledge_root.join("docs").join("family-plan.md"),
+            "The family garden plan includes photos, captions, and a sharing checklist.",
+        )
+        .expect("write doc");
+
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        configure_knowledge_source_with_policy(
+            &admin_store,
+            &knowledge_root,
+            &index_root,
+            PrivacyLevel::AllowRedactedCloud,
+            RagResourceProfile::CloudAllowed,
+        );
+        let service = TaskApiService::new(
+            admin_store,
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        configure_mock_embedding(&service);
+        configure_mock_cloud_llm(&service, "The plan includes photos and captions. [1]");
+        let request = TaskRequest {
+            task_id: "task-rag-answer-redacted-cloud".to_string(),
+            trace_id: "trace-rag-answer-redacted-cloud".to_string(),
+            step_id: "step-rag-answer-redacted-cloud".to_string(),
+            source: TaskSource {
+                user_id: "owner-1".to_string(),
+                ..Default::default()
+            },
+            intent: TaskIntent {
+                domain: "rag".to_string(),
+                action: "answer".to_string(),
+                raw_text: "summarize the family plan".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "query": "family garden plan",
+                "roots": [knowledge_root.to_string_lossy().to_string()],
+                "privacy_level": "allow_redacted_cloud",
+                "resource_profile": "cloud_allowed"
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(
+            response.result.data["privacy_gateway"]["decision"],
+            "allow_redacted_cloud"
+        );
+        assert_eq!(
+            response.result.data["privacy_gateway"]["capsule_prompt_used"],
+            true
+        );
+        assert_eq!(
+            response.result.data["model"]["selected_endpoint_kind"],
+            "cloud"
+        );
+        assert_eq!(
+            response.result.data["privacy_gateway"]["capsule_fact_count"],
+            1
+        );
+        let audits = service.admin_store.audit_records().expect("audit records");
+        assert!(audits
+            .iter()
+            .any(|record| record.action == "privacy_gateway.rag_answer.evaluate"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+        let _ = fs::remove_dir_all(index_root);
+        restore_env_var("HARBOR_ADMIN_STATE_PATH", previous_admin_state_path);
+    }
+
+    #[test]
+    fn handle_rag_answer_redacted_cloud_blocks_credential_capsule() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let previous_admin_state_path = std::env::var_os("HARBOR_ADMIN_STATE_PATH");
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_path);
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let knowledge_root = unique_dir("harborbeacon-rag-answer-credential-root");
+        let index_root = unique_dir("harborbeacon-rag-answer-credential-index");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::write(
+            knowledge_root.join("docs").join("garage-secret.md"),
+            "The garage integration api_key=secret-123 should never leave the home.",
+        )
+        .expect("write doc");
+
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        configure_knowledge_source_with_policy(
+            &admin_store,
+            &knowledge_root,
+            &index_root,
+            PrivacyLevel::AllowRedactedCloud,
+            RagResourceProfile::CloudAllowed,
+        );
+        let service = TaskApiService::new(
+            admin_store,
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        configure_mock_embedding(&service);
+        configure_mock_cloud_llm(&service, "this cloud text should not be used [1]");
+        let request = TaskRequest {
+            task_id: "task-rag-answer-credential".to_string(),
+            trace_id: "trace-rag-answer-credential".to_string(),
+            step_id: "step-rag-answer-credential".to_string(),
+            source: TaskSource::default(),
+            intent: TaskIntent {
+                domain: "rag".to_string(),
+                action: "answer".to_string(),
+                raw_text: "what is the garage api key".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "query": "garage api key",
+                "roots": [knowledge_root.to_string_lossy().to_string()],
+                "privacy_level": "allow_redacted_cloud",
+                "resource_profile": "cloud_allowed"
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.data["status"], "degraded");
+        assert_eq!(
+            response.result.data["degraded_reason"],
+            "privacy_gateway_blocked"
+        );
+        assert_eq!(
+            response.result.data["privacy_gateway"]["decision"],
+            "blocked_or_degraded"
+        );
+        assert_eq!(
+            response.result.data["privacy_gateway"]["cloud_allowed"],
+            false
+        );
+        assert_eq!(response.result.data["model"], Value::Null);
+        assert!(response.result.message.contains("Privacy Gateway"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+        let _ = fs::remove_dir_all(index_root);
+        restore_env_var("HARBOR_ADMIN_STATE_PATH", previous_admin_state_path);
+    }
+
+    #[test]
+    fn handle_rag_answer_allow_cloud_records_privacy_gateway_evidence() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let previous_admin_state_path = std::env::var_os("HARBOR_ADMIN_STATE_PATH");
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_path);
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let knowledge_root = unique_dir("harborbeacon-rag-answer-allow-cloud-root");
+        let index_root = unique_dir("harborbeacon-rag-answer-allow-cloud-index");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::write(
+            knowledge_root.join("docs").join("device-note.md"),
+            "The device note says Harbor can answer from controlled cloud fallback.",
+        )
+        .expect("write doc");
+
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        configure_knowledge_source_with_policy(
+            &admin_store,
+            &knowledge_root,
+            &index_root,
+            PrivacyLevel::AllowCloud,
+            RagResourceProfile::CloudAllowed,
+        );
+        let service = TaskApiService::new(
+            admin_store,
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        configure_mock_embedding(&service);
+        configure_mock_cloud_llm(
+            &service,
+            "Harbor can answer from controlled cloud fallback. [1]",
+        );
+        let request = TaskRequest {
+            task_id: "task-rag-answer-allow-cloud".to_string(),
+            trace_id: "trace-rag-answer-allow-cloud".to_string(),
+            step_id: "step-rag-answer-allow-cloud".to_string(),
+            source: TaskSource::default(),
+            intent: TaskIntent {
+                domain: "rag".to_string(),
+                action: "answer".to_string(),
+                raw_text: "what does the device note say".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "query": "controlled cloud fallback",
+                "roots": [knowledge_root.to_string_lossy().to_string()],
+                "privacy_level": "allow_cloud",
+                "resource_profile": "cloud_allowed"
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(
+            response.result.data["privacy_gateway"]["decision"],
+            "allow_cloud"
+        );
+        assert_eq!(
+            response.result.data["privacy_gateway"]["capsule_prompt_used"],
+            false
+        );
+        assert_eq!(
+            response.result.data["model"]["selected_endpoint_kind"],
+            "cloud"
+        );
+        assert_eq!(
+            response.result.data["degraded"], false,
+            "{}",
+            response.result.data
+        );
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+        let _ = fs::remove_dir_all(index_root);
+        restore_env_var("HARBOR_ADMIN_STATE_PATH", previous_admin_state_path);
+    }
+
+    #[test]
     fn general_message_routes_retrieval_query_to_knowledge_search() {
         let _guard = RETRIEVAL_GATE_TEST_LOCK
             .lock()
@@ -15070,6 +15549,68 @@ mod tests {
         assert!(!text.contains("gw_route_secret"));
         assert!(!text.contains("ha-secret-token"));
         assert!(!text.contains("secret-context-token"));
+    }
+
+    #[test]
+    fn general_message_workflow_compiler_shadow_matches_system_readiness() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-workflow-shadow-status");
+        let request = general_message_test_request(
+            "general_message_workflow_shadow_status",
+            "状态",
+            Value::Null,
+        );
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(
+            response.result.data["reply_pack"]["kind"],
+            json!("system_readiness")
+        );
+        let shadow =
+            &response.result.data["general_message_controller"]["workflow_compiler_shadow"];
+        assert_eq!(shadow["workflow_id"], json!("system_diagnostics_v1"));
+        assert_eq!(shadow["candidate_kind"], json!("system_readiness"));
+        assert_eq!(shadow["matched_current_plan"], json!(true));
+        assert_eq!(shadow["read_only"], json!(true));
+        assert_eq!(shadow["unsafe_action"], json!(false));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_workflow_compiler_shadow_does_not_override_nsp_plan() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-workflow-shadow-mismatch");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{"decision":"capability_summary","confidence":0.95,"reason":"forced mismatch"}"#,
+        );
+        let request = general_message_test_request(
+            "general_message_workflow_shadow_mismatch",
+            "状态",
+            Value::Null,
+        );
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(
+            response.result.data["general_message_controller"]["controller_stage"],
+            json!("nsp_router")
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["kind"],
+            json!("capability_summary")
+        );
+        let shadow =
+            &response.result.data["general_message_controller"]["workflow_compiler_shadow"];
+        assert_eq!(shadow["candidate_kind"], json!("system_readiness"));
+        assert_eq!(shadow["matched_current_plan"], json!(false));
+        assert_eq!(shadow["unsafe_action"], json!(false));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
     }
 
     #[test]

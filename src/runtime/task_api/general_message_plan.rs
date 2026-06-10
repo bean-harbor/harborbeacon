@@ -174,6 +174,18 @@ pub(super) struct GeneralMessageCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct GeneralMessageWorkflowCompilerShadowTrace {
+    pub(super) workflow_id: Option<String>,
+    pub(super) node_id: Option<String>,
+    pub(super) candidate_kind: Option<String>,
+    pub(super) confidence: Option<u8>,
+    pub(super) matched_current_plan: bool,
+    pub(super) read_only: bool,
+    pub(super) unsafe_action: bool,
+    pub(super) reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct GeneralMessageControllerTrace {
     pub(super) controller_stage: String,
     pub(super) router_llm: bool,
@@ -186,4 +198,5 @@ pub(super) struct GeneralMessageControllerTrace {
     pub(super) nsp_decision: Option<String>,
     pub(super) nsp_confidence: Option<u8>,
     pub(super) nsp_canonical_phrase: Option<String>,
+    pub(super) workflow_compiler_shadow: Option<GeneralMessageWorkflowCompilerShadowTrace>,
 }

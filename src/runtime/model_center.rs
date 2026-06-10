@@ -2586,7 +2586,7 @@ mod tests {
             "摄像头能干什么",
             &state,
             &LlmTextOptions {
-                purpose: Some("router".to_string()),
+                purpose: Some("rag.answer".to_string()),
                 max_tokens: Some(12),
                 ..Default::default()
             },
