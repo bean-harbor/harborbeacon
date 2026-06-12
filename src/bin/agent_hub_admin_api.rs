@@ -40,7 +40,7 @@ use harborbeacon_local_agent::connectors::notifications::{
 use harborbeacon_local_agent::connectors::storage::StorageTarget;
 use harborbeacon_local_agent::control_plane::audit::{
     build_audit_summary, build_metadata_audit_record, query_audit_records, AuditActorKind,
-    AuditRecordQuery,
+    AuditRecord, AuditRecordQuery,
 };
 use harborbeacon_local_agent::control_plane::events::EventRecord;
 use harborbeacon_local_agent::control_plane::media::{
@@ -119,6 +119,7 @@ use harborbeacon_local_agent::runtime::model_center::{
     redact_model_endpoint, run_vlm_summary_with_state, test_model_endpoint, vlm_endpoint_readiness,
     vlm_execution_runtime_snapshot, ModelEndpointTestResult, ADMIN_STATE_PATH_ENV,
 };
+use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
 use harborbeacon_local_agent::runtime::registry::{
     CameraCapabilities, CameraDevice, DeviceRegistryStore, HomeAssistantRegistryEntity,
 };
@@ -138,6 +139,8 @@ use harborbeacon_local_agent::runtime::vision_event::{
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
 const HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY: usize = 128;
 const HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS: u64 = 60;
+const PRIVACY_GATEWAY_AUDIT_ACTION: &str = "privacy_gateway.rag_answer.evaluate";
+const PRIVACY_GATEWAY_READINESS_AUDIT_LIMIT: usize = 20;
 const HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS: u64 = 300;
 const HOME_GUARDIAN_IDEMPOTENCY_MEMORY_SECONDS: u64 = 7 * 24 * 60 * 60;
 const ADMIN_HTTP_WORKER_COUNT: usize = 32;
@@ -1123,6 +1126,7 @@ struct RagReadinessResponse {
     resource_profiles: Vec<RagResourceProfileStatus>,
     capability_profiles: Vec<RagCapabilityReadinessCard>,
     privacy_policy: RagReadinessComponent,
+    privacy_gateway: RagPrivacyGatewayReadiness,
     media_parser: RagReadinessComponent,
     storage_writable: RagReadinessComponent,
     index_jobs: Vec<KnowledgeIndexJobRecord>,
@@ -1136,6 +1140,25 @@ struct RagReadinessComponent {
     status: String,
     summary: String,
     detail: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct RagPrivacyGatewayReadiness {
+    status: String,
+    summary: String,
+    policy_version: String,
+    covered_routes: Vec<String>,
+    privacy_level: String,
+    default_resource_profile: String,
+    recent_audit_count: usize,
+    decision_counts: BTreeMap<String, usize>,
+    risk_counts: BTreeMap<String, usize>,
+    latest_privacy_transform_id: Option<String>,
+    latest_evaluated_at: Option<String>,
+    warning_count: usize,
+    metadata_only: bool,
+    secret_scan: String,
     evidence: Vec<String>,
 }
 
@@ -2809,6 +2832,7 @@ impl AdminApi {
                     &state.knowledge,
                     &state.models.endpoints,
                     &state.knowledge_index_jobs,
+                    &state.audit_records,
                 );
                 let response = build_release_readiness_response(
                     &self.public_origin,
@@ -2878,6 +2902,7 @@ impl AdminApi {
                     &state.knowledge,
                     &state.models.endpoints,
                     &state.knowledge_index_jobs,
+                    &state.audit_records,
                 );
                 let current = build_release_readiness_response(
                     &self.public_origin,
@@ -2923,6 +2948,7 @@ impl AdminApi {
                     &state.knowledge,
                     &state.models.endpoints,
                     &state.knowledge_index_jobs,
+                    &state.audit_records,
                 ))
             }
             Err(error) => error_json(StatusCode(500), &error),
@@ -11223,6 +11249,99 @@ fn build_rag_privacy_policy_component(
     }
 }
 
+fn build_rag_privacy_gateway_readiness(
+    knowledge: &KnowledgeSettings,
+    audit_records: &[AuditRecord],
+) -> RagPrivacyGatewayReadiness {
+    let recent = audit_records
+        .iter()
+        .rev()
+        .filter(|record| record.action == PRIVACY_GATEWAY_AUDIT_ACTION)
+        .take(PRIVACY_GATEWAY_READINESS_AUDIT_LIMIT)
+        .collect::<Vec<_>>();
+    let mut decision_counts = BTreeMap::new();
+    let mut risk_counts = BTreeMap::new();
+    let mut warning_count = 0usize;
+    let latest = recent.first().copied();
+
+    for record in &recent {
+        let decision = record
+            .result_snapshot
+            .get("decision")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let risk = record
+            .result_snapshot
+            .get("risk_level")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        *decision_counts.entry(decision).or_insert(0) += 1;
+        *risk_counts.entry(risk).or_insert(0) += 1;
+        warning_count += record
+            .result_snapshot
+            .get("warnings")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+    }
+
+    let recent_audit_count = recent.len();
+    let status =
+        if knowledge.privacy_level == PrivacyLevel::StrictLocal || recent_audit_count > 0 {
+            "ready"
+        } else {
+            "needs-evidence"
+        }
+        .to_string();
+    let privacy_level = privacy_level_as_str(knowledge.privacy_level).to_string();
+    let default_resource_profile = knowledge.default_resource_profile.as_str().to_string();
+    let latest_privacy_transform_id = latest
+        .and_then(|record| {
+            record
+                .result_snapshot
+                .get("privacy_transform_id")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    (!record.entity_id.trim().is_empty()).then_some(record.entity_id.as_str())
+                })
+        })
+        .map(ToString::to_string);
+    let latest_evaluated_at = latest.and_then(|record| record.created_at.clone());
+
+    RagPrivacyGatewayReadiness {
+        status,
+        summary: if recent_audit_count > 0 {
+            format!("{recent_audit_count} recent Privacy Gateway audit record(s) found.")
+        } else if knowledge.privacy_level == PrivacyLevel::StrictLocal {
+            "Privacy Gateway is installed; strict_local blocks cloud execution.".to_string()
+        } else {
+            "Privacy Gateway is installed, but no recent RAG cloud-evaluation audit evidence exists yet."
+                .to_string()
+        },
+        policy_version: PRIVACY_GATEWAY_POLICY_VERSION.to_string(),
+        covered_routes: vec!["retrieval.answer".to_string()],
+        privacy_level,
+        default_resource_profile,
+        recent_audit_count,
+        decision_counts,
+        risk_counts,
+        latest_privacy_transform_id,
+        latest_evaluated_at,
+        warning_count,
+        metadata_only: true,
+        secret_scan: "clean".to_string(),
+        evidence: vec![
+            format!("policy_version={PRIVACY_GATEWAY_POLICY_VERSION}"),
+            "covered_route=retrieval.answer".to_string(),
+            format!("recent_audit_count={recent_audit_count}"),
+            format!("audit_action={PRIVACY_GATEWAY_AUDIT_ACTION}"),
+            "metadata_only=true".to_string(),
+        ],
+    }
+}
+
 fn build_rag_resource_profiles(
     knowledge: &KnowledgeSettings,
     model_endpoints: &[ModelEndpoint],
@@ -11498,6 +11617,7 @@ fn build_rag_readiness_response(
     knowledge: &KnowledgeSettings,
     model_endpoints: &[ModelEndpoint],
     index_jobs: &[KnowledgeIndexJobRecord],
+    audit_records: &[AuditRecord],
 ) -> RagReadinessResponse {
     let model_endpoints = overlay_model_endpoints_with_runtime_truth(model_endpoints, runtime);
     let generated_at = now_unix_string();
@@ -11527,6 +11647,7 @@ fn build_rag_readiness_response(
         .count();
     let model_readiness = build_rag_model_readiness(&model_endpoints);
     let privacy_policy = build_rag_privacy_policy_component(knowledge, &model_endpoints);
+    let privacy_gateway = build_rag_privacy_gateway_readiness(knowledge, audit_records);
 
     let source_roots = RagReadinessComponent {
         status: if existing_enabled_source_roots > 0 {
@@ -11745,6 +11866,7 @@ fn build_rag_readiness_response(
         resource_profiles,
         capability_profiles,
         privacy_policy,
+        privacy_gateway,
         media_parser,
         storage_writable: storage,
         index_jobs: recent_knowledge_index_jobs(index_jobs),
@@ -17412,7 +17534,7 @@ fn redact_local_path_occurrences(value: &str) -> String {
         let remaining = &value[index..];
         if remaining.starts_with('/') && is_local_path_boundary(value, index) {
             let end = consume_local_path(value, index);
-            if end > index + 1 {
+            if end > index + 1 && looks_like_posix_local_path(value, index, end) {
                 output.push_str("[redacted local path]");
                 index = end;
                 continue;
@@ -17433,6 +17555,31 @@ fn redact_local_path_occurrences(value: &str) -> String {
     output
 }
 
+fn looks_like_posix_local_path(value: &str, start: usize, end: usize) -> bool {
+    let candidate = &value[start..end];
+    const LOCAL_PATH_PREFIXES: &[&str] = &[
+        "/app/",
+        "/data/",
+        "/etc/",
+        "/home/",
+        "/media/",
+        "/mnt/",
+        "/opt/",
+        "/private/",
+        "/root/",
+        "/run/",
+        "/srv/",
+        "/tmp/",
+        "/usr/",
+        "/var/",
+        "/Volumes/",
+        "/workspace/",
+    ];
+    LOCAL_PATH_PREFIXES
+        .iter()
+        .any(|prefix| candidate.starts_with(prefix))
+}
+
 fn is_local_path_boundary(value: &str, index: usize) -> bool {
     if index == 0 {
         return true;
@@ -17440,7 +17587,7 @@ fn is_local_path_boundary(value: &str, index: usize) -> bool {
     value[..index]
         .chars()
         .last()
-        .map(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '(' | '[' | '{'))
+        .map(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '(' | '[' | '{' | '='))
         .unwrap_or(true)
 }
 
@@ -18326,7 +18473,7 @@ mod tests {
         LocalModelRuntimeProjection, ManualAddRequest, ModelRuntimeActivationRequest,
         ModelRuntimeActivationResult, VisionIngestLimiter, DEFAULT_HF_ENDPOINT,
         HOME_GUARDIAN_ACTION_COOLDOWN_SECONDS, HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS,
-        MAX_VISION_EVENT_INGEST_INFLIGHT,
+        MAX_VISION_EVENT_INGEST_INFLIGHT, PRIVACY_GATEWAY_AUDIT_ACTION,
     };
     use harborbeacon_local_agent::control_plane::audit::{
         build_metadata_audit_record, AuditActorKind,
@@ -18337,7 +18484,7 @@ mod tests {
         ShareLink,
     };
     use harborbeacon_local_agent::control_plane::models::{
-        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind,
+        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
     };
     use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
     use harborbeacon_local_agent::runtime::access_control::{
@@ -18347,12 +18494,13 @@ mod tests {
         default_model_route_policies, AdminConsoleState, AdminConsoleStore, AdminModelCenterState,
         AutomationRuleReview, BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord,
         HomeAssistantAdminState, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
-        NotificationTargetRecord, RemoteViewConfig,
+        NotificationTargetRecord, RagResourceProfile, RemoteViewConfig,
     };
     use harborbeacon_local_agent::runtime::hub::CameraHubService;
     use harborbeacon_local_agent::runtime::knowledge_index::{
         KnowledgeIndexConfig, KnowledgeIndexService,
     };
+    use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
     use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
     use harborbeacon_local_agent::runtime::remote_view;
     use harborbeacon_local_agent::runtime::task_api::TaskApiService;
@@ -19277,6 +19425,18 @@ mod tests {
         let redacted = redact_admin_string("probe http://homeassistant.local:8123 ok");
 
         assert!(redacted.contains("http://homeassistant.local:8123"));
+    }
+
+    #[test]
+    fn admin_string_redaction_preserves_public_shared_camera_route() {
+        let redacted = redact_admin_string(
+            "share=/shared/cameras/token local=/mnt/software/secret.bin win=C:\\models\\secret.bin",
+        );
+
+        assert!(redacted.contains("/shared/cameras/token"));
+        assert!(!redacted.contains("/mnt/software"));
+        assert!(!redacted.contains("C:\\models"));
+        assert!(redacted.contains("[redacted local path]"));
     }
 
     #[test]
@@ -20285,6 +20445,7 @@ mod tests {
             &state.knowledge,
             &state.models.endpoints,
             &state.knowledge_index_jobs,
+            &state.audit_records,
         );
 
         let response = build_release_readiness_response(
@@ -21179,6 +21340,7 @@ mod tests {
             &settings,
             &default_model_endpoints(),
             &[],
+            &[],
         );
 
         assert!(!response.generated_at.is_empty());
@@ -21188,6 +21350,95 @@ mod tests {
             .evidence
             .iter()
             .any(|entry| entry.contains("embedding_model=jina")));
+        assert_eq!(
+            response.privacy_gateway.policy_version,
+            PRIVACY_GATEWAY_POLICY_VERSION
+        );
+        assert_eq!(
+            response.privacy_gateway.covered_routes,
+            vec!["retrieval.answer".to_string()]
+        );
+        assert_eq!(response.privacy_gateway.secret_scan, "clean");
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn rag_readiness_privacy_gateway_reports_metadata_only_audit_stats() {
+        let source_root = unique_store_path("harborbeacon-rag-source-privacy-gateway");
+        let index_root = unique_store_path("harborbeacon-rag-index-privacy-gateway");
+        fs::create_dir_all(&source_root).expect("create rag source root");
+        let settings = KnowledgeSettings {
+            source_roots: vec![KnowledgeSourceRoot {
+                root_id: "test-root".to_string(),
+                label: "Test root".to_string(),
+                path: source_root.to_string_lossy().into_owned(),
+                enabled: true,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                last_indexed_at: None,
+            }],
+            index_root: index_root.to_string_lossy().into_owned(),
+            privacy_level: PrivacyLevel::AllowRedactedCloud,
+            default_resource_profile: RagResourceProfile::CloudAllowed,
+            ..Default::default()
+        };
+        let audit = build_metadata_audit_record(
+            "home-1",
+            "privacy_transform",
+            "privacy-transform-abc123",
+            PRIVACY_GATEWAY_AUDIT_ACTION,
+            AuditActorKind::System,
+            "system",
+            json!({
+                "task_id": "task-1",
+                "trace_id": "trace-1",
+                "metadata_only": true,
+            }),
+            json!({
+                "decision": "allow_redacted_cloud",
+                "risk_level": "medium",
+                "privacy_transform_id": "privacy-transform-abc123",
+                "warnings": ["redacted cloud capsule used"],
+                "metadata_only": true,
+            }),
+        );
+
+        let response = build_rag_readiness_response(
+            &LocalModelRuntimeProjection {
+                ready: true,
+                backend_ready: true,
+                embedding_model: Some("jina".to_string()),
+                ..Default::default()
+            },
+            &settings,
+            &default_model_endpoints(),
+            &[],
+            &[audit],
+        );
+
+        assert_eq!(response.privacy_gateway.status, "ready");
+        assert_eq!(response.privacy_gateway.recent_audit_count, 1);
+        assert_eq!(
+            response
+                .privacy_gateway
+                .decision_counts
+                .get("allow_redacted_cloud"),
+            Some(&1)
+        );
+        assert_eq!(response.privacy_gateway.risk_counts.get("medium"), Some(&1));
+        assert_eq!(response.privacy_gateway.warning_count, 1);
+        assert_eq!(
+            response
+                .privacy_gateway
+                .latest_privacy_transform_id
+                .as_deref(),
+            Some("privacy-transform-abc123")
+        );
+        let text = serde_json::to_string(&response.privacy_gateway).expect("serialize gateway");
+        assert!(!text.contains("C:\\Users"));
+        assert!(!text.contains("source_path"));
+        assert!(!text.contains("https://"));
+
         let _ = fs::remove_dir_all(source_root);
     }
 
@@ -21218,6 +21469,7 @@ mod tests {
                 ..Default::default()
             },
             &settings,
+            &[],
             &[],
             &[],
         );
@@ -21275,6 +21527,7 @@ mod tests {
                 status: ModelEndpointStatus::Active,
                 metadata: json!({}),
             }],
+            &[],
             &[],
         );
 
@@ -21370,6 +21623,7 @@ mod tests {
                 endpoint(ModelKind::Vlm, "vlm-local", "cpu-vlm"),
                 endpoint(ModelKind::Ocr, "ocr-local", "tesseract"),
             ],
+            &[],
             &[],
         );
 

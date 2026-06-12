@@ -77,6 +77,55 @@ pub struct PrivacyGatewayEvaluation {
 
 pub struct PrivacyGateway;
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrivacyGatewayEvalCase {
+    pub case_id: String,
+    pub query: String,
+    pub privacy_level: PrivacyLevel,
+    #[serde(default)]
+    pub citations: Vec<KnowledgeSearchCitation>,
+    pub expected_decision: String,
+    #[serde(default)]
+    pub expected_information_types: Vec<String>,
+    #[serde(default)]
+    pub expected_risk_level: Option<String>,
+    #[serde(default)]
+    pub expected_capsule: Option<bool>,
+    #[serde(default)]
+    pub leak_markers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrivacyGatewayEvalCaseResult {
+    pub case_id: String,
+    pub passed: bool,
+    pub decision: String,
+    pub expected_decision: String,
+    pub risk_level: String,
+    pub source_leak_count: usize,
+    pub blocked_or_degraded: bool,
+    pub high_risk: bool,
+    #[serde(default)]
+    pub missing_information_types: Vec<String>,
+    #[serde(default)]
+    pub failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrivacyGatewayEvalReport {
+    pub kind: String,
+    pub policy_version: String,
+    pub total_cases: usize,
+    pub passed_cases: usize,
+    pub failed_cases: usize,
+    pub source_leak_count: usize,
+    pub blocked_or_degraded_count: usize,
+    pub high_risk_count: usize,
+    pub passed: bool,
+    #[serde(default)]
+    pub cases: Vec<PrivacyGatewayEvalCaseResult>,
+}
+
 impl PrivacyGateway {
     pub fn evaluate_rag_answer_cloud_context(
         query: &str,
@@ -213,6 +262,212 @@ impl PrivacyGateway {
             semantic_capsule: capsule,
             privacy_transform,
         }
+    }
+}
+
+pub fn privacy_gateway_eval_cases() -> Vec<PrivacyGatewayEvalCase> {
+    vec![
+        PrivacyGatewayEvalCase {
+            case_id: "strict_local_blocks_cloud".to_string(),
+            query: "summarize the family note".to_string(),
+            privacy_level: PrivacyLevel::StrictLocal,
+            citations: vec![eval_citation(
+                "family-note.md",
+                r"C:\Users\Bean\family-note.md",
+                "The family garden plan is ready.",
+                Some(r"C:\Users\Bean\family-note.md"),
+            )],
+            expected_decision: "blocked_or_degraded".to_string(),
+            expected_information_types: vec!["knowledge_context".to_string()],
+            expected_risk_level: Some("low".to_string()),
+            expected_capsule: Some(true),
+            leak_markers: vec![r"C:\Users\Bean".to_string(), "family-note.md".to_string()],
+        },
+        PrivacyGatewayEvalCase {
+            case_id: "redacted_cloud_generates_capsule".to_string(),
+            query: "what does the garden plan say".to_string(),
+            privacy_level: PrivacyLevel::AllowRedactedCloud,
+            citations: vec![eval_citation(
+                "garden-plan.md",
+                r"C:\Users\Bean\garden-plan.md",
+                "The garden plan is ready. Raw source C:\\Users\\Bean\\garden-plan.md https://example.test/private",
+                Some("https://example.test/private"),
+            )],
+            expected_decision: "allow_redacted_cloud".to_string(),
+            expected_information_types: vec!["knowledge_context".to_string()],
+            expected_risk_level: Some("low".to_string()),
+            expected_capsule: Some(true),
+            leak_markers: vec![
+                r"C:\Users\Bean".to_string(),
+                "garden-plan.md".to_string(),
+                "https://example.test/private".to_string(),
+            ],
+        },
+        PrivacyGatewayEvalCase {
+            case_id: "credential_blocks_redacted_cloud".to_string(),
+            query: "what is the garage api key".to_string(),
+            privacy_level: PrivacyLevel::AllowRedactedCloud,
+            citations: vec![eval_citation(
+                "garage-secret.md",
+                r"C:\Users\Bean\garage-secret.md",
+                "The garage integration api_key=secret-123 should never leave the home.",
+                Some(r"C:\Users\Bean\garage-secret.md"),
+            )],
+            expected_decision: "blocked_or_degraded".to_string(),
+            expected_information_types: vec!["credential".to_string(), "home_security".to_string()],
+            expected_risk_level: Some("high".to_string()),
+            expected_capsule: Some(true),
+            leak_markers: vec![
+                "api_key=secret-123".to_string(),
+                "secret-123".to_string(),
+                r"C:\Users\Bean".to_string(),
+                "garage-secret.md".to_string(),
+            ],
+        },
+        PrivacyGatewayEvalCase {
+            case_id: "child_health_home_security_risk_tags".to_string(),
+            query: "child health and camera status".to_string(),
+            privacy_level: PrivacyLevel::AllowRedactedCloud,
+            citations: vec![eval_citation(
+                "home-status.md",
+                r"C:\Users\Bean\home-status.md",
+                "Child location, health status, home camera, and front door status are in this note.",
+                Some(r"C:\Users\Bean\home-status.md"),
+            )],
+            expected_decision: "allow_redacted_cloud".to_string(),
+            expected_information_types: vec![
+                "child_location".to_string(),
+                "health_status".to_string(),
+                "home_security".to_string(),
+            ],
+            expected_risk_level: Some("medium".to_string()),
+            expected_capsule: Some(true),
+            leak_markers: vec![r"C:\Users\Bean".to_string(), "home-status.md".to_string()],
+        },
+        PrivacyGatewayEvalCase {
+            case_id: "allow_cloud_records_evidence_only".to_string(),
+            query: "summarize the device note".to_string(),
+            privacy_level: PrivacyLevel::AllowCloud,
+            citations: vec![eval_citation(
+                "device-note.md",
+                r"C:\Users\Bean\device-note.md",
+                "Harbor can answer from controlled cloud fallback.",
+                Some(r"C:\Users\Bean\device-note.md"),
+            )],
+            expected_decision: "allow_cloud".to_string(),
+            expected_information_types: vec!["knowledge_context".to_string()],
+            expected_risk_level: Some("low".to_string()),
+            expected_capsule: Some(true),
+            leak_markers: vec![r"C:\Users\Bean".to_string(), "device-note.md".to_string()],
+        },
+    ]
+}
+
+pub fn evaluate_privacy_gateway_cases(
+    cases: &[PrivacyGatewayEvalCase],
+) -> PrivacyGatewayEvalReport {
+    let mut results = Vec::new();
+    let mut source_leak_count = 0usize;
+    let mut blocked_or_degraded_count = 0usize;
+    let mut high_risk_count = 0usize;
+
+    for case in cases {
+        let evaluation = PrivacyGateway::evaluate_rag_answer_cloud_context(
+            &case.query,
+            &case.citations,
+            case.privacy_level,
+            "home-1",
+            &case.case_id,
+            "owner",
+        );
+        let evidence = evaluation.evidence_value(case.expected_capsule.unwrap_or(false));
+        let serialized_capsule =
+            serde_json::to_string(&evaluation.semantic_capsule).unwrap_or_else(|_| String::new());
+        let serialized_evidence =
+            serde_json::to_string(&evidence).unwrap_or_else(|_| String::new());
+        let mut failures = Vec::new();
+
+        if evaluation.decision.decision != case.expected_decision {
+            failures.push(format!(
+                "decision expected {} but got {}",
+                case.expected_decision, evaluation.decision.decision
+            ));
+        }
+        if let Some(expected_risk) = case.expected_risk_level.as_ref() {
+            if &evaluation.decision.risk_level != expected_risk {
+                failures.push(format!(
+                    "risk_level expected {expected_risk} but got {}",
+                    evaluation.decision.risk_level
+                ));
+            }
+        }
+        if let Some(expect_capsule) = case.expected_capsule {
+            if evaluation.semantic_capsule.is_some() != expect_capsule {
+                failures.push(format!(
+                    "semantic_capsule expected {expect_capsule} but got {}",
+                    evaluation.semantic_capsule.is_some()
+                ));
+            }
+        }
+        let missing_information_types = case
+            .expected_information_types
+            .iter()
+            .filter(|expected| !evaluation.flow.information_types.contains(*expected))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_information_types.is_empty() {
+            failures.push(format!(
+                "missing information_types: {}",
+                missing_information_types.join(",")
+            ));
+        }
+        let leaks = case
+            .leak_markers
+            .iter()
+            .filter(|marker| {
+                !marker.trim().is_empty()
+                    && (serialized_capsule.contains(marker.as_str())
+                        || serialized_evidence.contains(marker.as_str()))
+            })
+            .count();
+        if leaks > 0 {
+            failures.push(format!("{leaks} source leak marker(s) found"));
+        }
+
+        let blocked_or_degraded = evaluation.decision.decision == "blocked_or_degraded";
+        let high_risk = evaluation.decision.risk_level == "high";
+        source_leak_count += leaks;
+        blocked_or_degraded_count += usize::from(blocked_or_degraded);
+        high_risk_count += usize::from(high_risk);
+
+        results.push(PrivacyGatewayEvalCaseResult {
+            case_id: case.case_id.clone(),
+            passed: failures.is_empty(),
+            decision: evaluation.decision.decision,
+            expected_decision: case.expected_decision.clone(),
+            risk_level: evaluation.decision.risk_level,
+            source_leak_count: leaks,
+            blocked_or_degraded,
+            high_risk,
+            missing_information_types,
+            failures,
+        });
+    }
+
+    let passed_cases = results.iter().filter(|case| case.passed).count();
+    let total_cases = results.len();
+    let failed_cases = total_cases.saturating_sub(passed_cases);
+    PrivacyGatewayEvalReport {
+        kind: "privacy_gateway_eval_report".to_string(),
+        policy_version: PRIVACY_GATEWAY_POLICY_VERSION.to_string(),
+        total_cases,
+        passed_cases,
+        failed_cases,
+        source_leak_count,
+        blocked_or_degraded_count,
+        high_risk_count,
+        passed: failed_cases == 0 && source_leak_count == 0,
+        cases: results,
     }
 }
 
@@ -512,6 +767,30 @@ fn now_unix_string() -> String {
         .to_string()
 }
 
+fn eval_citation(
+    title: &str,
+    path: &str,
+    preview: &str,
+    source_path: Option<&str>,
+) -> KnowledgeSearchCitation {
+    KnowledgeSearchCitation {
+        title: title.to_string(),
+        path: path.to_string(),
+        modality: "document".to_string(),
+        chunk_id: Some("chunk-1".to_string()),
+        line_start: Some(1),
+        line_end: Some(1),
+        matched_terms: Vec::new(),
+        preview: Some(preview.to_string()),
+        score: 100,
+        lexical_score: None,
+        embedding_score: None,
+        hybrid_score: None,
+        provenance: Some("document".to_string()),
+        source_path: source_path.map(ToString::to_string),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,5 +906,17 @@ mod tests {
         assert!(prompt.contains("[1]"));
         assert!(!prompt.contains("family-note.md"));
         assert!(!prompt.contains("C:\\Users"));
+    }
+
+    #[test]
+    fn privacy_gateway_eval_pack_passes_without_source_leaks() {
+        let report = evaluate_privacy_gateway_cases(&privacy_gateway_eval_cases());
+
+        assert!(report.passed, "{report:#?}");
+        assert_eq!(report.failed_cases, 0);
+        assert_eq!(report.source_leak_count, 0);
+        assert!(report.blocked_or_degraded_count >= 2);
+        assert!(report.high_risk_count >= 1);
+        assert_eq!(report.policy_version, PRIVACY_GATEWAY_POLICY_VERSION);
     }
 }
