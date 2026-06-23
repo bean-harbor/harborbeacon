@@ -314,6 +314,16 @@ impl KnowledgeIndexService {
             .join(format!("{}.embeddings.json", root_storage_key(root)))
     }
 
+    pub fn embedding_warmup_candidate_count(&self, snapshot: &KnowledgeIndexSnapshot) -> usize {
+        snapshot
+            .manifest
+            .entries
+            .iter()
+            .flat_map(embedding_chunks_for_entry)
+            .filter(|chunk| !chunk.text.trim().is_empty())
+            .count()
+    }
+
     pub fn warm_embedding_cache(
         &self,
         snapshot: &KnowledgeIndexSnapshot,

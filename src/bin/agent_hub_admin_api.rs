@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -110,8 +110,8 @@ use harborbeacon_local_agent::runtime::knowledge::{
     KnowledgeSearchRequest, KnowledgeSearchService,
 };
 use harborbeacon_local_agent::runtime::knowledge_index::{
-    load_embedding_store, KnowledgeIndexConfig, KnowledgeIndexManifest, KnowledgeIndexService,
-    KnowledgeModality,
+    load_embedding_store, KnowledgeEmbeddingWarmupStats, KnowledgeIndexConfig,
+    KnowledgeIndexManifest, KnowledgeIndexService, KnowledgeIndexSnapshot, KnowledgeModality,
 };
 use harborbeacon_local_agent::runtime::media::{SnapshotCaptureRequest, SnapshotFormat};
 use harborbeacon_local_agent::runtime::media_tools::{ffmpeg_resolution_hint, resolve_ffmpeg_bin};
@@ -138,6 +138,9 @@ use harborbeacon_local_agent::runtime::vision_event::{
 };
 
 const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
+const KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS_ENV: &str =
+    "HARBORBEACON_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS";
+const DEFAULT_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS: u64 = 120_000;
 const HOME_GUARDIAN_EVALUATION_QUEUE_CAPACITY: usize = 128;
 const HOME_GUARDIAN_AUTO_EVALUATION_MIN_INTERVAL_SECONDS: u64 = 60;
 const PRIVACY_GATEWAY_AUDIT_ACTION: &str = "privacy_gateway.rag_answer.evaluate";
@@ -10494,6 +10497,79 @@ fn run_knowledge_index_jobs(
     }
 }
 
+fn knowledge_embedding_warmup_timeout() -> Duration {
+    env::var(KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_KNOWLEDGE_EMBEDDING_WARMUP_TIMEOUT_MS))
+}
+
+fn embedding_warmup_timeout_stats(
+    total: usize,
+    timeout: Duration,
+) -> KnowledgeEmbeddingWarmupStats {
+    KnowledgeEmbeddingWarmupStats {
+        total,
+        completed: 0,
+        skipped: 0,
+        failed: total,
+        degraded: true,
+        persist_error: None,
+        last_error: Some(format!(
+            "Embedding warmup exceeded {} ms; index completed with degraded embedding cache.",
+            timeout.as_millis()
+        )),
+    }
+}
+
+fn run_knowledge_embedding_warmup_with_timeout(
+    service: &KnowledgeIndexService,
+    snapshot: &KnowledgeIndexSnapshot,
+    model_center_state: &AdminModelCenterState,
+) -> KnowledgeEmbeddingWarmupStats {
+    let timeout = knowledge_embedding_warmup_timeout();
+    let total = service.embedding_warmup_candidate_count(snapshot);
+    let (sender, receiver) = sync_channel(1);
+    let worker_service = service.clone();
+    let worker_snapshot = snapshot.clone();
+    let worker_model_center_state = model_center_state.clone();
+
+    if let Err(error) = thread::Builder::new()
+        .name("harborbeacon-knowledge-embedding-warmup".to_string())
+        .spawn(move || {
+            let stats =
+                worker_service.warm_embedding_cache(&worker_snapshot, &worker_model_center_state);
+            let _ = sender.try_send(stats);
+        })
+    {
+        return KnowledgeEmbeddingWarmupStats {
+            total,
+            completed: 0,
+            skipped: 0,
+            failed: total,
+            degraded: true,
+            persist_error: None,
+            last_error: Some(format!("failed to spawn embedding warmup worker: {error}")),
+        };
+    }
+
+    match receiver.recv_timeout(timeout) {
+        Ok(stats) => stats,
+        Err(RecvTimeoutError::Timeout) => embedding_warmup_timeout_stats(total, timeout),
+        Err(RecvTimeoutError::Disconnected) => KnowledgeEmbeddingWarmupStats {
+            total,
+            completed: 0,
+            skipped: 0,
+            failed: total,
+            degraded: true,
+            persist_error: None,
+            last_error: Some("Embedding warmup worker exited without returning stats.".to_string()),
+        },
+    }
+}
+
 fn run_knowledge_index_job(
     store: &AdminConsoleStore,
     service: &KnowledgeIndexService,
@@ -10548,7 +10624,11 @@ fn run_knowledge_index_job(
                 return;
             }
             let model_center_state = load_model_center_state();
-            let embedding_warmup = service.warm_embedding_cache(&snapshot, &model_center_state);
+            let embedding_warmup = run_knowledge_embedding_warmup_with_timeout(
+                service,
+                &snapshot,
+                &model_center_state,
+            );
             if knowledge_index_job_cancel_requested(store, &job.job_id) {
                 cancel_knowledge_index_job(store, job, "canceled_after_embedding_warmup");
                 return;
@@ -10573,6 +10653,8 @@ fn run_knowledge_index_job(
                 "embedding_skipped": embedding_warmup.skipped,
                 "embedding_failed": embedding_warmup.failed,
                 "embedding_warmup_degraded": embedding_warmup.degraded,
+                "embedding_warmup_timeout_ms": knowledge_embedding_warmup_timeout().as_millis()
+                    as u64,
                 "embedding_persist_error": embedding_warmup.persist_error,
                 "embedding_last_error": embedding_warmup.last_error,
             });
@@ -18459,8 +18541,9 @@ mod tests {
         build_redacted_diagnostics_bundle, build_release_readiness_response,
         build_rtsp_url_from_patch, camera_stream_url_with_credentials, current_epoch_secs,
         default_model_download_target_path, default_model_download_target_path_in_root,
-        default_model_endpoints, ensure_local_admin_access, ensure_local_camera_access,
-        harbor_assistant_build_missing_response, hardware_class_for_probe, has_forwarding_headers,
+        default_model_endpoints, embedding_warmup_timeout_stats, ensure_local_admin_access,
+        ensure_local_camera_access, harbor_assistant_build_missing_response,
+        hardware_class_for_probe, has_forwarding_headers,
         huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
         identity_query_suffix, is_admin_surface_path, is_harbor_assistant_client_route,
         is_harbor_assistant_surface_path, is_safe_live_asset_name,
@@ -18544,7 +18627,7 @@ mod tests {
     use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn hf_endpoint_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -21968,6 +22051,23 @@ mod tests {
     }
 
     #[test]
+    fn embedding_warmup_timeout_stats_complete_job_as_degraded() {
+        let stats = embedding_warmup_timeout_stats(2, Duration::from_millis(25));
+
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.completed, 0);
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.failed, 2);
+        assert!(stats.degraded);
+        assert!(stats.persist_error.is_none());
+        assert!(stats
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("exceeded 25 ms"));
+    }
+
+    #[test]
     fn knowledge_index_worker_completes_job_and_updates_source_root() {
         let admin_path = unique_store_path("harborbeacon-knowledge-index-worker-admin");
         let registry_path = unique_store_path("harborbeacon-knowledge-index-worker-registry");
@@ -22023,6 +22123,7 @@ mod tests {
         assert!(jobs[0].checkpoint["embedding_skipped"].is_number());
         assert!(jobs[0].checkpoint["embedding_failed"].is_number());
         assert!(jobs[0].checkpoint["embedding_warmup_degraded"].is_boolean());
+        assert!(jobs[0].checkpoint["embedding_warmup_timeout_ms"].is_number());
         let updated_settings = store.knowledge_settings().expect("load settings");
         assert!(updated_settings.source_roots[0].last_indexed_at.is_some());
         assert!(index_root
