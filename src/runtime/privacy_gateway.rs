@@ -786,6 +786,7 @@ fn eval_citation(
         lexical_score: None,
         embedding_score: None,
         hybrid_score: None,
+        rerank_score: None,
         provenance: Some("document".to_string()),
         source_path: source_path.map(ToString::to_string),
     }
@@ -812,6 +813,7 @@ mod tests {
             lexical_score: None,
             embedding_score: None,
             hybrid_score: None,
+            rerank_score: None,
             provenance: None,
             source_path: Some("https://example.test/private/source".to_string()),
         }

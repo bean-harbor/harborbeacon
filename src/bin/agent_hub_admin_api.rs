@@ -116,8 +116,9 @@ use harborbeacon_local_agent::runtime::knowledge_index::{
 use harborbeacon_local_agent::runtime::media::{SnapshotCaptureRequest, SnapshotFormat};
 use harborbeacon_local_agent::runtime::media_tools::{ffmpeg_resolution_hint, resolve_ffmpeg_bin};
 use harborbeacon_local_agent::runtime::model_center::{
-    redact_model_endpoint, run_vlm_summary_with_state, test_model_endpoint, vlm_endpoint_readiness,
-    vlm_execution_runtime_snapshot, ModelEndpointTestResult, ADMIN_STATE_PATH_ENV,
+    load_model_center_state, redact_model_endpoint, run_vlm_summary_with_state,
+    test_model_endpoint, vlm_endpoint_readiness, vlm_execution_runtime_snapshot,
+    ModelEndpointTestResult, ADMIN_STATE_PATH_ENV,
 };
 use harborbeacon_local_agent::runtime::privacy_gateway::PRIVACY_GATEWAY_POLICY_VERSION;
 use harborbeacon_local_agent::runtime::registry::{
@@ -1241,7 +1242,7 @@ impl KnowledgeSearchApiRequest {
     }
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 struct KnowledgeIndexStatusResponse {
     generated_at: String,
     status: String,
@@ -10536,6 +10537,22 @@ fn run_knowledge_index_job(
                 cancel_knowledge_index_job(store, job, "canceled_after_refresh");
                 return;
             }
+            job.progress_percent = Some(85);
+            job.checkpoint = json!({
+                "phase": "embedding_warmup",
+                "entry_count": snapshot.manifest.entries.len(),
+                "manifest_path": snapshot.manifest_path.to_string_lossy(),
+            });
+            if let Err(error) = store.save_knowledge_index_job(job.clone()) {
+                fail_knowledge_index_job(store, job, "job_state_write_failed", error);
+                return;
+            }
+            let model_center_state = load_model_center_state();
+            let embedding_warmup = service.warm_embedding_cache(&snapshot, &model_center_state);
+            if knowledge_index_job_cancel_requested(store, &job.job_id) {
+                cancel_knowledge_index_job(store, job, "canceled_after_embedding_warmup");
+                return;
+            }
             let indexed_at = snapshot.manifest.generated_at.clone();
             let _ = mark_knowledge_source_root_indexed(
                 store,
@@ -10551,6 +10568,13 @@ fn run_knowledge_index_job(
                 "phase": "completed",
                 "entry_count": snapshot.manifest.entries.len(),
                 "manifest_path": snapshot.manifest_path.to_string_lossy(),
+                "embedding_total": embedding_warmup.total,
+                "embedding_completed": embedding_warmup.completed,
+                "embedding_skipped": embedding_warmup.skipped,
+                "embedding_failed": embedding_warmup.failed,
+                "embedding_warmup_degraded": embedding_warmup.degraded,
+                "embedding_persist_error": embedding_warmup.persist_error,
+                "embedding_last_error": embedding_warmup.last_error,
             });
             let _ = store.save_knowledge_index_job(job);
         }
@@ -10829,6 +10853,7 @@ fn build_admin_knowledge_search_request(
     request.limit = payload.limit.unwrap_or(24).clamp(1, 50);
     request.privacy_level = settings.privacy_level;
     request.resource_profile = settings.default_resource_profile;
+    request.retrieval = settings.retrieval.clone();
     request.require_embeddings = false;
     request.latency_budget_ms = None;
     request.focus_paths = focus_paths;
@@ -14413,6 +14438,7 @@ fn preferred_endpoint_id_for_model_kind(kind: ModelKind) -> &'static str {
         ModelKind::Asr => "asr-local",
         ModelKind::Detector => "detector-local",
         ModelKind::Embedder => "embed-local-openai-compatible",
+        ModelKind::Reranker => "rerank-local-compatible",
     }
 }
 
@@ -21992,6 +22018,11 @@ mod tests {
         assert_eq!(jobs[0].status, "completed");
         assert_eq!(jobs[0].progress_percent, Some(100));
         assert_eq!(jobs[0].checkpoint["phase"], "completed");
+        assert_eq!(jobs[0].checkpoint["embedding_total"], 1);
+        assert!(jobs[0].checkpoint["embedding_completed"].is_number());
+        assert!(jobs[0].checkpoint["embedding_skipped"].is_number());
+        assert!(jobs[0].checkpoint["embedding_failed"].is_number());
+        assert!(jobs[0].checkpoint["embedding_warmup_degraded"].is_boolean());
         let updated_settings = store.knowledge_settings().expect("load settings");
         assert!(updated_settings.source_roots[0].last_indexed_at.is_some());
         assert!(index_root

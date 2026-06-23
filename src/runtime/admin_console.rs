@@ -250,7 +250,94 @@ pub struct KnowledgeSourceRoot {
     pub last_indexed_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgeRetrievalSettings {
+    #[serde(default = "default_retrieval_fusion_strategy")]
+    pub fusion_strategy: String,
+    #[serde(default = "default_retrieval_rrf_k")]
+    pub rrf_k: f32,
+    #[serde(default = "default_retrieval_lexical_weight")]
+    pub lexical_weight: f32,
+    #[serde(default = "default_retrieval_vector_weight")]
+    pub vector_weight: f32,
+    #[serde(default = "default_retrieval_candidate_limit")]
+    pub candidate_limit: usize,
+    #[serde(default = "default_retrieval_vector_min_score")]
+    pub vector_min_score: f32,
+    #[serde(default = "default_retrieval_semantic_only_min_score")]
+    pub semantic_only_min_score: f32,
+    #[serde(default = "default_true")]
+    pub rerank_enabled: bool,
+    #[serde(default = "default_retrieval_rerank_top_k")]
+    pub rerank_top_k: usize,
+    #[serde(default = "default_retrieval_rerank_min_score")]
+    pub rerank_min_score: f32,
+    #[serde(default = "default_true")]
+    pub mmr_enabled: bool,
+    #[serde(default = "default_retrieval_mmr_lambda")]
+    pub mmr_lambda: f32,
+}
+
+impl Default for KnowledgeRetrievalSettings {
+    fn default() -> Self {
+        Self {
+            fusion_strategy: default_retrieval_fusion_strategy(),
+            rrf_k: default_retrieval_rrf_k(),
+            lexical_weight: default_retrieval_lexical_weight(),
+            vector_weight: default_retrieval_vector_weight(),
+            candidate_limit: default_retrieval_candidate_limit(),
+            vector_min_score: default_retrieval_vector_min_score(),
+            semantic_only_min_score: default_retrieval_semantic_only_min_score(),
+            rerank_enabled: true,
+            rerank_top_k: default_retrieval_rerank_top_k(),
+            rerank_min_score: default_retrieval_rerank_min_score(),
+            mmr_enabled: true,
+            mmr_lambda: default_retrieval_mmr_lambda(),
+        }
+    }
+}
+
+fn default_retrieval_fusion_strategy() -> String {
+    "rrf".to_string()
+}
+
+fn default_retrieval_rrf_k() -> f32 {
+    60.0
+}
+
+fn default_retrieval_lexical_weight() -> f32 {
+    0.35
+}
+
+fn default_retrieval_vector_weight() -> f32 {
+    0.65
+}
+
+fn default_retrieval_candidate_limit() -> usize {
+    80
+}
+
+fn default_retrieval_vector_min_score() -> f32 {
+    0.25
+}
+
+fn default_retrieval_semantic_only_min_score() -> f32 {
+    0.55
+}
+
+fn default_retrieval_rerank_top_k() -> usize {
+    30
+}
+
+fn default_retrieval_rerank_min_score() -> f32 {
+    0.15
+}
+
+fn default_retrieval_mmr_lambda() -> f32 {
+    0.70
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KnowledgeSettings {
     #[serde(default)]
     pub source_roots: Vec<KnowledgeSourceRoot>,
@@ -260,6 +347,8 @@ pub struct KnowledgeSettings {
     pub privacy_level: PrivacyLevel,
     #[serde(default)]
     pub default_resource_profile: RagResourceProfile,
+    #[serde(default)]
+    pub retrieval: KnowledgeRetrievalSettings,
 }
 
 impl Default for KnowledgeSettings {
@@ -269,6 +358,7 @@ impl Default for KnowledgeSettings {
             index_root: default_knowledge_index_root(),
             privacy_level: PrivacyLevel::StrictLocal,
             default_resource_profile: RagResourceProfile::CpuOnly,
+            retrieval: KnowledgeRetrievalSettings::default(),
         }
     }
 }
@@ -745,6 +835,7 @@ const DEFAULT_RECORDING_POLICY_ID: &str = "recording-policy-default";
 const DEFAULT_MODEL_WORKSPACE_ID: &str = "home-1";
 const DEFAULT_POLICY_RETRIEVAL_OCR: &str = "retrieval.ocr";
 const DEFAULT_POLICY_RETRIEVAL_EMBED: &str = "retrieval.embed";
+const DEFAULT_POLICY_RETRIEVAL_RERANK: &str = "retrieval.rerank";
 const DEFAULT_POLICY_RETRIEVAL_ANSWER: &str = "retrieval.answer";
 const DEFAULT_POLICY_RETRIEVAL_VISION_SUMMARY: &str = "retrieval.vision_summary";
 const DEFAULT_POLICY_SEMANTIC_ROUTER: &str = "semantic.router";
@@ -2206,6 +2297,45 @@ pub fn sanitize_knowledge_settings(settings: KnowledgeSettings) -> KnowledgeSett
             .unwrap_or_else(default_knowledge_index_root),
         privacy_level: settings.privacy_level,
         default_resource_profile: settings.default_resource_profile,
+        retrieval: sanitize_knowledge_retrieval_settings(settings.retrieval),
+    }
+}
+
+fn sanitize_knowledge_retrieval_settings(
+    mut settings: KnowledgeRetrievalSettings,
+) -> KnowledgeRetrievalSettings {
+    if !settings.fusion_strategy.eq_ignore_ascii_case("rrf") {
+        settings.fusion_strategy = default_retrieval_fusion_strategy();
+    } else {
+        settings.fusion_strategy = "rrf".to_string();
+    }
+    settings.rrf_k = sanitize_unit_or_positive_f32(settings.rrf_k, 1.0, 1000.0, 60.0);
+    settings.lexical_weight =
+        sanitize_unit_or_positive_f32(settings.lexical_weight, 0.0, 1.0, 0.35);
+    settings.vector_weight = sanitize_unit_or_positive_f32(settings.vector_weight, 0.0, 1.0, 0.65);
+    if settings.lexical_weight <= f32::EPSILON && settings.vector_weight <= f32::EPSILON {
+        settings.lexical_weight = 0.35;
+        settings.vector_weight = 0.65;
+    }
+    settings.candidate_limit = settings.candidate_limit.clamp(1, 500);
+    settings.vector_min_score =
+        sanitize_unit_or_positive_f32(settings.vector_min_score, 0.0, 1.0, 0.25);
+    settings.semantic_only_min_score =
+        sanitize_unit_or_positive_f32(settings.semantic_only_min_score, 0.0, 1.0, 0.55);
+    settings.rerank_top_k = settings
+        .rerank_top_k
+        .clamp(1, settings.candidate_limit.max(1));
+    settings.rerank_min_score =
+        sanitize_unit_or_positive_f32(settings.rerank_min_score, 0.0, 1.0, 0.15);
+    settings.mmr_lambda = sanitize_unit_or_positive_f32(settings.mmr_lambda, 0.0, 1.0, 0.70);
+    settings
+}
+
+fn sanitize_unit_or_positive_f32(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
     }
 }
 
@@ -3372,6 +3502,27 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
             }),
         },
         ModelEndpoint {
+            model_endpoint_id: "rerank-local-compatible".to_string(),
+            workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Reranker,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "rerank_compatible".to_string(),
+            model_name: "local-reranker".to_string(),
+            capability_tags: vec!["local_first".to_string(), "rerank".to_string()],
+            cost_policy: json!({"cost_hint": "local_or_sidecar"}),
+            status: ModelEndpointStatus::Disabled,
+            metadata: json!({
+                "builtin": true,
+                "base_url": local_base_url.clone(),
+                "healthz_url": local_healthz_url.clone(),
+                "api_key": local_api_key.clone(),
+                "api_key_configured": true,
+                "rerank_path": "/rerank",
+                "cloud_fallback_allowed": false,
+            }),
+        },
+        ModelEndpoint {
             model_endpoint_id: "llm-local-openai-compatible".to_string(),
             workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
             provider_account_id: None,
@@ -3515,6 +3666,22 @@ pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {
             ],
             status: "active".to_string(),
             metadata: json!({"capability": "embed"}),
+        },
+        ModelRoutePolicy {
+            route_policy_id: DEFAULT_POLICY_RETRIEVAL_RERANK.to_string(),
+            workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
+            domain_scope: "retrieval".to_string(),
+            modality: "text".to_string(),
+            privacy_level: PrivacyLevel::StrictLocal,
+            local_preferred: true,
+            max_cost_per_run: None,
+            fallback_order: vec!["local".to_string(), "sidecar".to_string()],
+            status: "active".to_string(),
+            metadata: json!({
+                "capability": "rerank",
+                "local_only": true,
+                "cloud_fallback_allowed": false,
+            }),
         },
         ModelRoutePolicy {
             route_policy_id: DEFAULT_POLICY_SEMANTIC_ROUTER.to_string(),
@@ -5613,11 +5780,11 @@ mod tests {
         default_model_store_root, default_rtsp_paths, derive_rtsp_hints, device_rtsp_credential_id,
         normalize_binding_code, normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path,
         resolved_identity_binding_records, resolved_remote_view_config,
-        sanitize_bridge_provider_config, sanitize_defaults, sanitize_model_center_state,
-        sync_platform_from_legacy, user_default_delivery_surface, user_recent_interactive_surface,
-        AdminConsoleState, AdminConsoleStore, AdminDefaults, AdminModelCenterState,
-        AutomationRuleReview, BridgeProviderCapabilities, BridgeProviderConfig,
-        DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings,
+        sanitize_bridge_provider_config, sanitize_defaults, sanitize_knowledge_settings,
+        sanitize_model_center_state, sync_platform_from_legacy, user_default_delivery_surface,
+        user_recent_interactive_surface, AdminConsoleState, AdminConsoleStore, AdminDefaults,
+        AdminModelCenterState, AutomationRuleReview, BridgeProviderCapabilities,
+        BridgeProviderConfig, DeviceCredentialSecret, DeviceEvidenceRecord, DvrRecordingSettings,
         HomeAssistantConfigUpdate, IdentityBindingRecord, KnowledgeSettings, KnowledgeSourceRoot,
         RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID,
         LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
@@ -5629,6 +5796,49 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("harborbeacon-{name}-{unique}.json"))
+    }
+
+    #[test]
+    fn old_knowledge_settings_json_defaults_retrieval_config() {
+        let settings = serde_json::from_value::<KnowledgeSettings>(json!({
+            "source_roots": [],
+            "index_root": ".harborbeacon/knowledge-index",
+            "privacy_level": "strict_local",
+            "default_resource_profile": "cpu_only"
+        }))
+        .expect("old knowledge settings json");
+        let settings = sanitize_knowledge_settings(settings);
+
+        assert_eq!(settings.retrieval.fusion_strategy, "rrf");
+        assert_eq!(settings.retrieval.candidate_limit, 80);
+        assert!(settings.retrieval.rerank_enabled);
+        assert!(settings.retrieval.mmr_enabled);
+    }
+
+    #[test]
+    fn default_rerank_policy_is_strict_local_without_cloud_fallback() {
+        let endpoint = default_model_endpoints()
+            .into_iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "rerank-local-compatible")
+            .expect("default rerank endpoint");
+        assert_eq!(endpoint.model_kind, ModelKind::Reranker);
+        assert_eq!(endpoint.endpoint_kind, ModelEndpointKind::Local);
+        assert_eq!(endpoint.provider_key, "rerank_compatible");
+        assert_eq!(endpoint.status, ModelEndpointStatus::Disabled);
+
+        let policy = default_model_route_policies()
+            .into_iter()
+            .find(|policy| policy.route_policy_id == "retrieval.rerank")
+            .expect("default rerank policy");
+        assert_eq!(policy.privacy_level, PrivacyLevel::StrictLocal);
+        assert_eq!(
+            policy.fallback_order,
+            vec!["local".to_string(), "sidecar".to_string()]
+        );
+        assert!(!policy
+            .fallback_order
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case("cloud")));
     }
 
     #[test]

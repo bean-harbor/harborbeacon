@@ -3319,6 +3319,7 @@ impl TaskApiService {
             limit: knowledge_result_limit(request),
             privacy_level,
             resource_profile,
+            retrieval: knowledge_settings.retrieval.clone(),
             require_embeddings: knowledge_require_embeddings(request),
             latency_budget_ms: knowledge_latency_budget_ms(request),
         };
@@ -3483,6 +3484,7 @@ impl TaskApiService {
             limit: knowledge_result_limit(request),
             privacy_level,
             resource_profile,
+            retrieval: knowledge_settings.retrieval.clone(),
             require_embeddings: knowledge_require_embeddings(request),
             latency_budget_ms: knowledge_latency_budget_ms(request),
         };
@@ -3688,7 +3690,7 @@ impl TaskApiService {
             }
         }
 
-        let degraded = search_result.degraded || !warnings.is_empty() || degraded_reason.is_some();
+        let degraded = search_result.degraded || degraded_reason.is_some();
         let status = if degraded { "degraded" } else { "completed" };
         let reason = degraded_reason.as_deref().unwrap_or("none");
         let privacy_gateway = privacy_gateway_evaluation.evidence_value(capsule_prompt_used);
@@ -6105,6 +6107,10 @@ fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<T
                         "matched_terms": hit.matched_terms.clone(),
                         "preview": hit.snippet.clone(),
                         "score": hit.score,
+                        "lexical_score": hit.lexical_score,
+                        "embedding_score": hit.embedding_score,
+                        "hybrid_score": hit.hybrid_score,
+                        "rerank_score": hit.rerank_score,
                         "provenance": hit.provenance.clone(),
                         "match_source": knowledge_hit_match_source(hit),
                         "segment_locator": video_segment_locator(hit),
@@ -10109,6 +10115,7 @@ mod tests {
                 lexical_score: Some(0.82),
                 embedding_score: None,
                 hybrid_score: Some(0.82),
+                rerank_score: None,
                 chunk_id: Some("chunk-0001".to_string()),
                 line_start: Some(1),
                 line_end: Some(1),
@@ -10176,6 +10183,7 @@ mod tests {
                 lexical_score: Some(0.76),
                 embedding_score: None,
                 hybrid_score: Some(0.76),
+                rerank_score: None,
                 chunk_id: Some("chunk-0001".to_string()),
                 line_start: Some(1),
                 line_end: Some(1),
@@ -10254,6 +10262,7 @@ mod tests {
                 lexical_score: Some(0.76),
                 embedding_score: None,
                 hybrid_score: Some(0.76),
+                rerank_score: None,
                 chunk_id: Some("chunk-0001".to_string()),
                 line_start: Some(1),
                 line_end: Some(1),
@@ -10354,6 +10363,7 @@ mod tests {
                 index_root: index_root.to_string_lossy().into_owned(),
                 privacy_level,
                 default_resource_profile,
+                retrieval: Default::default(),
             })
             .expect("save knowledge settings");
         KnowledgeIndexService::from_config(

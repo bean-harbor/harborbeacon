@@ -17,7 +17,8 @@ use serde_json::{json, Value};
 
 use crate::connectors::ai_provider::{
     EmbeddingRequest, OpenAiCompatibleConfig, OpenAiCompatibleEmbeddingClient,
-    OpenAiCompatibleTextClient, OpenAiCompatibleVisionClient, TextCompletionRequest,
+    OpenAiCompatibleTextClient, OpenAiCompatibleVisionClient, RerankCompatibleClient,
+    RerankCompatibleConfig, RerankRequest, RerankScore, TextCompletionRequest,
     VisionSummaryRequest,
 };
 use crate::control_plane::models::{
@@ -32,6 +33,7 @@ pub const OCR_TESSERACT_PATH_ENV: &str = "HARBOR_OCR_TESSERACT_PATH";
 pub const OCR_TESSERACT_LANGS_ENV: &str = "HARBOR_OCR_LANGS";
 const OCR_POLICY_ID: &str = "retrieval.ocr";
 const EMBED_POLICY_ID: &str = "retrieval.embed";
+pub const RERANK_POLICY_ID: &str = "retrieval.rerank";
 const LLM_POLICY_ID: &str = "retrieval.answer";
 const SEMANTIC_ROUTER_POLICY_ID: &str = "semantic.router";
 const VLM_POLICY_ID: &str = "retrieval.vision_summary";
@@ -140,6 +142,32 @@ pub struct EmbeddingExecution {
     pub vector: Vec<f32>,
     #[serde(default)]
     pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RerankExecution {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub provider_key: String,
+    #[serde(default)]
+    pub model_endpoint_id: Option<String>,
+    #[serde(default)]
+    pub model_name: Option<String>,
+    #[serde(default)]
+    pub scores: Vec<RerankDocumentScore>,
+    #[serde(default)]
+    pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RerankDocumentScore {
+    pub index: usize,
+    pub score: f32,
 }
 
 pub fn default_admin_state_path() -> PathBuf {
@@ -656,6 +684,209 @@ pub fn run_llm_text(prompt: &str) -> LlmTextExecution {
 pub fn run_embedding(text: &str) -> EmbeddingExecution {
     let state = load_model_center_state();
     run_embedding_with_state(text, &state)
+}
+
+pub fn run_rerank(query: &str, documents: &[String], top_n: usize) -> RerankExecution {
+    let state = load_model_center_state();
+    run_rerank_with_state(query, documents, top_n, &state)
+}
+
+pub fn run_rerank_with_state(
+    query: &str,
+    documents: &[String],
+    top_n: usize,
+    state: &AdminModelCenterState,
+) -> RerankExecution {
+    let query = query.trim();
+    if query.is_empty() {
+        return RerankExecution {
+            available: false,
+            status: "disabled".to_string(),
+            summary: "Rerank query is empty.".to_string(),
+            provider_key: String::new(),
+            model_endpoint_id: None,
+            model_name: None,
+            scores: Vec::new(),
+            details: json!({}),
+        };
+    }
+    let documents = documents
+        .iter()
+        .map(|document| document.trim().to_string())
+        .filter(|document| !document.is_empty())
+        .collect::<Vec<_>>();
+    if documents.is_empty() {
+        return RerankExecution {
+            available: false,
+            status: "disabled".to_string(),
+            summary: "Rerank documents are empty.".to_string(),
+            provider_key: String::new(),
+            model_endpoint_id: None,
+            model_name: None,
+            scores: Vec::new(),
+            details: json!({}),
+        };
+    }
+
+    let Some(endpoint) = resolve_endpoint(state, ModelKind::Reranker, RERANK_POLICY_ID) else {
+        return RerankExecution {
+            available: false,
+            status: "disabled".to_string(),
+            summary: "No local rerank endpoint is enabled.".to_string(),
+            provider_key: String::new(),
+            model_endpoint_id: None,
+            model_name: None,
+            scores: Vec::new(),
+            details: json!({
+                "route_policy_id": RERANK_POLICY_ID,
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    };
+
+    if endpoint.endpoint_kind == ModelEndpointKind::Cloud {
+        return RerankExecution {
+            available: false,
+            status: "blocked".to_string(),
+            summary: "Cloud reranker endpoints are not allowed for retrieval.rerank.".to_string(),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            scores: Vec::new(),
+            details: json!({
+                "route_policy_id": RERANK_POLICY_ID,
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    }
+
+    if let Some(scores) = mock_rerank_scores_from_endpoint(&endpoint, documents.len()) {
+        return RerankExecution {
+            available: !scores.is_empty(),
+            status: "active".to_string(),
+            summary: "Mock rerank endpoint resolved.".to_string(),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            scores,
+            details: json!({
+                "route_policy_id": RERANK_POLICY_ID,
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    }
+
+    if !endpoint
+        .provider_key
+        .eq_ignore_ascii_case("rerank_compatible")
+    {
+        return RerankExecution {
+            available: false,
+            status: "degraded".to_string(),
+            summary: format!(
+                "Rerank endpoint {} is configured, but provider {} is not implemented yet.",
+                endpoint.model_endpoint_id, endpoint.provider_key
+            ),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            scores: Vec::new(),
+            details: json!({
+                "route_policy_id": RERANK_POLICY_ID,
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    }
+
+    let Some(config) = rerank_compatible_config_from_endpoint(&endpoint) else {
+        return RerankExecution {
+            available: false,
+            status: "degraded".to_string(),
+            summary: "Rerank endpoint base_url / model_name are not configured.".to_string(),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            scores: Vec::new(),
+            details: json!({
+                "route_policy_id": RERANK_POLICY_ID,
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        };
+    };
+
+    let client = match RerankCompatibleClient::new(config) {
+        Ok(client) => client,
+        Err(error) => {
+            return RerankExecution {
+                available: false,
+                status: "degraded".to_string(),
+                summary: format!("Failed to build rerank client: {error}"),
+                provider_key: endpoint.provider_key.clone(),
+                model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+                model_name: Some(endpoint.model_name.clone()),
+                scores: Vec::new(),
+                details: json!({
+                    "route_policy_id": RERANK_POLICY_ID,
+                    "local_only": true,
+                    "fallback_allowed": false,
+                }),
+            };
+        }
+    };
+
+    let document_count = documents.len();
+    match client.rerank(&RerankRequest {
+        query: query.to_string(),
+        documents,
+        top_n: top_n.max(1),
+    }) {
+        Ok(response) => {
+            let scores = response
+                .scores
+                .into_iter()
+                .filter(|score| score.index < document_count)
+                .map(rerank_score_to_document_score)
+                .collect::<Vec<_>>();
+            RerankExecution {
+                available: !scores.is_empty(),
+                status: "active".to_string(),
+                summary: "Rerank request completed.".to_string(),
+                provider_key: endpoint.provider_key.clone(),
+                model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+                model_name: Some(endpoint.model_name.clone()),
+                scores,
+                details: json!({
+                    "route_policy_id": RERANK_POLICY_ID,
+                    "raw_response": response.raw_response,
+                    "local_only": true,
+                    "fallback_allowed": false,
+                }),
+            }
+        }
+        Err(error) => RerankExecution {
+            available: false,
+            status: "degraded".to_string(),
+            summary: format!("Rerank request failed: {error}"),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            scores: Vec::new(),
+            details: json!({
+                "route_policy_id": RERANK_POLICY_ID,
+                "local_only": true,
+                "fallback_allowed": false,
+            }),
+        },
+    }
 }
 
 pub fn run_llm_text_with_state(prompt: &str, state: &AdminModelCenterState) -> LlmTextExecution {
@@ -1787,6 +2018,27 @@ fn openai_compatible_config_from_endpoint(
     })
 }
 
+fn rerank_compatible_config_from_endpoint(
+    endpoint: &ModelEndpoint,
+) -> Option<RerankCompatibleConfig> {
+    let base_url = metadata_string(&endpoint.metadata, "base_url")?;
+    if endpoint.endpoint_kind == ModelEndpointKind::Cloud {
+        return None;
+    }
+    let api_key = metadata_string(&endpoint.metadata, "api_key").unwrap_or_default();
+    let model = metadata_string(&endpoint.metadata, "model").or_else(|| {
+        (!endpoint.model_name.trim().is_empty()).then_some(endpoint.model_name.clone())
+    })?;
+    let rerank_path =
+        metadata_string(&endpoint.metadata, "rerank_path").unwrap_or_else(|| "/rerank".to_string());
+    Some(RerankCompatibleConfig {
+        base_url: base_url.trim_end_matches('/').to_string(),
+        api_key,
+        model,
+        rerank_path,
+    })
+}
+
 fn build_image_data_url(image_path: &Path) -> Result<String, String> {
     let bytes = fs::read(image_path)
         .map_err(|error| format!("Failed to read image {}: {error}", image_path.display()))?;
@@ -1932,6 +2184,39 @@ fn mock_embedding_vector_from_endpoint(endpoint: &ModelEndpoint, input: &str) ->
     Some(build_mock_embedding(input, dimensions))
 }
 
+fn mock_rerank_scores_from_endpoint(
+    endpoint: &ModelEndpoint,
+    document_count: usize,
+) -> Option<Vec<RerankDocumentScore>> {
+    let values = endpoint
+        .metadata
+        .get("mock_rerank_scores")
+        .and_then(Value::as_array)?;
+    let mut scores = values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            let score = value.as_f64()? as f32;
+            (index < document_count && score.is_finite())
+                .then_some(RerankDocumentScore { index, score })
+        })
+        .collect::<Vec<_>>();
+    scores.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    Some(scores)
+}
+
+fn rerank_score_to_document_score(score: RerankScore) -> RerankDocumentScore {
+    RerankDocumentScore {
+        index: score.index,
+        score: score.score,
+    }
+}
+
 fn parse_embedding_vector(value: &Value) -> Option<Vec<f32>> {
     let items = value.as_array()?;
     let mut vector = Vec::with_capacity(items.len());
@@ -2014,9 +2299,9 @@ mod tests {
     use super::{
         clear_local_runtime_projection_cache, connectivity_url,
         openai_compatible_config_from_endpoint, redact_model_endpoint, run_embedding_with_state,
-        run_llm_text_with_state, run_llm_text_with_state_and_options, run_vlm_summary_with_state,
-        semantic_router_local_only_model_state, test_model_endpoint, vlm_endpoint_readiness,
-        LlmTextOptions,
+        run_llm_text_with_state, run_llm_text_with_state_and_options, run_rerank_with_state,
+        run_vlm_summary_with_state, semantic_router_local_only_model_state, test_model_endpoint,
+        vlm_endpoint_readiness, LlmTextOptions, RERANK_POLICY_ID,
     };
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
@@ -2025,6 +2310,107 @@ mod tests {
     use crate::runtime::admin_console::AdminModelCenterState;
 
     static MODEL_RUNTIME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn rerank_mock_endpoint_returns_scores() {
+        let _env_guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        clear_local_runtime_projection_cache();
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "rerank-local".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Reranker,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "rerank_compatible".to_string(),
+                model_name: "mock-reranker".to_string(),
+                capability_tags: vec!["rerank".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({"mock_rerank_scores": [0.2, 0.9]}),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: RERANK_POLICY_ID.to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::StrictLocal,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "sidecar".to_string()],
+                status: "active".to_string(),
+                metadata: json!({"capability": "rerank"}),
+            }],
+            ..Default::default()
+        };
+
+        let documents = vec!["alpha".to_string(), "beta".to_string()];
+        let result = run_rerank_with_state("query", &documents, 2, &state);
+
+        assert!(result.available);
+        assert_eq!(result.model_endpoint_id.as_deref(), Some("rerank-local"));
+        assert_eq!(result.scores[0].index, 1);
+    }
+
+    #[test]
+    fn rerank_strict_local_policy_does_not_select_cloud_endpoint() {
+        let _env_guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .expect("model runtime env lock");
+        clear_local_runtime_projection_cache();
+        let state = AdminModelCenterState {
+            endpoints: vec![
+                ModelEndpoint {
+                    model_endpoint_id: "rerank-cloud".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Reranker,
+                    endpoint_kind: ModelEndpointKind::Cloud,
+                    provider_key: "rerank_compatible".to_string(),
+                    model_name: "cloud-reranker".to_string(),
+                    capability_tags: vec!["rerank".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({"mock_rerank_scores": [1.0, 1.0]}),
+                },
+                ModelEndpoint {
+                    model_endpoint_id: "rerank-local".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Reranker,
+                    endpoint_kind: ModelEndpointKind::Local,
+                    provider_key: "rerank_compatible".to_string(),
+                    model_name: "local-reranker".to_string(),
+                    capability_tags: vec!["rerank".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({"mock_rerank_scores": [0.1, 0.7]}),
+                },
+            ],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: RERANK_POLICY_ID.to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::StrictLocal,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["cloud".to_string(), "local".to_string()],
+                status: "active".to_string(),
+                metadata: json!({"capability": "rerank", "cloud_fallback_allowed": false}),
+            }],
+            ..Default::default()
+        };
+
+        let documents = vec!["alpha".to_string(), "beta".to_string()];
+        let result = run_rerank_with_state("query", &documents, 2, &state);
+
+        assert!(result.available);
+        assert_eq!(result.model_endpoint_id.as_deref(), Some("rerank-local"));
+        assert_eq!(result.scores[0].index, 1);
+    }
 
     struct EnvVarGuard {
         key: &'static str,
